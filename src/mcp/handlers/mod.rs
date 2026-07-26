@@ -57,18 +57,27 @@ use crate::agent_ops::{cleanup_working_dir, merge_metadata};
 pub(super) const MAX_MESSAGE_FILE_BYTES: u64 = 1_048_576; // 1 MB
 
 /// Read a text file for message_from_file, with size limit.
-/// Returns the file content on success, or an error string on failure.
+/// Opens the file once and checks metadata on the open handle — TOCTOU-safe
+/// (the path cannot be swapped between the size check and the read).
 pub(super) fn read_message_file(path: &str) -> Result<String, String> {
-    let metadata =
-        std::fs::metadata(path).map_err(|e| format!("failed to read message_from_file: {e}"))?;
-    if metadata.len() > MAX_MESSAGE_FILE_BYTES {
+    use std::io::Read;
+
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("failed to read message_from_file: {e}"))?;
+    let len = file
+        .metadata()
+        .map_err(|e| format!("failed to read message_from_file: {e}"))?
+        .len();
+    if len > MAX_MESSAGE_FILE_BYTES {
         return Err(format!(
             "message_from_file exceeds size limit ({} > {} bytes)",
-            metadata.len(),
-            MAX_MESSAGE_FILE_BYTES
+            len, MAX_MESSAGE_FILE_BYTES
         ));
     }
-    std::fs::read_to_string(path).map_err(|e| format!("failed to read message_from_file: {e}"))
+    let mut content = String::with_capacity(len as usize);
+    file.read_to_string(&mut content)
+        .map_err(|e| format!("failed to read message_from_file: {e}"))?;
+    Ok(content)
 }
 
 /// True iff the MCP handler output should be treated as a success for

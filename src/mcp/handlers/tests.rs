@@ -4762,3 +4762,43 @@ fn read_message_file_non_utf8() {
     assert!(err.contains("failed to read message_from_file"), "error: {err}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn send_message_from_file_ok() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("send-msg-file-ok");
+    let file_path = home.join("draft.txt");
+    std::fs::write(&file_path, b"hello from file").unwrap();
+    let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
+    let args = json!({
+        "instance": "target",
+        "message_from_file": file_path.to_str().unwrap(),
+    });
+    let result = super::comms::handle_unified_send(&home, &args, &Some(sender), None);
+    // The file was read successfully, so the error (if any) is NOT about
+    // message_from_file — it will be about fleet/invariants/routing.
+    let err = result["error"].as_str().unwrap_or("");
+    assert!(
+        !err.contains("message_from_file"),
+        "file read must succeed, error must be about routing, got: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn send_message_from_file_missing() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("send-msg-file-missing");
+    let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
+    let args = json!({
+        "instance": "target",
+        "message_from_file": "/nonexistent/path.txt",
+    });
+    let result = super::comms::handle_unified_send(&home, &args, &Some(sender), None);
+    let err = result["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("message_from_file"),
+        "must report file read error, got: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
