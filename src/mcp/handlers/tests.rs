@@ -4726,10 +4726,13 @@ fn read_message_file_ok() {
 
 #[test]
 fn read_message_file_missing() {
-    let result = read_message_file("/nonexistent/path/xyz.txt");
+    let dir = tmp_home("read_msg_file_missing");
+    let path = dir.join("xyz.txt");
+    let result = read_message_file(path.to_str().unwrap());
     assert!(result
         .unwrap_err()
         .contains("failed to read message_from_file"));
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -4808,10 +4811,11 @@ fn send_message_from_file_delivers_content() {
 fn send_message_from_file_missing() {
     let _g = fleet_test_guard();
     let home = tmp_home("send-msg-file-missing");
+    let missing_path = home.join("missing.txt");
     let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
     let args = json!({
         "instance": "target",
-        "message_from_file": "/nonexistent/path.txt",
+        "message_from_file": missing_path.to_str().unwrap(),
     });
     let result = super::comms::handle_unified_send(&home, &args, &Some(sender), None);
     let err = result["error"].as_str().unwrap_or("");
@@ -4920,6 +4924,9 @@ fn reply_message_from_file_ok() {
         caps: crate::channel::ChannelCapabilities::default(),
     });
     crate::channel::register_active_channel(rec);
+    crate::daemon::heartbeat_pair::update_with("alpha", |p| {
+        p.reply_to_channel = None;
+    });
 
     let result = super::channel::handle_reply(
         &home,
