@@ -4727,7 +4727,9 @@ fn read_message_file_ok() {
 #[test]
 fn read_message_file_missing() {
     let result = read_message_file("/nonexistent/path/xyz.txt");
-    assert!(result.unwrap_err().contains("failed to read message_from_file"));
+    assert!(result
+        .unwrap_err()
+        .contains("failed to read message_from_file"));
 }
 
 #[test]
@@ -4759,7 +4761,10 @@ fn read_message_file_non_utf8() {
     std::fs::write(&path, &[0xFF, 0xFE, 0x00]).unwrap();
     let result = read_message_file(path.to_str().unwrap());
     let err = result.unwrap_err();
-    assert!(err.contains("failed to read message_from_file"), "error: {err}");
+    assert!(
+        err.contains("failed to read message_from_file"),
+        "error: {err}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

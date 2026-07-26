@@ -57,12 +57,13 @@ use crate::agent_ops::{cleanup_working_dir, merge_metadata};
 pub(super) const MAX_MESSAGE_FILE_BYTES: u64 = 1_048_576; // 1 MB
 
 /// Read a text file for message_from_file, with size limit.
-/// Opens the file once and checks metadata on the open handle — TOCTOU-safe
-/// (the path cannot be swapped between the size check and the read).
+/// Opens the file once and reads through a bounded reader — TOCTOU-safe
+/// against both path swap (single fd) and concurrent append/growth
+/// (`.take(MAX + 1)` enforces the cap on actual bytes transferred).
 pub(super) fn read_message_file(path: &str) -> Result<String, String> {
     use std::io::Read;
 
-    let mut file =
+    let file =
         std::fs::File::open(path).map_err(|e| format!("failed to read message_from_file: {e}"))?;
     let len = file
         .metadata()
@@ -74,9 +75,20 @@ pub(super) fn read_message_file(path: &str) -> Result<String, String> {
             len, MAX_MESSAGE_FILE_BYTES
         ));
     }
+    // Bounded read: enforce the cap on actual bytes transferred, not just
+    // the initial metadata — TOCTOU-safe against concurrent append/growth.
+    let limit = MAX_MESSAGE_FILE_BYTES + 1;
     let mut content = String::with_capacity(len as usize);
-    file.read_to_string(&mut content)
+    file.take(limit)
+        .read_to_string(&mut content)
         .map_err(|e| format!("failed to read message_from_file: {e}"))?;
+    if content.len() > MAX_MESSAGE_FILE_BYTES as usize {
+        return Err(format!(
+            "message_from_file exceeds size limit ({} > {} bytes)",
+            content.len(),
+            MAX_MESSAGE_FILE_BYTES
+        ));
+    }
     Ok(content)
 }
 
