@@ -60,34 +60,40 @@ pub(super) const MAX_MESSAGE_FILE_BYTES: u64 = 1_048_576; // 1 MB
 /// Opens the file once and reads through a bounded reader — TOCTOU-safe
 /// against both path swap (single fd) and concurrent append/growth
 /// (`.take(MAX + 1)` enforces the cap on actual bytes transferred).
+/// Rejects relative paths (non-deterministic cwd), non-regular files,
+/// empty files, oversized content, and non-UTF-8 content.
 pub(super) fn read_message_file(path: &str) -> Result<String, String> {
     use std::io::Read;
 
+    if !path.starts_with('/') {
+        return Err("message_from_file requires an absolute path".into());
+    }
     let file =
         std::fs::File::open(path).map_err(|e| format!("failed to read message_from_file: {e}"))?;
-    let len = file
+    let meta = file
         .metadata()
-        .map_err(|e| format!("failed to read message_from_file: {e}"))?
-        .len();
-    if len > MAX_MESSAGE_FILE_BYTES {
-        return Err(format!(
-            "message_from_file exceeds size limit ({} > {} bytes)",
-            len, MAX_MESSAGE_FILE_BYTES
-        ));
-    }
-    // Bounded read: enforce the cap on actual bytes transferred, not just
-    // the initial metadata — TOCTOU-safe against concurrent append/growth.
-    let limit = MAX_MESSAGE_FILE_BYTES + 1;
-    let mut content = String::with_capacity(len as usize);
-    file.take(limit)
-        .read_to_string(&mut content)
         .map_err(|e| format!("failed to read message_from_file: {e}"))?;
-    if content.len() > MAX_MESSAGE_FILE_BYTES as usize {
+    if !meta.file_type().is_file() {
+        return Err("message_from_file: path is not a regular file".into());
+    }
+    // Read bounded bytes first, then check size — avoids splitting a UTF-8
+    // code point and reporting a false encoding error for oversized content.
+    let limit = (MAX_MESSAGE_FILE_BYTES + 1) as usize;
+    let mut bytes = Vec::with_capacity((meta.len() as usize).min(limit));
+    file.take(limit as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("failed to read message_from_file: {e}"))?;
+    if bytes.len() > MAX_MESSAGE_FILE_BYTES as usize {
         return Err(format!(
             "message_from_file exceeds size limit ({} > {} bytes)",
-            content.len(),
+            bytes.len(),
             MAX_MESSAGE_FILE_BYTES
         ));
+    }
+    let content = String::from_utf8(bytes)
+        .map_err(|e| format!("failed to read message_from_file: invalid UTF-8: {e}"))?;
+    if content.is_empty() {
+        return Err("message_from_file: file is empty".into());
     }
     Ok(content)
 }

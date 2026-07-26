@@ -26,8 +26,8 @@ pub fn tool_definitions_for_role(role_kind: Option<crate::fleet::RoleKind>) -> V
 pub(crate) fn def_reply() -> Value {
     json!({"name": "reply", "description": "Reply to the user via the active channel. Requires daemon API. Sprint 59 Wave 1 PR-4 ((B) decision default with timeout): when both `default_action` and `timeout_secs` are set, the daemon records a pending operator decision sidecar and auto-fires the default after the timeout window. Subsequent reply calls without `default_action` resolve the pending decision (operator override / explicit answer arrived).",
         "inputSchema": {"type": "object", "properties": {
-            "message": {"type": "string", "description": "The reply text to send to the user. Optional when message_from_file is provided."},
-            "message_from_file": {"type": "string", "description": "Path to a text file whose contents become the reply. Overrides 'message' when both are provided."},
+            "message": {"type": "string", "description": "The reply text to send to the user. Required unless message_from_file is provided."},
+            "message_from_file": {"type": "string", "description": "Path to a text file whose contents become the reply. Overrides 'message' when both are provided. Must be an absolute path to a regular UTF-8 text file (max 1 MiB)."},
             "message_id": {"type": "string", "description": "#2622 PR-3: target an original inbox message by id. When set, routes by THAT message's own channel (instead of the process-global reply_to_channel prefer-chain) and, on send success, settles that row so it stops redelivering. Omit for the default prefer-chain behavior."},
             "default_action": {"type": "string", "description": "Action to auto-execute on timeout when the operator doesn't reply within `timeout_secs`. e.g. 'proceed-with-lean' / 'abort'. Pair with `timeout_secs` (Sprint 59 Wave 1 PR-4)."},
             "timeout_secs": {"type": "integer", "description": "Seconds to wait for an operator response before firing `default_action`. Required when `default_action` is set; ignored otherwise (Sprint 59 Wave 1 PR-4)."},
@@ -48,8 +48,8 @@ pub(crate) fn def_send() -> Value {
             "instances": {"type": "array", "items": {"type": "string"}, "description": "Names of existing instances to broadcast to (broadcast mode)"},
             "team": {"type": "string", "description": "Team name (broadcast to team)"},
             "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags filter (broadcast mode)"},
-            "message": {"type": "string", "description": "Message text (or 'task' for delegate, 'summary' for report, 'question' for query). Optional when message_from_file is provided."},
-            "message_from_file": {"type": "string", "description": "Path to a text file whose contents become the message. Overrides 'message' when both are provided."},
+            "message": {"type": "string", "description": "Message text (or 'task' for delegate, 'summary' for report, 'question' for query). Required unless message_from_file is provided."},
+            "message_from_file": {"type": "string", "description": "Path to a text file whose contents become the message. Overrides 'message' when both are provided. Must be an absolute path to a regular UTF-8 text file (max 1 MiB)."},
             "request_kind": {"type": "string", "enum": ["query", "task", "report", "update"], "description": "Message kind (determines behavior). NOTE: kind=task requires task_id (Sprint 58 Wave 4 PR-1 anti-stall contract)."},
             "report_purpose": {"type": "string", "enum": ["task_result", "analysis_decision", "source_spike", "rca", "code_review"], "description": "Typed purpose for request_kind=report. New report callers should always set it. Missing legacy values remain ordinary LegacyUntyped reports with zero code-review authority."},
             "code_review": {"type": "object", "additionalProperties": false, "properties": {

@@ -4733,13 +4733,21 @@ fn read_message_file_missing() {
 }
 
 #[test]
-fn read_message_file_empty_ok() {
+fn read_message_file_empty_rejected() {
     let dir = tmp_home("read_msg_file_empty");
     let path = dir.join("empty.txt");
     std::fs::write(&path, b"").unwrap();
     let result = read_message_file(path.to_str().unwrap());
-    assert_eq!(result.unwrap(), "");
+    let err = result.unwrap_err();
+    assert!(err.contains("empty"), "error: {err}");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn read_message_file_relative_path_rejected() {
+    let result = read_message_file("relative/path.txt");
+    let err = result.unwrap_err();
+    assert!(err.contains("absolute path"), "error: {err}");
 }
 
 #[test]
@@ -4762,7 +4770,7 @@ fn read_message_file_non_utf8() {
     let result = read_message_file(path.to_str().unwrap());
     let err = result.unwrap_err();
     assert!(
-        err.contains("failed to read message_from_file"),
+        err.contains("invalid UTF-8") || err.contains("message_from_file"),
         "error: {err}"
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -4862,6 +4870,30 @@ fn reply_message_from_file_missing() {
     assert!(
         err.contains("message_from_file"),
         "must report file read error in reply path, got: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn reply_message_from_file_empty() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("reply-msg-file-empty");
+    let file_path = home.join("empty.txt");
+    std::fs::write(&file_path, b"").unwrap();
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "instances:\n  alpha:\n    backend: claude\n",
+    )
+    .unwrap();
+    let result = super::channel::handle_reply(
+        &home,
+        &json!({"message_from_file": file_path.to_str().unwrap()}),
+        "alpha",
+    );
+    let err = result["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("empty"),
+        "must reject empty file in reply path, got: {result}"
     );
     std::fs::remove_dir_all(&home).ok();
 }
