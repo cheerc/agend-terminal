@@ -7,11 +7,11 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
     // #1602: the reply content param is `message` (was `text`).
     // message_from_file overrides message — read the file at the given path.
     let text = if let Some(path) = args["message_from_file"].as_str().filter(|s| !s.is_empty()) {
-        match std::fs::read_to_string(path) {
+        match super::read_message_file(path) {
             Ok(content) => content,
             Err(e) => {
                 crate::reply_ledger::record_reply_outcome(instance_name, false);
-                return json!({"error": format!("failed to read message_from_file: {e}")});
+                return json!({"error": e});
             }
         }
     } else {

@@ -39,11 +39,11 @@ pub(super) fn handle_unified_send(
     // message_from_file: read file content into message (applies to all
     // downstream paths: send, broadcast, report, query, task).
     if let Some(path) = args["message_from_file"].as_str().filter(|s| !s.is_empty()) {
-        match std::fs::read_to_string(path) {
+        match super::read_message_file(path) {
             Ok(content) => {
                 args["message"] = json!(content);
             }
-            Err(e) => return json!({"error": format!("failed to read message_from_file: {e}")}),
+            Err(e) => return json!({"error": e}),
         }
     }
     if let Some(err) = validate_selector_exclusivity(&args) {

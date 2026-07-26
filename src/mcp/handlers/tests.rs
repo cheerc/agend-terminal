@@ -4711,3 +4711,54 @@ fn runtime_present_mcp_no_listener_matrix_2454() {
     std::env::remove_var("AGEND_HOME");
     std::fs::remove_dir_all(&home).ok();
 }
+
+// --- read_message_file tests ---
+
+#[test]
+fn read_message_file_ok() {
+    let dir = tmp_home("read_msg_file_ok");
+    let path = dir.join("test.txt");
+    std::fs::write(&path, b"hello world").unwrap();
+    let result = read_message_file(path.to_str().unwrap());
+    assert_eq!(result.unwrap(), "hello world");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn read_message_file_missing() {
+    let result = read_message_file("/nonexistent/path/xyz.txt");
+    assert!(result.unwrap_err().contains("failed to read message_from_file"));
+}
+
+#[test]
+fn read_message_file_empty_ok() {
+    let dir = tmp_home("read_msg_file_empty");
+    let path = dir.join("empty.txt");
+    std::fs::write(&path, b"").unwrap();
+    let result = read_message_file(path.to_str().unwrap());
+    assert_eq!(result.unwrap(), "");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn read_message_file_oversized() {
+    let dir = tmp_home("read_msg_file_big");
+    let path = dir.join("big.txt");
+    let content = vec![b'x'; (MAX_MESSAGE_FILE_BYTES + 1) as usize];
+    std::fs::write(&path, &content).unwrap();
+    let result = read_message_file(path.to_str().unwrap());
+    let err = result.unwrap_err();
+    assert!(err.contains("exceeds size limit"), "error: {err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn read_message_file_non_utf8() {
+    let dir = tmp_home("read_msg_file_utf8");
+    let path = dir.join("binary.bin");
+    std::fs::write(&path, &[0xFF, 0xFE, 0x00]).unwrap();
+    let result = read_message_file(path.to_str().unwrap());
+    let err = result.unwrap_err();
+    assert!(err.contains("failed to read message_from_file"), "error: {err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
