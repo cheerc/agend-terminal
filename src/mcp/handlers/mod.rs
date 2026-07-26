@@ -65,7 +65,8 @@ pub(super) const MAX_MESSAGE_FILE_BYTES: u64 = 1_048_576; // 1 MB
 pub(super) fn read_message_file(path: &str) -> Result<String, String> {
     use std::io::Read;
 
-    if !path.starts_with('/') {
+    let path = std::path::Path::new(path);
+    if !path.is_absolute() {
         return Err("message_from_file requires an absolute path".into());
     }
     let file =

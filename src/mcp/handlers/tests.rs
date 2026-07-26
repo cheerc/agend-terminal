@@ -4833,22 +4833,110 @@ fn reply_message_from_file_ok() {
         "instances:\n  alpha:\n    backend: claude\n",
     )
     .unwrap();
-    // File read succeeds => the reply handler errors on "no active channel",
-    // NOT on message_from_file — proving the file was consumed.
+
+    struct RecordingChannel {
+        replies: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        caps: crate::channel::ChannelCapabilities,
+    }
+    impl crate::channel::Channel for RecordingChannel {
+        fn kind(&self) -> &'static str {
+            "recording"
+        }
+        fn caps(&self) -> &crate::channel::ChannelCapabilities {
+            &self.caps
+        }
+        fn poll_event(&self) -> Option<crate::channel::ChannelEvent> {
+            None
+        }
+        fn send_from_agent(
+            &self,
+            _agent: &str,
+            op: crate::channel::AgentOutboundOp,
+        ) -> std::result::Result<crate::channel::MsgRef, crate::channel::ChannelError> {
+            if let crate::channel::AgentOutboundOp::Reply { text, .. } = op {
+                self.replies.lock().unwrap().push(text.to_string());
+            }
+            Ok(crate::channel::MsgRef {
+                id: "m-recording-1".into(),
+                binding: crate::channel::BindingRef::new(
+                    "recording",
+                    Some("TG#recording".into()),
+                    (),
+                ),
+            })
+        }
+        fn outbound_authorized(&self) -> bool {
+            true
+        }
+        fn send(
+            &self,
+            _: &crate::channel::BindingRef,
+            _: crate::channel::OutMsg,
+        ) -> anyhow::Result<crate::channel::MsgRef> {
+            anyhow::bail!("mock")
+        }
+        fn edit(
+            &self,
+            _: &crate::channel::MsgRef,
+            _: crate::channel::OutMsg,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("mock")
+        }
+        fn delete(&self, _: &crate::channel::MsgRef) -> anyhow::Result<()> {
+            anyhow::bail!("mock")
+        }
+        fn create_binding(
+            &self,
+            _: &str,
+            _: crate::channel::BindingOpts,
+        ) -> anyhow::Result<crate::channel::BindingRef> {
+            anyhow::bail!("mock")
+        }
+        fn remove_binding(&self, _: &crate::channel::BindingRef) -> anyhow::Result<()> {
+            anyhow::bail!("mock")
+        }
+        fn has_binding(&self, _: &str) -> bool {
+            false
+        }
+        fn record_binding(&self, _: &str, _: crate::channel::BindingRef, _: String) {}
+        fn take_binding(&self, _: &str) -> Option<crate::channel::BindingRef> {
+            None
+        }
+        fn attach_registry(&self, _: crate::agent::AgentRegistry) {}
+        fn notify(
+            &self,
+            _: &str,
+            _: crate::channel::NotifySeverity,
+            _: &str,
+            _: bool,
+        ) -> std::result::Result<(), crate::channel::ChannelError> {
+            Ok(())
+        }
+    }
+
+    let replies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let rec = std::sync::Arc::new(RecordingChannel {
+        replies: replies.clone(),
+        caps: crate::channel::ChannelCapabilities::default(),
+    });
+    crate::channel::register_active_channel(rec);
+
     let result = super::channel::handle_reply(
         &home,
         &json!({"message_from_file": file_path.to_str().unwrap()}),
         "alpha",
     );
-    let err = result["error"].as_str().unwrap_or("");
     assert!(
-        !err.contains("message_from_file"),
-        "file read must succeed in reply path, got: {result}"
+        result.get("error").is_none(),
+        "reply should succeed when channel is active, got: {result}"
     );
-    assert!(
-        err.contains("channel") || err.contains("fleet"),
-        "error must be about channel/routing, got: {result}"
+    let delivered = replies.lock().unwrap();
+    assert_eq!(delivered.len(), 1, "one reply should have been sent");
+    assert_eq!(
+        delivered[0], "reply from file",
+        "delivered reply text must equal file content"
     );
+    crate::channel::reset_active_channel_for_test();
     std::fs::remove_dir_all(&home).ok();
 }
 
