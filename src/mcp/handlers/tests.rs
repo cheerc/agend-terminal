@@ -4758,7 +4758,7 @@ fn read_message_file_oversized() {
 fn read_message_file_non_utf8() {
     let dir = tmp_home("read_msg_file_utf8");
     let path = dir.join("binary.bin");
-    std::fs::write(&path, &[0xFF, 0xFE, 0x00]).unwrap();
+    std::fs::write(&path, [0xFF, 0xFE, 0x00]).unwrap();
     let result = read_message_file(path.to_str().unwrap());
     let err = result.unwrap_err();
     assert!(
