@@ -4,12 +4,26 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Value {
-    // #1602: the reply content param is `message` (was `text`) — now consistent
-    // with `send`/`schedule`. The MCP dispatch validator rejects a missing
-    // `message` with a clear named error, so a mis-named param no longer
-    // silently becomes an empty reply.
-    let text = args["message"].as_str().unwrap_or("").to_string();
-    tracing::info!(from = %instance_name, %text, "reply");
+    // #1602: the reply content param is `message` (was `text`).
+    // message_from_file overrides message — read the file at the given path.
+    let text = if let Some(path) = args["message_from_file"].as_str().filter(|s| !s.is_empty()) {
+        match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(e) => {
+                crate::reply_ledger::record_reply_outcome(instance_name, false);
+                return json!({"error": format!("failed to read message_from_file: {e}")});
+            }
+        }
+    } else {
+        match args["message"].as_str() {
+            Some(t) if !t.is_empty() => t.to_string(),
+            _ => {
+                crate::reply_ledger::record_reply_outcome(instance_name, false);
+                return json!({"error": "missing 'message' or 'message_from_file'"});
+            }
+        }
+    };
+    tracing::info!(from = %instance_name, text_len = %text.len(), "reply");
 
     // Reply-to correlation: carry the sending turn's task context (when the
     // agent passes it) into the sent_ledger so a later operator reply-to can be
