@@ -69,6 +69,15 @@ pub(super) fn read_message_file(path: &str) -> Result<String, String> {
     if !path.is_absolute() {
         return Err("message_from_file requires an absolute path".into());
     }
+    // Stat before open: reject non-regular files (FIFO, socket, device)
+    // without blocking on open. The fd-based metadata() after open is kept
+    // as a TOCTOU guard against path-swap attacks.
+    let pre_meta = path
+        .metadata()
+        .map_err(|e| format!("failed to read message_from_file: {e}"))?;
+    if !pre_meta.file_type().is_file() {
+        return Err("message_from_file: path is not a regular file".into());
+    }
     let file =
         std::fs::File::open(path).map_err(|e| format!("failed to read message_from_file: {e}"))?;
     let meta = file

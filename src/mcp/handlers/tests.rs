@@ -4779,6 +4779,23 @@ fn read_message_file_non_utf8() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[cfg(unix)]
+#[test]
+fn read_message_file_non_regular_rejected() {
+    let sock_path =
+        std::path::PathBuf::from(format!("/tmp/agend-message-{}.sock", std::process::id()));
+    std::fs::remove_file(&sock_path).ok();
+    let listener = std::os::unix::net::UnixListener::bind(&sock_path).expect("create test socket");
+    let result = read_message_file(sock_path.to_str().unwrap());
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("not a regular file"),
+        "must reject socket pre-open, got: {err}"
+    );
+    drop(listener);
+    std::fs::remove_file(&sock_path).ok();
+}
+
 #[test]
 fn send_message_from_file_delivers_content() {
     let _g = fleet_test_guard();
