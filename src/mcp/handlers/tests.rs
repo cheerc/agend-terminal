@@ -4769,24 +4769,30 @@ fn read_message_file_non_utf8() {
 }
 
 #[test]
-fn send_message_from_file_ok() {
+fn send_message_from_file_delivers_content() {
     let _g = fleet_test_guard();
-    let home = tmp_home("send-msg-file-ok");
+    let home = tmp_home("send-msg-file-deliver");
     let file_path = home.join("draft.txt");
     std::fs::write(&file_path, b"hello from file").unwrap();
-    let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "instances:\n  sender-agent:\n    backend: claude\n  target-agent:\n    backend: claude\n",
+    )
+    .unwrap();
+    let sender = crate::identity::Sender::new("sender-agent").expect("valid sender name");
+    let rt = minimal_test_runtime();
     let args = json!({
-        "instance": "target",
+        "instance": "target-agent",
         "message_from_file": file_path.to_str().unwrap(),
     });
-    let result = super::comms::handle_unified_send(&home, &args, &Some(sender), None);
-    // The file was read successfully, so the error (if any) is NOT about
-    // message_from_file — it will be about fleet/invariants/routing.
-    let err = result["error"].as_str().unwrap_or("");
+    let result = super::comms::handle_unified_send(&home, &args, &Some(sender), Some(&rt));
     assert!(
-        !err.contains("message_from_file"),
-        "file read must succeed, error must be about routing, got: {result}"
+        result.get("error").is_none(),
+        "send should succeed: {result}"
     );
+    let msgs = crate::inbox::drain(&home, "target-agent");
+    assert_eq!(msgs.len(), 1, "target should have 1 message");
+    assert_eq!(msgs[0].text, "hello from file", "content must match file");
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -4804,6 +4810,76 @@ fn send_message_from_file_missing() {
     assert!(
         err.contains("message_from_file"),
         "must report file read error, got: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn reply_message_from_file_ok() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("reply-msg-file-ok");
+    let file_path = home.join("reply.txt");
+    std::fs::write(&file_path, b"reply from file").unwrap();
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "instances:\n  alpha:\n    backend: claude\n",
+    )
+    .unwrap();
+    // File read succeeds => the reply handler errors on "no active channel",
+    // NOT on message_from_file — proving the file was consumed.
+    let result = super::channel::handle_reply(
+        &home,
+        &json!({"message_from_file": file_path.to_str().unwrap()}),
+        "alpha",
+    );
+    let err = result["error"].as_str().unwrap_or("");
+    assert!(
+        !err.contains("message_from_file"),
+        "file read must succeed in reply path, got: {result}"
+    );
+    assert!(
+        err.contains("channel") || err.contains("fleet"),
+        "error must be about channel/routing, got: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn reply_message_from_file_missing() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("reply-msg-file-missing");
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "instances:\n  alpha:\n    backend: claude\n",
+    )
+    .unwrap();
+    let result = super::channel::handle_reply(
+        &home,
+        &json!({"message_from_file": "/nonexistent/reply.txt"}),
+        "alpha",
+    );
+    let err = result["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("message_from_file"),
+        "must report file read error in reply path, got: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn reply_no_message_nor_file() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("reply-no-msg-file");
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "instances:\n  alpha:\n    backend: claude\n",
+    )
+    .unwrap();
+    let result = super::channel::handle_reply(&home, &json!({}), "alpha");
+    let err = result["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("message"),
+        "must report missing message/file, got: {result}"
     );
     std::fs::remove_dir_all(&home).ok();
 }

@@ -36,16 +36,6 @@ pub(super) fn handle_unified_send(
     runtime: Option<&RuntimeContext>,
 ) -> Value {
     let mut args = args.clone();
-    // message_from_file: read file content into message (applies to all
-    // downstream paths: send, broadcast, report, query, task).
-    if let Some(path) = args["message_from_file"].as_str().filter(|s| !s.is_empty()) {
-        match super::read_message_file(path) {
-            Ok(content) => {
-                args["message"] = json!(content);
-            }
-            Err(e) => return json!({"error": e}),
-        }
-    }
     if let Some(err) = validate_selector_exclusivity(&args) {
         return err;
     }
@@ -54,6 +44,17 @@ pub(super) fn handle_unified_send(
     }
     if let Some(err) = validate_request_kind(&args) {
         return err;
+    }
+    // message_from_file: read file content into message — resolved AFTER
+    // validation so invalid dispatches never perform file I/O, but BEFORE
+    // broadcast/routing so the body is available to all downstream paths.
+    if let Some(path) = args["message_from_file"].as_str().filter(|s| !s.is_empty()) {
+        match super::read_message_file(path) {
+            Ok(content) => {
+                args["message"] = json!(content);
+            }
+            Err(e) => return json!({"error": e}),
+        }
     }
     // Broadcast mode: instances/team present (tags-only rejected above)
     if args.get("instances").is_some() || args.get("team").is_some() {
