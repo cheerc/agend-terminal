@@ -898,19 +898,6 @@ mod tests {
     // ── #1602: inputSchema enforcement at dispatch ──────────────────────
 
     #[test]
-    fn validate_rejects_missing_required_with_named_error() {
-        // reply requires `message` (post-#1602 rename); omitting it is the
-        // exact bug the operator hit (a mis-named param became an empty reply).
-        let def = crate::mcp::tools::def_reply();
-        let fields = validation_fields(&def);
-        let err = validate_args("reply", &fields, &json!({})).expect("must reject");
-        assert_eq!(
-            err["error"], "reply: missing required parameter 'message'",
-            "must name the tool + the missing param: {err}"
-        );
-    }
-
-    #[test]
     fn validate_passes_when_required_present_and_unknown_only_warns() {
         // `message` present → no reject; an unknown key only warns (no reject).
         let def = crate::mcp::tools::def_reply();
@@ -985,9 +972,9 @@ mod tests {
     #[test]
     fn genuinely_required_fields_are_hard_rejected() {
         use crate::mcp::tools::*;
+        // send/reply: message is conditionally required via message_from_file,
+        // so it's not in the schema-level required[] — handler enforces instead.
         let cases = [
-            ("reply", def_reply(), "message"),
-            ("send", def_send(), "message"),
             ("delete_instance", def_delete_instance(), "instance"),
             ("task", def_task(), "action"),
         ];
@@ -1011,7 +998,7 @@ mod tests {
         let ctx = ctx_for(&home, &args, "alpha");
         let result = try_dispatch("reply", &ctx).expect("registered tool returns Some");
         assert_eq!(
-            result["error"], "reply: missing required parameter 'message'",
+            result["error"], "missing 'message' or 'message_from_file'",
             "dispatch must reject reply with no message: {result}"
         );
     }
@@ -1079,28 +1066,6 @@ mod tests {
         );
     }
 
-    // ── Rank8 bug-audit: present-but-JSON-null required field ───────────────
-    // `{"message": null}` slipped through validation because `args.get(req)`
-    // returns `Some(Value::Null)` (not `None`), so `is_none()` saw it as
-    // "present". `handle_reply` then did `as_str().unwrap_or("")` → forwarded an
-    // EMPTY string → opaque downstream channel rejection (Telegram 400) instead
-    // of a clean early named error. The fix treats present-but-null as missing.
-
-    #[test]
-    fn validate_rejects_present_but_null_required_field() {
-        // The exact Rank8 bug: a null required value must reject like a missing
-        // one, with the SAME named error — caught early at the validator, never
-        // forwarded as an empty reply.
-        let def = crate::mcp::tools::def_reply();
-        let fields = validation_fields(&def);
-        let err = validate_args("reply", &fields, &json!({"message": null}))
-            .expect("a null required field must reject like a missing one");
-        assert_eq!(
-            err["error"], "reply: missing required parameter 'message'",
-            "present-but-null must reject with the same named error as missing: {err}"
-        );
-    }
-
     #[test]
     fn validate_allows_empty_string_required_field() {
         // Precision: ONLY JSON null counts as missing. A legit empty string is a
@@ -1118,10 +1083,10 @@ mod tests {
     fn validate_rejects_null_for_all_genuinely_required_fields() {
         // The null-as-missing rule lives in validate_args, so it benefits EVERY
         // handler — not just reply. Mirror the genuinely-required cases.
+        // send/reply: message is conditionally required via message_from_file,
+        // so it's not in the schema-level required[] — handler enforces instead.
         use crate::mcp::tools::*;
         let cases = [
-            ("reply", def_reply(), "message"),
-            ("send", def_send(), "message"),
             ("delete_instance", def_delete_instance(), "instance"),
             ("task", def_task(), "action"),
         ];
