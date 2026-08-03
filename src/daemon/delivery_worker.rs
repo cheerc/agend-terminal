@@ -42,14 +42,26 @@ use std::sync::OnceLock;
 /// surfaces as drops quickly rather than unbounded memory growth.
 const QUEUE_CAP: usize = 256;
 
+/// #3175: resume-attempt budget for a typed-inject readback-abort. Each attempt
+/// is paced by the flush's busy-hold (fresh defer timestamp ⇒ released at the
+/// MAX_DEFER cap, ~7s ambient while busy) and costs only a short readback poll
+/// (500ms) — the payload is NEVER re-written. Covers multi-minute generations;
+/// past the budget a persistently-unsettled pane gives up loudly (WARN +
+/// event-log) instead of retrying forever.
+const MAX_RESUME_ATTEMPTS: u32 = 30;
+
 /// A unit of blocking delivery work offloaded off the tick / main-loop thread.
 enum DeliveryJob {
-    /// A selected transport delivery. LegacyPty performs its physical wake
-    /// directly from this worker; it never enqueues a second physical wake job.
+    /// A selected transport delivery. Structured backends (Codex/OpenCode)
+    /// deliver through their transport seam; LegacyPty performs its physical
+    /// wake directly from this worker — it never enqueues a second physical
+    /// wake job. #3175: carries the WHOLE `QueuedNotification` (resume flag +
+    /// attempt budget) so a typed-inject readback-abort can be requeued as a
+    /// RESUME item for the same payload.
     TransportDelivery {
         home: PathBuf,
         agent: String,
-        notification: String,
+        notification: crate::notification_queue::QueuedNotification,
         epoch: u64,
     },
     /// A Telegram send whose dedup claim was already recorded on the caller
@@ -192,14 +204,55 @@ fn dispatch(job: DeliveryJob) {
                 );
                 return;
             }
+            // #3175: the legacy injector runs on the worker thread (never a
+            // second enqueue from here). It returns a STRUCTURED failure
+            // classification; an unconfirmed readback-abort requeues its OWN
+            // payload as a RESUME item — never re-typed — while any transport
+            // write failure other than the recoverable abort is dropped (the
+            // legacy pre-#3175 semantics apply).
+            let body = notification.text.clone();
             let result = crate::transport::deliver_notification(
                 &home,
                 &agent,
-                &notification,
-                |home, agent, text| {
+                &body,
+                move |home, agent, _notification| {
+                    use crate::inbox::notify::InjectDeliveryFailure;
                     #[cfg(test)]
                     test_support::note_legacy_wake(agent);
-                    crate::inbox::notify::inject_with_submit_direct(home, agent, text)
+                    match crate::inbox::notify::inject_with_submit_direct(home, agent, &notification) {
+                        Ok(()) => {}
+                        Err(InjectDeliveryFailure::Unconfirmed(message)) => {
+                            if notification.attempts >= MAX_RESUME_ATTEMPTS {
+                                tracing::warn!(
+                                    agent = %agent,
+                                    tag = "#3175-resume-give-up",
+                                    attempts = notification.attempts,
+                                    error = %message,
+                                    "typed inject unconfirmed after {MAX_RESUME_ATTEMPTS} resume attempts \
+                                     — wake dropped (pane never settled; check the pane for a stranded \
+                                     draft)"
+                                );
+                                crate::event_log::log(
+                                    &home,
+                                    "inject_unconfirmed_gave_up",
+                                    &agent,
+                                    "typed inject payload unconfirmed after resume budget — wake dropped",
+                                );
+                            } else {
+                                tracing::debug!(
+                                    agent = %agent,
+                                    tag = "#3175-resume-requeue",
+                                    attempts = notification.attempts,
+                                    "typed inject unconfirmed — requeueing as resume item"
+                                );
+                                crate::notification_queue::enqueue_resume(&home, &agent, &notification);
+                            }
+                        }
+                        Err(InjectDeliveryFailure::Other(e)) => {
+                            tracing::debug!(agent = %agent, error = %e, "delivery_worker: legacy wake inject failed");
+                        }
+                    }
+                    Ok(())
                 },
             );
             if let Err(error) = result {
@@ -267,18 +320,21 @@ fn dispatch(job: DeliveryJob) {
     }
 }
 
-/// Enqueue a complete backend transport delivery. The bounded queue is the
+/// Enqueue a complete backend-side delivery. The bounded queue is the
 /// caller-facing non-blocking boundary; structured handshakes and protocol
 /// waits happen only in [`dispatch`] on the worker thread.
+/// #3175: takes the whole `QueuedNotification` (resume flag + attempt budget)
+/// so the worker can requeue a typed-inject abort (`inject_unconfirmed`) as a
+/// bounded RESUME item for the same payload.
 pub(crate) fn enqueue_transport_delivery(
     home: &Path,
     agent: &str,
-    notification: &str,
+    notification: crate::notification_queue::QueuedNotification,
 ) -> Result<(), ()> {
     try_enqueue(DeliveryJob::TransportDelivery {
         home: home.to_path_buf(),
         agent: agent.to_string(),
-        notification: notification.to_string(),
+        notification,
         epoch: transport_epoch(home, agent),
     })
 }
@@ -445,7 +501,12 @@ mod tests {
         // Healthy queue: a transport delivery enqueues without blocking.
         test_support::set_force_full(false);
         assert!(
-            enqueue_transport_delivery(std::path::Path::new("/tmp/aw"), "agentA", "ping").is_ok(),
+            enqueue_transport_delivery(
+                std::path::Path::new("/tmp/aw"),
+                "agentA",
+                crate::notification_queue::QueuedNotification::fresh("ping".to_string(), false)
+            )
+            .is_ok(),
             "a non-full delivery queue must accept the wake without blocking"
         );
 
@@ -453,7 +514,12 @@ mod tests {
         // owns recording the drop. No block, no panic.
         test_support::set_force_full(true);
         assert!(
-            enqueue_transport_delivery(std::path::Path::new("/tmp/aw"), "agentA", "ping").is_err(),
+            enqueue_transport_delivery(
+                std::path::Path::new("/tmp/aw"),
+                "agentA",
+                crate::notification_queue::QueuedNotification::fresh("ping".to_string(), false)
+            )
+            .is_err(),
             "AUDIT2-006: a full delivery queue must drop (Err), never block the tick thread"
         );
         test_support::set_force_full(false);
@@ -497,7 +563,14 @@ mod tests {
         )
         .expect("fleet");
         let started = std::time::Instant::now();
-        assert!(enqueue_transport_delivery(&home, "codex-agent", "ping").is_ok());
+        assert!(
+            enqueue_transport_delivery(
+                &home,
+                "codex-agent",
+                crate::notification_queue::QueuedNotification::fresh("ping".to_string(), false)
+            )
+            .is_ok()
+        );
         assert!(
             started.elapsed() < std::time::Duration::from_millis(500),
             "transport enqueue must not run Codex readiness on the caller thread"
@@ -524,7 +597,10 @@ mod tests {
         dispatch(DeliveryJob::TransportDelivery {
             home: home.clone(),
             agent: "legacy-agent".to_string(),
-            notification: "one logical wake".to_string(),
+            notification: crate::notification_queue::QueuedNotification::fresh(
+                "one logical wake".to_string(),
+                false,
+            ),
             epoch: transport_epoch(&home, "legacy-agent"),
         });
         assert_eq!(
@@ -556,7 +632,10 @@ mod tests {
         assert!(try_enqueue(DeliveryJob::TransportDelivery {
             home: home.clone(),
             agent: agent.to_string(),
-            notification: "stale teardown wake".to_string(),
+            notification: crate::notification_queue::QueuedNotification::fresh(
+                "stale teardown wake".to_string(),
+                false,
+            ),
             epoch: stale_epoch,
         })
         .is_ok());
@@ -607,7 +686,17 @@ mod tests {
         .expect("fleet");
 
         let cleanup = begin_transport_cleanup(&home, agent);
-        assert!(enqueue_transport_delivery(&home, agent, "wake during teardown").is_ok());
+        assert!(
+            enqueue_transport_delivery(
+                &home,
+                agent,
+                crate::notification_queue::QueuedNotification::fresh(
+                    "wake during teardown".to_string(),
+                    false,
+                ),
+            )
+            .is_ok()
+        );
         crate::transport::remove_instance_delivery_state(&home, agent).expect("cleanup");
         drop(cleanup);
 

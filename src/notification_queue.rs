@@ -33,6 +33,33 @@ pub struct QueuedNotification {
     /// Preserved across requeue so the cap counts from the original defer.
     #[serde(default)]
     pub deferred_since_ms: i64,
+    /// #3175: this item is a RESUME of a previously-aborted typed inject — the
+    /// payload is ALREADY buffered in the PTY (rendering as a draft once the
+    /// pane settles). The flush injects it through the submit-only resume path
+    /// (`resume` param on the INJECT api); it must never be re-typed.
+    #[serde(default)]
+    pub resume: bool,
+    /// #3175: bounded retry budget for resume items — the delivery worker
+    /// increments on each unconfirmed requeue and gives up past the cap
+    /// (WARN + event-log) instead of retrying forever against a dead pane.
+    #[serde(default)]
+    pub attempts: u32,
+}
+
+impl QueuedNotification {
+    /// #3175: a fresh (non-resume) notification from a raw pointer text — the
+    /// shape callers with only a string (compose_aware_inject actionable path,
+    /// route_notification, renudge) hand to the delivery worker.
+    pub fn fresh(text: String, actionable: bool) -> Self {
+        Self {
+            text,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            actionable,
+            deferred_since_ms: chrono::Utc::now().timestamp_millis(),
+            resume: false,
+            attempts: 0,
+        }
+    }
 }
 
 fn queue_path(home: &Path, agent_name: &str) -> PathBuf {
@@ -339,6 +366,32 @@ pub fn enqueue(home: &Path, agent_name: &str, text: &str) -> anyhow::Result<()> 
     enqueue_classified(home, agent_name, text, false)
 }
 
+/// #3175: requeue a typed-inject wake whose payload was written but never
+/// confirmed rendered (the delivery worker's `inject_unconfirmed` recovery).
+///
+/// Unlike `requeue_all` (verbatim preservation — cap counts from the original
+/// defer), a RESUME item RESTAMPS `deferred_since_ms` so the flush's busy-hold
+/// paces the retry from THIS requeue: while the pane stays busy the item is
+/// held, released at the MAX_DEFER cap, resume-checked (submit-only — never a
+/// payload rewrite), and requeued again until it lands or the attempt budget
+/// gives up. Text + actionable class are preserved.
+pub fn enqueue_resume(home: &Path, agent_name: &str, original: &QueuedNotification) {
+    let mut resumed = original.clone();
+    resumed.resume = true;
+    resumed.attempts = resumed.attempts.saturating_add(1);
+    resumed.deferred_since_ms = chrono::Utc::now().timestamp_millis();
+    // A swallowed append here is MESSAGE LOSS (the item was already claimed out
+    // of the queue by the flush) — surface it loudly, mirroring `requeue_all`.
+    if let Err(e) = append_queued(home, agent_name, &resumed) {
+        tracing::error!(
+            agent = agent_name,
+            error = %e,
+            text = %resumed.text.chars().take(80).collect::<String>(),
+            "resume requeue FAILED — this queued wake is LOST"
+        );
+    }
+}
+
 /// #1513: enqueue a notification tagged actionable/ambient. `deferred_since_ms`
 /// is stamped now (first defer). Actionable items drain first and carry a
 /// tighter MAX_DEFER cap; ambient retains the legacy contract.
@@ -353,6 +406,8 @@ pub fn enqueue_classified(
         timestamp: chrono::Utc::now().to_rfc3339(),
         actionable,
         deferred_since_ms: chrono::Utc::now().timestamp_millis(),
+        resume: false,
+        attempts: 0,
     };
     append_queued(home, agent_name, &msg)
 }
@@ -405,6 +460,8 @@ pub fn enqueue_coalesced_auto(home: &Path, agent_name: &str, text: &str) -> anyh
         timestamp: chrono::Utc::now().to_rfc3339(),
         actionable: false,
         deferred_since_ms: chrono::Utc::now().timestamp_millis(),
+        resume: false,
+        attempts: 0,
     };
     let Some(kind_key) = agend_auto_kind_prefix(text) else {
         // Not an AGEND-AUTO nudge (defensive — the caller only routes those
@@ -1170,7 +1227,10 @@ mod tests {
         let drained = drain_settled(&home, "a", 1);
         assert_eq!(drained.len(), 1, "resume requeue is exactly one queue line");
         let item = &drained[0];
-        assert_eq!(item.text, "pointer", "text preserved through resume requeue");
+        assert_eq!(
+            item.text, "pointer",
+            "text preserved through resume requeue"
+        );
         assert!(
             item.actionable,
             "actionable class preserved so MAX_DEFER pacing keeps its class"

@@ -2035,10 +2035,7 @@ fn typed_inject_abort_returns_unconfirmed_error_variant_3175() {
     let err = inject_with_target(&target, payload)
         .expect_err("a persistently unrendered payload must abort with an error");
     assert!(
-        matches!(
-            err,
-            crate::error::AgendError::PtyWriteUnconfirmed(_)
-        ),
+        matches!(err, crate::error::AgendError::PtyWriteUnconfirmed(_)),
         "abort must surface the recoverable Unconfirmed variant, got: {err:?}"
     );
     assert_eq!(
