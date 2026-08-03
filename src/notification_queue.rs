@@ -1150,6 +1150,41 @@ mod tests {
     }
 
     #[test]
+    fn enqueue_resume_stamps_resume_bumps_attempts_and_refreshes_defer_3175() {
+        // #3175: the delivery worker requeues an unconfirmed typed inject as a
+        // RESUME item. It must preserve the text + actionable class, flip
+        // `resume`, bump the attempt budget, and RESTAMP `deferred_since_ms` so
+        // the flush's busy-hold paces the retries from THIS requeue (unlike
+        // `requeue_all`, which preserves the original cap count).
+        let home = tmp_home("resume-3175");
+        let original = QueuedNotification {
+            text: "pointer".to_string(),
+            timestamp: "ts-1".to_string(),
+            actionable: true,
+            resume: false,
+            attempts: 1,
+            deferred_since_ms: 111,
+        };
+        enqueue_resume(&home, "a", &original);
+
+        let drained = drain_settled(&home, "a", 1);
+        assert_eq!(drained.len(), 1, "resume requeue is exactly one queue line");
+        let item = &drained[0];
+        assert_eq!(item.text, "pointer", "text preserved through resume requeue");
+        assert!(
+            item.actionable,
+            "actionable class preserved so MAX_DEFER pacing keeps its class"
+        );
+        assert!(item.resume, "resume flag flipped for the submit-only path");
+        assert_eq!(item.attempts, 2, "attempt budget incremented");
+        assert!(
+            item.deferred_since_ms > 111,
+            "deferred_since restamped so the busy-hold counts from this requeue"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
     fn drain_settled_retries_through_transient_lock_contention_2072() {
         // Deterministic reproduction of the #2072 coverage-flake MECHANISM:
         // while the drain lock reads as held, a one-shot `drain()` returns empty
