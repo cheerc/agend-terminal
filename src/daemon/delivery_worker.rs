@@ -32,10 +32,10 @@
 //! line latency becomes real after the Telegram request timeout lands, split into
 //! lanes (one Telegram, one PTY) later — not now.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// Queue depth. Large enough to absorb a burst of watchdog / cron / crash
 /// notifications, small enough that a wedged delivery path (post request-timeout)
@@ -49,6 +49,98 @@ const QUEUE_CAP: usize = 256;
 /// past the budget a persistently-unsettled pane gives up loudly (WARN +
 /// event-log) instead of retrying forever.
 const MAX_RESUME_ATTEMPTS: u32 = 30;
+
+/// (home, agent) → held fresh wakes awaiting release (see [`PENDING_UNCONFIRMED`]).
+type HeldWakeMap =
+    HashMap<(PathBuf, String), VecDeque<crate::notification_queue::QueuedNotification>>;
+
+/// #3176: per-agent serialization across the typed-inject unconfirmed state.
+///
+/// The failure contract of `inject_unconfirmed` is "the payload WAS written
+/// (renders as a draft once the pane settles) but the submit key was withheld"
+/// — so after an unconfirmed abort, the agent's input box holds an UNSENT draft
+/// of that wake. If a later fresh wake for the SAME agent were physically typed
+/// before the draft reaches a terminal resume outcome, the two texts would
+/// combine in one input box and could be submitted together — corrupting both
+/// notifications.
+///
+/// This map enforces the fix: PRESENCE of a `(home, agent)` key means an
+/// unconfirmed wake for that agent is pending (its resume has not reached a
+/// terminal outcome: confirmed `Ok`, gave up past `MAX_RESUME_ATTEMPTS`, or an
+/// unrecoverable `Other` write failure). While present, fresh (`resume: false`)
+/// wakes for that agent are HELD (never physically written) in the value's
+/// FIFO `VecDeque`; the pending wake's own resume item (and nothing else) is
+/// allowed to write submit-only. When the resume reaches a terminal outcome the
+/// entry is taken and the held wakes are released in FIFO order (each released
+/// wake may itself become the next pending one if it aborts).
+///
+/// Held items live only in memory by design (AUDIT2-006 best-effort): the
+/// pending window is bounded by the resume budget (~30 attempts, each paced by
+/// the flush's MAX_DEFER caps), and a queued-but-undrained job is already
+/// explained by its synchronous record.
+static PENDING_UNCONFIRMED: OnceLock<Mutex<HeldWakeMap>> = OnceLock::new();
+
+fn pending_unconfirmed_map() -> &'static Mutex<HeldWakeMap> {
+    PENDING_UNCONFIRMED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn pending_key(home: &Path, agent: &str) -> (PathBuf, String) {
+    (home.to_path_buf(), agent.to_string())
+}
+
+/// #3176: is an unconfirmed wake for this agent still awaiting its terminal
+/// resume outcome? If so, fresh wakes must be held, never physically written.
+fn has_pending_unconfirmed(home: &Path, agent: &str) -> bool {
+    pending_unconfirmed_map()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains_key(&pending_key(home, agent))
+}
+
+/// #3176: record that an unconfirmed wake for this agent is awaiting resume.
+/// Idempotent — the first unconfirmed of a cycle creates the entry, a re-
+/// unconfirmed resume keeps it.
+fn set_pending_unconfirmed(home: &Path, agent: &str) {
+    pending_unconfirmed_map()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(pending_key(home, agent))
+        .or_default();
+}
+
+/// #3176: hold a fresh wake while the agent's pending unconfirmed resume has
+/// not reached a terminal outcome. Order is preserved (FIFO) so held wakes
+/// release in arrival order.
+fn hold_item(
+    home: &Path,
+    agent: &str,
+    notification: crate::notification_queue::QueuedNotification,
+) {
+    tracing::debug!(
+        agent = %agent,
+        tag = "#3176-hold",
+        "fresh wake HELD — same-agent typed inject still unconfirmed (resume pending)"
+    );
+    pending_unconfirmed_map()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(pending_key(home, agent))
+        .or_default()
+        .push_back(notification);
+}
+
+/// #3176: take the held-wakes FIFO for an agent and clear its pending marker.
+/// Returns `None` when no pending unconfirmed exists. Called only at a terminal
+/// resume outcome — afterwards fresh wakes may write again.
+fn take_held(
+    home: &Path,
+    agent: &str,
+) -> Option<VecDeque<crate::notification_queue::QueuedNotification>> {
+    pending_unconfirmed_map()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&pending_key(home, agent))
+}
 
 /// A unit of blocking delivery work offloaded off the tick / main-loop thread.
 enum DeliveryJob {
@@ -192,7 +284,7 @@ fn dispatch(job: DeliveryJob) {
             notification,
             epoch,
         } => {
-            let _serial = transport_coordinator().serial.lock();
+let _serial = transport_coordinator().serial.lock();
             if crate::agent::deleting::is_deleting(&home, &agent)
                 || transport_epoch(&home, &agent) != epoch
             {
@@ -204,54 +296,28 @@ fn dispatch(job: DeliveryJob) {
                 );
                 return;
             }
-            // #3175: the legacy injector runs on the worker thread (never a
-            // second enqueue from here). It returns a STRUCTURED failure
-            // classification; an unconfirmed readback-abort requeues its OWN
-            // payload as a RESUME item — never re-typed — while any transport
-            // write failure other than the recoverable abort is dropped (the
-            // legacy pre-#3175 semantics apply).
+            // #3175+#3176: the legacy injector runs on the worker thread via
+            // `dispatch_pty_wake`, which enforces per-agent serialization across
+            // the unconfirmed state: a FRESH wake for an agent whose earlier wake
+            // is still unconfirmed is HELD (never physically written) until the
+            // pending resume reaches a terminal outcome. Structured backends
+            // (Codex / OpenCode NativeShared) deliver through their own transport
+            // seam instead — the closure here is only invoked for the LegacyPty
+            // path.
             let body = notification.text.clone();
             let result = crate::transport::deliver_notification(
                 &home,
                 &agent,
                 &body,
                 move |home, agent, _notification| {
-                    use crate::inbox::notify::InjectDeliveryFailure;
                     #[cfg(test)]
                     test_support::note_legacy_wake(agent);
-                    match crate::inbox::notify::inject_with_submit_direct(home, agent, &notification) {
-                        Ok(()) => {}
-                        Err(InjectDeliveryFailure::Unconfirmed(message)) => {
-                            if notification.attempts >= MAX_RESUME_ATTEMPTS {
-                                tracing::warn!(
-                                    agent = %agent,
-                                    tag = "#3175-resume-give-up",
-                                    attempts = notification.attempts,
-                                    error = %message,
-                                    "typed inject unconfirmed after {MAX_RESUME_ATTEMPTS} resume attempts \
-                                     — wake dropped (pane never settled; check the pane for a stranded \
-                                     draft)"
-                                );
-                                crate::event_log::log(
-                                    &home,
-                                    "inject_unconfirmed_gave_up",
-                                    &agent,
-                                    "typed inject payload unconfirmed after resume budget — wake dropped",
-                                );
-                            } else {
-                                tracing::debug!(
-                                    agent = %agent,
-                                    tag = "#3175-resume-requeue",
-                                    attempts = notification.attempts,
-                                    "typed inject unconfirmed — requeueing as resume item"
-                                );
-                                crate::notification_queue::enqueue_resume(&home, &agent, &notification);
-                            }
-                        }
-                        Err(InjectDeliveryFailure::Other(e)) => {
-                            tracing::debug!(agent = %agent, error = %e, "delivery_worker: legacy wake inject failed");
-                        }
-                    }
+                    dispatch_pty_wake(
+                        home,
+                        agent,
+                        notification.clone(),
+                        &mut crate::inbox::notify::inject_with_submit_direct,
+                    );
                     Ok(())
                 },
             );
@@ -316,6 +382,169 @@ fn dispatch(job: DeliveryJob) {
                 channels = dispatched,
                 "tick_stall: tick host wedged — out-of-band page dispatched"
             );
+        }
+    }
+}
+
+/// #3176: deliver ONE submit-aware PTY wake, enforcing per-agent serialization
+/// across the typed-inject unconfirmed state (see [`PENDING_UNCONFIRMED`]).
+///
+/// Runs on the delivery worker thread. `inject` is the physical write
+/// primitive; production passes [`crate::inbox::notify::inject_with_submit_direct`],
+/// tests pass a scripted closure. NOTE: the caller MUST be the only thread
+/// driving physical writes for an agent (the worker is single-threaded), or the
+/// hold/release discipline is meaningless.
+fn dispatch_pty_wake<F>(
+    home: &Path,
+    agent: &str,
+    notification: crate::notification_queue::QueuedNotification,
+    inject: &mut F,
+) where
+    F: FnMut(
+        &Path,
+        &str,
+        &crate::notification_queue::QueuedNotification,
+    ) -> Result<(), crate::inbox::notify::InjectDeliveryFailure>,
+{
+    use crate::inbox::notify::InjectDeliveryFailure;
+    // #3176: while an earlier same-agent wake is unconfirmed (its payload is
+    // already in the input area as an unsubmitted draft and its resume is
+    // pending), a FRESH wake must not physically write — typing it now would
+    // combine/corrupt the two notifications and could submit them together.
+    // Hold it in memory; the pending resume's terminal outcome releases it.
+    if !notification.resume && has_pending_unconfirmed(home, agent) {
+        hold_item(home, agent, notification);
+        return;
+    }
+    match inject(home, agent, &notification) {
+        Ok(()) => {
+            // Terminal success for the agent's pending resume (submit-only) —
+            // the unsubmitted draft is gone and fresh wakes may write again.
+            if notification.resume {
+                release_held(home, agent, inject);
+            }
+        }
+        // #3175: typed-inject readback-abort — the payload WAS written
+        // (renders as a draft once the pane settles) but the submit key
+        // was withheld. Requeue as a RESUME item: the flush holds it
+        // while busy (fresh defer timestamp) and re-attempts submit-only
+        // — never a payload rewrite, so no buffer duplication, and it
+        // survives arbitrarily long generations. Bounded by the attempt
+        // budget so a dead pane gives up loudly instead of retrying
+        // forever. #3176 wraps that recovery in per-agent serialization.
+        Err(InjectDeliveryFailure::Unconfirmed(message)) => {
+            if notification.attempts >= MAX_RESUME_ATTEMPTS {
+                // Give-up is a TERMINAL resume outcome: the pending draft is
+                // declared unrecoverable (loudly logged) and fresh wakes may
+                // proceed.
+                release_held(home, agent, inject);
+                tracing::warn!(
+                    agent = %agent,
+                    tag = "#3175-resume-give-up",
+                    attempts = notification.attempts,
+                    error = %message,
+                    "typed inject unconfirmed after {MAX_RESUME_ATTEMPTS} resume attempts \
+                     — wake dropped (pane never settled; check the pane for a stranded \
+                     draft)"
+                );
+                crate::event_log::log(
+                    home,
+                    "inject_unconfirmed_gave_up",
+                    agent,
+                    "typed inject payload unconfirmed after resume budget — wake dropped",
+                );
+            } else {
+                tracing::debug!(
+                    agent = %agent,
+                    tag = "#3175-resume-requeue",
+                    attempts = notification.attempts,
+                    "typed inject unconfirmed — requeueing as resume item"
+                );
+                set_pending_unconfirmed(home, agent);
+                crate::notification_queue::enqueue_resume(home, agent, &notification);
+            }
+        }
+        // Any physical write failure other than the recoverable abort. On a
+        // RESUME item this is terminal too (the write did not complete; the
+        // pending draft is unreachable) so held fresh wakes are released —
+        // matching the pre-#3176 drop semantics for `Other`.
+        Err(InjectDeliveryFailure::Other(e)) => {
+            if notification.resume {
+                release_held(home, agent, inject);
+            }
+            tracing::debug!(agent = %agent, error = %e, "delivery_worker: PTY wake inject failed");
+        }
+    }
+}
+
+/// #3176: terminal resume outcome reached for an agent's pending unconfirmed
+/// wake — take the held FIFO and release each held fresh wake IN ORDER. Each
+/// release is a real physical write via `inject`; a released wake that aborts
+/// unconfirmed becomes the agent's NEW pending wake and the remaining held
+/// wakes stay held behind it (they never overtake an unconfirmed draft).
+fn release_held<F>(home: &Path, agent: &str, inject: &mut F)
+where
+    F: FnMut(
+        &Path,
+        &str,
+        &crate::notification_queue::QueuedNotification,
+    ) -> Result<(), crate::inbox::notify::InjectDeliveryFailure>,
+{
+    use crate::inbox::notify::InjectDeliveryFailure;
+    let Some(mut held) = take_held(home, agent) else {
+        return;
+    };
+    while let Some(notification) = held.pop_front() {
+        // A previous release aborted and re-marked this agent as pending —
+        // the remainder must not write ahead of that fresh unconfirmed draft.
+        if has_pending_unconfirmed(home, agent) {
+            pending_unconfirmed_map()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entry(pending_key(home, agent))
+                .or_default()
+                .extend(held);
+            return;
+        }
+        match inject(home, agent, &notification) {
+            Ok(()) => {}
+            Err(InjectDeliveryFailure::Unconfirmed(message)) => {
+                if notification.attempts >= MAX_RESUME_ATTEMPTS {
+                    // Give-up is terminal for THIS wake too: its draft is
+                    // declared unrecoverable and the next held wake may
+                    // proceed (uniform with the resume give-up path).
+                    tracing::warn!(
+                        agent = %agent,
+                        tag = "#3175-resume-give-up",
+                        attempts = notification.attempts,
+                        error = %message,
+                        "typed inject unconfirmed after {MAX_RESUME_ATTEMPTS} resume attempts \
+                         — wake dropped (pane never settled; check the pane for a stranded \
+                         draft)"
+                    );
+                    crate::event_log::log(
+                        home,
+                        "inject_unconfirmed_gave_up",
+                        agent,
+                        "typed inject payload unconfirmed after resume budget — wake dropped",
+                    );
+                    continue;
+                }
+                set_pending_unconfirmed(home, agent);
+                crate::notification_queue::enqueue_resume(home, agent, &notification);
+                // This released wake is now the pending draft; the remainder
+                // stays held behind it.
+                pending_unconfirmed_map()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .entry(pending_key(home, agent))
+                    .or_default()
+                    .extend(held);
+                return;
+            }
+            Err(InjectDeliveryFailure::Other(e)) => {
+                tracing::debug!(agent = %agent, error = %e, "delivery_worker: PTY wake inject failed");
+            }
         }
     }
 }
@@ -485,6 +714,26 @@ pub(crate) mod test_support {
 
     pub(super) fn force_full() -> bool {
         FORCE_FULL.load(Ordering::Relaxed)
+    }
+
+    /// #3176: clear the process-global unconfirmed-pending registry. Tests key
+    /// their state on unique tempdir homes (no cross-talk), but a deterministic
+    /// reset also guards against a leaked entry surviving into another test.
+    /// MUST be called while holding [`pending_guard`] — the map is process-
+    /// global and parallel tests would otherwise wipe each other's live state.
+    pub(crate) fn reset_pending_unconfirmed() {
+        super::pending_unconfirmed_map()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+    }
+
+    /// #3176: serialize tests that touch the process-global unconfirmed-pending
+    /// registry. Hold the returned guard across the whole
+    /// reset→dispatch→assert→reset window. Every pending-state test MUST hold it.
+    pub(crate) fn pending_guard() -> parking_lot::MutexGuard<'static, ()> {
+        static PENDING_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        PENDING_LOCK.lock()
     }
 }
 
@@ -727,5 +976,267 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn tmp_home(suffix: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-delivery-worker-{suffix}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// #3176 regression test (reviewer: "two same-agent notifications where the
+    /// first physical inject is forced unconfirmed and the second must not write
+    /// before the first is resolved"):
+    ///
+    ///   1. WAKE_A is physically written and aborts unconfirmed — its payload is
+    ///      now an unsubmitted draft in the pane; the worker records the pending
+    ///      state and requeues WAKE_A as a resume item (submit-only, never
+    ///      re-typed).
+    ///   2. WAKE_B for the SAME agent arrives while WAKE_A is unresolved — it
+    ///      MUST NOT physically write (typing it now would combine/corrupt the
+    ///      two notifications and potentially submit them together).
+    ///   3. Only once WAKE_A's resume reaches a terminal outcome (success) is
+    ///      WAKE_B released and physically written.
+    #[test]
+    fn same_agent_second_wake_not_written_until_first_resolved_3176() {
+        let _pending_guard = test_support::pending_guard();
+        test_support::reset_pending_unconfirmed();
+        let home = tmp_home("3176-serial");
+        let agent = "agentA";
+        let written: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        let mut inject = |_: &std::path::Path,
+                          _: &str,
+                          n: &crate::notification_queue::QueuedNotification|
+         -> Result<(), crate::inbox::notify::InjectDeliveryFailure> {
+            let mut w = written.borrow_mut();
+            w.push(n.text.clone());
+            if w.len() == 1 {
+                Err(crate::inbox::notify::InjectDeliveryFailure::Unconfirmed(
+                    "forced abort".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        };
+
+        let wake_a = crate::notification_queue::QueuedNotification::fresh("WAKE_A".into(), true);
+        let wake_b = crate::notification_queue::QueuedNotification::fresh("WAKE_B".into(), false);
+
+        // 1) First same-agent wake aborts unconfirmed → pending + resume requeued.
+        dispatch_pty_wake(&home, agent, wake_a.clone(), &mut inject);
+        assert_eq!(
+            *written.borrow(),
+            ["WAKE_A"],
+            "first wake must be physically written"
+        );
+        assert!(
+            has_pending_unconfirmed(&home, agent),
+            "the unconfirmed wake must be recorded as pending for its agent"
+        );
+        let queue_file = home
+            .join("notification-queue")
+            .join(format!("{agent}.jsonl"));
+        let queued = std::fs::read_to_string(&queue_file).expect("resume item must be on disk");
+        assert!(
+            queued.contains("WAKE_A") && queued.contains("\"resume\":true"),
+            "the aborted wake must be requeued as a RESUME item (submit-only): {queued}"
+        );
+
+        // 2) Second same-agent wake while A unresolved → HELD, never written.
+        dispatch_pty_wake(&home, agent, wake_b.clone(), &mut inject);
+        assert_eq!(
+            *written.borrow(),
+            ["WAKE_A"],
+            "second same-agent wake must NOT write before the first is resolved"
+        );
+
+        // 3) A's resume succeeds (terminal) → the held wake is released.
+        let mut resume_a = wake_a.clone();
+        resume_a.resume = true;
+        resume_a.attempts = 1;
+        dispatch_pty_wake(&home, agent, resume_a, &mut inject);
+        assert_eq!(
+            *written.borrow(),
+            ["WAKE_A", "WAKE_A", "WAKE_B"],
+            "held wake must be physically written only after the first wake is resolved"
+        );
+        assert!(
+            !has_pending_unconfirmed(&home, agent),
+            "pending unconfirmed state must clear at the terminal resume outcome"
+        );
+        test_support::reset_pending_unconfirmed();
+    }
+
+    /// #3176: the unconfirmed hold is PER-AGENT — a wake for a different agent
+    /// must never be delayed by another agent's pending resume.
+    #[test]
+    fn unconfirmed_hold_is_per_agent_3176() {
+        let _pending_guard = test_support::pending_guard();
+        test_support::reset_pending_unconfirmed();
+        let home = tmp_home("3176-peragent");
+        let written: std::cell::RefCell<Vec<(String, String)>> =
+            std::cell::RefCell::new(Vec::new());
+        let mut inject = |_: &std::path::Path,
+                          a: &str,
+                          n: &crate::notification_queue::QueuedNotification|
+         -> Result<(), crate::inbox::notify::InjectDeliveryFailure> {
+            let mut w = written.borrow_mut();
+            w.push((a.to_string(), n.text.clone()));
+            if w.len() == 1 {
+                Err(crate::inbox::notify::InjectDeliveryFailure::Unconfirmed(
+                    "forced abort".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        };
+
+        // agentA's wake aborts → pending ONLY for agentA.
+        dispatch_pty_wake(
+            &home,
+            "agentA",
+            crate::notification_queue::QueuedNotification::fresh("A1".into(), true),
+            &mut inject,
+        );
+        assert!(has_pending_unconfirmed(&home, "agentA"));
+        // agentB's wake writes immediately — serialization is per-agent.
+        dispatch_pty_wake(
+            &home,
+            "agentB",
+            crate::notification_queue::QueuedNotification::fresh("B1".into(), true),
+            &mut inject,
+        );
+        assert_eq!(
+            *written.borrow(),
+            [
+                ("agentA".to_string(), "A1".to_string()),
+                ("agentB".to_string(), "B1".to_string())
+            ],
+            "a different agent's wake must not be held by agentA's pending resume"
+        );
+        test_support::reset_pending_unconfirmed();
+    }
+
+    /// #3176: held wakes release in FIFO arrival order once the pending resume
+    /// succeeds. A released wake that itself aborts unconfirmed becomes the NEW
+    /// pending wake; the remainder stays held behind it (never overtaking the
+    /// fresh unconfirmed draft).
+    #[test]
+    fn held_wakes_release_in_fifo_order_and_reabort_holds_remainder_3176() {
+        let _pending_guard = test_support::pending_guard();
+        test_support::reset_pending_unconfirmed();
+        let home = tmp_home("3176-release");
+        let agent = "agentA";
+        let calls: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        let mut inject = |_: &std::path::Path,
+                          _: &str,
+                          n: &crate::notification_queue::QueuedNotification|
+         -> Result<(), crate::inbox::notify::InjectDeliveryFailure> {
+            let mut c = calls.borrow_mut();
+            c.push(n.text.clone());
+            // 1st physical write (A) and 3rd (B released) abort unconfirmed.
+            match c.len() {
+                1 | 3 => Err(crate::inbox::notify::InjectDeliveryFailure::Unconfirmed(
+                    "forced abort".to_string(),
+                )),
+                _ => Ok(()),
+            }
+        };
+
+        let wake_a = crate::notification_queue::QueuedNotification::fresh("WAKE_A".into(), true);
+        let wake_b = crate::notification_queue::QueuedNotification::fresh("WAKE_B".into(), false);
+        let wake_c = crate::notification_queue::QueuedNotification::fresh("WAKE_C".into(), false);
+
+        // A aborts (pending); B and C are held.
+        dispatch_pty_wake(&home, agent, wake_a.clone(), &mut inject);
+        dispatch_pty_wake(&home, agent, wake_b.clone(), &mut inject);
+        dispatch_pty_wake(&home, agent, wake_c.clone(), &mut inject);
+        assert_eq!(
+            *calls.borrow(),
+            ["WAKE_A"],
+            "only A has physically written so far"
+        );
+
+        // A's resume succeeds → release B (which aborts → becomes new pending),
+        // C stays held behind it.
+        let mut resume_a = wake_a.clone();
+        resume_a.resume = true;
+        resume_a.attempts = 1;
+        dispatch_pty_wake(&home, agent, resume_a, &mut inject);
+        assert_eq!(
+            *calls.borrow(),
+            ["WAKE_A", "WAKE_A", "WAKE_B"],
+            "B released in order but aborted"
+        );
+        assert!(
+            has_pending_unconfirmed(&home, agent),
+            "the re-aborted released wake B must become the new pending wake; C stays held"
+        );
+
+        // B's resume succeeds → C is finally released.
+        let mut resume_b = wake_b.clone();
+        resume_b.resume = true;
+        resume_b.attempts = 1;
+        dispatch_pty_wake(&home, agent, resume_b, &mut inject);
+        assert_eq!(
+            *calls.borrow(),
+            ["WAKE_A", "WAKE_A", "WAKE_B", "WAKE_B", "WAKE_C"],
+            "held wakes release in FIFO order, each behind the previous resolution"
+        );
+        assert!(
+            !has_pending_unconfirmed(&home, agent),
+            "pending unconfirmed state must clear once the tail wake resolves"
+        );
+        test_support::reset_pending_unconfirmed();
+    }
+
+    /// #3176: give-up (resume budget exhausted) is a TERMINAL resume outcome —
+    /// the held fresh wakes are released rather than trapped forever behind a
+    /// pane that never settles.
+    #[test]
+    fn give_up_is_terminal_and_releases_held_wakes_3176() {
+        let _pending_guard = test_support::pending_guard();
+        test_support::reset_pending_unconfirmed();
+        let home = tmp_home("3176-giveup");
+        let agent = "agentA";
+        let written: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        let mut inject = |_: &std::path::Path,
+                          _: &str,
+                          n: &crate::notification_queue::QueuedNotification|
+         -> Result<(), crate::inbox::notify::InjectDeliveryFailure> {
+            written.borrow_mut().push(n.text.clone());
+            Err(crate::inbox::notify::InjectDeliveryFailure::Unconfirmed(
+                "pane never settles".to_string(),
+            ))
+        };
+
+        let wake_a = crate::notification_queue::QueuedNotification::fresh("WAKE_A".into(), true);
+        let wake_b = crate::notification_queue::QueuedNotification::fresh("WAKE_B".into(), false);
+
+        // A aborts → pending; B held.
+        dispatch_pty_wake(&home, agent, wake_a.clone(), &mut inject);
+        dispatch_pty_wake(&home, agent, wake_b.clone(), &mut inject);
+        assert_eq!(
+            *written.borrow(),
+            ["WAKE_A"],
+            "B must be held while A is unresolved"
+        );
+
+        // A's resume has exhausted the budget → give-up: A is declared terminal
+        // and B is physically released even though A never settled.
+        let mut resume_a = wake_a.clone();
+        resume_a.resume = true;
+        resume_a.attempts = MAX_RESUME_ATTEMPTS;
+        dispatch_pty_wake(&home, agent, resume_a, &mut inject);
+        assert_eq!(
+            *written.borrow(),
+            ["WAKE_A", "WAKE_A", "WAKE_B"],
+            "give-up is a terminal resume outcome: held wakes may write afterwards"
+        );
+        test_support::reset_pending_unconfirmed();
     }
 }
