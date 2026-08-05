@@ -2104,6 +2104,12 @@ fn cleanup_agent(
     remove_and_unregister(registry, id);
     if let Some(ref home) = home {
         crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
+        // #3176: this agent's pane is being torn down (shell fallback respawn /
+        // shutdown / signal-kill removal) — any unproven stranded typed-inject
+        // draft is destroyed with it. Lift a delivery-worker quarantine so held
+        // wakes stop being blocked; they are re-enqueued fresh and land on the
+        // (re)spawned pane. Harmless when no quarantine is set.
+        crate::daemon::delivery_worker::lift_quarantine(home, name);
     }
 }
 

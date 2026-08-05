@@ -799,7 +799,8 @@ fn inject_with_submit(
     notification: crate::notification_queue::QueuedNotification,
 ) -> anyhow::Result<()> {
     let text = notification.text.clone();
-    if crate::daemon::delivery_worker::enqueue_transport_delivery(home, agent_name, notification).is_ok()
+    if crate::daemon::delivery_worker::enqueue_transport_delivery(home, agent_name, notification)
+        .is_ok()
     {
         return Ok(());
     }

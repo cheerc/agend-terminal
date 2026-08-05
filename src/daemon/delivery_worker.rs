@@ -32,7 +32,7 @@
 //! line latency becomes real after the Telegram request timeout lands, split into
 //! lanes (one Telegram, one PTY) later — not now.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock};
@@ -47,7 +47,8 @@ const QUEUE_CAP: usize = 256;
 /// MAX_DEFER cap, ~7s ambient while busy) and costs only a short readback poll
 /// (500ms) — the payload is NEVER re-written. Covers multi-minute generations;
 /// past the budget a persistently-unsettled pane gives up loudly (WARN +
-/// event-log) instead of retrying forever.
+/// event-log) and the agent is QUARANTINED (see [`QUARANTINED`]) instead of
+/// retrying forever — held wakes stay blocked until a provable recovery.
 const MAX_RESUME_ATTEMPTS: u32 = 30;
 
 /// (home, agent) → held fresh wakes awaiting release (see [`PENDING_UNCONFIRMED`]).
@@ -66,22 +67,44 @@ type HeldWakeMap =
 ///
 /// This map enforces the fix: PRESENCE of a `(home, agent)` key means an
 /// unconfirmed wake for that agent is pending (its resume has not reached a
-/// terminal outcome: confirmed `Ok`, gave up past `MAX_RESUME_ATTEMPTS`, or an
-/// unrecoverable `Other` write failure). While present, fresh (`resume: false`)
-/// wakes for that agent are HELD (never physically written) in the value's
-/// FIFO `VecDeque`; the pending wake's own resume item (and nothing else) is
-/// allowed to write submit-only. When the resume reaches a terminal outcome the
-/// entry is taken and the held wakes are released in FIFO order (each released
-/// wake may itself become the next pending one if it aborts).
+/// TERMINAL outcome). While present, fresh (`resume: false`) wakes for
+/// that agent are HELD (never physically written) in the value's FIFO
+/// `VecDeque`; the pending wake's own resume item (and nothing else) is allowed
+/// to write submit-only.
+///
+/// Only a resume that returns `Ok` (the draft was provably submitted/cleared)
+/// is a safe release: [`release_held`] then takes the FIFO and releases each
+/// held wake IN ORDER — a released wake that itself aborts becomes the new
+/// pending one. Because a resume `Ok` is the ONLY proof the input box is clean,
+/// the terminal-but-unsettled outcomes (resume budget give-up, or an `Other`
+/// write failure on a resume) do NOT release: the agent is recorded in
+/// [`QUARANTINED`] and its held wakes stay blocked until an equivalent recovery
+/// (agent/pane lifecycle invalidation, or an explicit operator recovery)
+/// clears it — see [`lift_quarantine`]. Never write a fresh wake on top of a
+/// stranded draft.
 ///
 /// Held items live only in memory by design (AUDIT2-006 best-effort): the
 /// pending window is bounded by the resume budget (~30 attempts, each paced by
 /// the flush's MAX_DEFER caps), and a queued-but-undrained job is already
-/// explained by its synchronous record.
+/// explained by its synchronous record. While quarantined, held items likewise
+/// stay in-memory until lifecycle recovery; the queue itself remains bounded by
+/// `QUEUE_CAP`.
 static PENDING_UNCONFIRMED: OnceLock<Mutex<HeldWakeMap>> = OnceLock::new();
 
 fn pending_unconfirmed_map() -> &'static Mutex<HeldWakeMap> {
     PENDING_UNCONFIRMED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// (home, agent) → agent is QUARANTINED: an unconfirmed draft may still sit in
+/// the input box AND no resume will resolve it (the resume budget gave up, or a
+/// resume-drain `Other` write failure occurred). Later same-agent wakes MUST NOT
+/// be physically written until the draft is provably cleared (a later resume
+/// `Ok`), the pane/agent lifecycle invalidates the draft (agent restart/removal),
+/// or an explicit operator recovery resolves it.
+static QUARANTINED: OnceLock<Mutex<HashSet<(PathBuf, String)>>> = OnceLock::new();
+
+fn quarantined_set() -> &'static Mutex<HashSet<(PathBuf, String)>> {
+    QUARANTINED.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 fn pending_key(home: &Path, agent: &str) -> (PathBuf, String) {
@@ -97,6 +120,15 @@ fn has_pending_unconfirmed(home: &Path, agent: &str) -> bool {
         .contains_key(&pending_key(home, agent))
 }
 
+/// #3176: is this agent QUARANTINED (unproven stranded draft + no resume in
+/// flight)? Same write-blocking effect as [`has_pending_unconfirmed`].
+fn is_quarantined(home: &Path, agent: &str) -> bool {
+    quarantined_set()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(&pending_key(home, agent))
+}
+
 /// #3176: record that an unconfirmed wake for this agent is awaiting resume.
 /// Idempotent — the first unconfirmed of a cycle creates the entry, a re-
 /// unconfirmed resume keeps it.
@@ -106,6 +138,76 @@ fn set_pending_unconfirmed(home: &Path, agent: &str) {
         .unwrap_or_else(|p| p.into_inner())
         .entry(pending_key(home, agent))
         .or_default();
+}
+
+/// #3176: quarantine this agent — its unproven stranded draft must block later
+/// same-agent wakes until a provable recovery (resume `Ok`, pane/agent lifecycle
+/// invalidation, or operator recovery) lifts it. Idempotent.
+fn set_quarantined(home: &Path, agent: &str) {
+    quarantined_set()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(pending_key(home, agent));
+}
+
+/// #3176: clear the quarantine marker once the stranded draft is provably
+/// resolved (a resume reached `Ok`) or intentionally invalidated (pane/agent
+/// lifecycle, operator recovery). Does NOT touch the held-wakes FIFO.
+fn clear_quarantine(home: &Path, agent: &str) {
+    quarantined_set()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&pending_key(home, agent));
+}
+
+/// #3176: permanently lift quarantine for an agent when the stranded draft has
+/// been invalidated OUTSIDE the unconfirmed-resume cycle — the pane/agent
+/// lifecycle tore it down (agent restarted or removed, so the old input box is
+/// gone) or an explicit operator recovery replaced/cleared it. The held wakes
+/// are re-released IN ORDER by re-enqueueing them as FRESH deliveries on the
+/// worker thread (never a physical write from the caller's thread — the worker
+/// is the single writer). Any wake the worker later flushes that aborts again
+/// cycles through the normal pending/unconfirmed recovery.
+pub(crate) fn lift_quarantine(home: &Path, agent: &str) {
+    lift_quarantine_with(home, agent, &mut |h, a, n| {
+        enqueue_transport_delivery(h, a, n.clone()).map_err(|()| {
+            crate::inbox::notify::InjectDeliveryFailure::Other("delivery queue full".to_string())
+        })
+    });
+}
+
+/// #3176: core of [`lift_quarantine`], injectable for tests. Clears the
+/// quarantine marker and re-hands each held wake to `inject` (in FIFO order);
+/// a failed re-enqueue stops the lift (remaining wakes are dropped loud, the
+/// quarantine is already lifted so fresh wakes may write again).
+fn lift_quarantine_with<F>(home: &Path, agent: &str, inject: &mut F)
+where
+    F: FnMut(
+        &Path,
+        &str,
+        &crate::notification_queue::QueuedNotification,
+    ) -> Result<(), crate::inbox::notify::InjectDeliveryFailure>,
+{
+    clear_quarantine(home, agent);
+    let Some(held) = take_held(home, agent) else {
+        return;
+    };
+    tracing::info!(
+        agent = %agent,
+        tag = "#3176-lift-quarantine",
+        held = held.len(),
+        "quarantine lifted — held wakes re-enqueued"
+    );
+    for n in held {
+        if inject(home, agent, &n).is_err() {
+            tracing::warn!(
+                agent = %agent,
+                tag = "#3176-lift-quarantine",
+                "held wake re-enqueue failed during quarantine lift — dropped"
+            );
+            break;
+        }
+    }
 }
 
 /// #3176: hold a fresh wake while the agent's pending unconfirmed resume has
@@ -284,7 +386,7 @@ fn dispatch(job: DeliveryJob) {
             notification,
             epoch,
         } => {
-let _serial = transport_coordinator().serial.lock();
+            let _serial = transport_coordinator().serial.lock();
             if crate::agent::deleting::is_deleting(&home, &agent)
                 || transport_epoch(&home, &agent) != epoch
             {
@@ -409,18 +511,24 @@ fn dispatch_pty_wake<F>(
     use crate::inbox::notify::InjectDeliveryFailure;
     // #3176: while an earlier same-agent wake is unconfirmed (its payload is
     // already in the input area as an unsubmitted draft and its resume is
-    // pending), a FRESH wake must not physically write — typing it now would
-    // combine/corrupt the two notifications and could submit them together.
-    // Hold it in memory; the pending resume's terminal outcome releases it.
-    if !notification.resume && has_pending_unconfirmed(home, agent) {
+    // pending) OR the agent is QUARANTINED (a terminal-but-unsettled resume
+    // outcome left an unPROVEN stranded draft in the box), a FRESH wake must
+    // not physically write — typing it now would combine/corrupt the two
+    // notifications and could submit them together. Hold it in memory; only a
+    // provable recovery (resume `Ok`, pane/agent lifecycle invalidation, or an
+    // explicit operator recovery via [`lift_quarantine`]) releases it.
+    if !notification.resume && (has_pending_unconfirmed(home, agent) || is_quarantined(home, agent))
+    {
         hold_item(home, agent, notification);
         return;
     }
     match inject(home, agent, &notification) {
         Ok(()) => {
             // Terminal success for the agent's pending resume (submit-only) —
-            // the unsubmitted draft is gone and fresh wakes may write again.
+            // the unsubmitted draft is provably submitted/cleared, so any
+            // quarantine is lifted too and fresh wakes may write again.
             if notification.resume {
+                clear_quarantine(home, agent);
                 release_held(home, agent, inject);
             }
         }
@@ -434,24 +542,29 @@ fn dispatch_pty_wake<F>(
         // forever. #3176 wraps that recovery in per-agent serialization.
         Err(InjectDeliveryFailure::Unconfirmed(message)) => {
             if notification.attempts >= MAX_RESUME_ATTEMPTS {
-                // Give-up is a TERMINAL resume outcome: the pending draft is
-                // declared unrecoverable (loudly logged) and fresh wakes may
-                // proceed.
-                release_held(home, agent, inject);
+                // Give-up is a LIVENESS terminal condition — the resume budget
+                // is exhausted — but it is NOT proof that the stranded draft
+                // was submitted or cleared. The pane never settled, so the
+                // unsubmitted draft may still sit in the input box. QUARANTINE
+                // the agent: held fresh wakes stay blocked (never physically
+                // written) until a provable recovery — a later resume `Ok`,
+                // pane/agent lifecycle invalidation, or an explicit operator
+                // recovery via [`lift_quarantine`].
+                set_quarantined(home, agent);
                 tracing::warn!(
                     agent = %agent,
                     tag = "#3175-resume-give-up",
                     attempts = notification.attempts,
                     error = %message,
                     "typed inject unconfirmed after {MAX_RESUME_ATTEMPTS} resume attempts \
-                     — wake dropped (pane never settled; check the pane for a stranded \
-                     draft)"
+                     — agent QUARANTINED (pane never settled; stranded draft may remain; \
+                     held wakes blocked pending recovery)"
                 );
                 crate::event_log::log(
                     home,
                     "inject_unconfirmed_gave_up",
                     agent,
-                    "typed inject payload unconfirmed after resume budget — wake dropped",
+                    "typed inject payload unconfirmed after resume budget — agent quarantined",
                 );
             } else {
                 tracing::debug!(
@@ -465,12 +578,28 @@ fn dispatch_pty_wake<F>(
             }
         }
         // Any physical write failure other than the recoverable abort. On a
-        // RESUME item this is terminal too (the write did not complete; the
-        // pending draft is unreachable) so held fresh wakes are released —
-        // matching the pre-#3176 drop semantics for `Other`.
+        // RESUME item the submit-only write did not complete — this does NOT
+        // prove the pre-existing draft was cleared (e.g. self-IPC failed
+        // before the submit landed), so held fresh wakes must NOT be released:
+        // quarantine the agent instead, matching the give-up discipline above.
+        // On a FRESH item `Other` is a plain failed write (no draft was
+        // created); pre-#3176 drop semantics apply.
         Err(InjectDeliveryFailure::Other(e)) => {
             if notification.resume {
-                release_held(home, agent, inject);
+                set_quarantined(home, agent);
+                tracing::warn!(
+                    agent = %agent,
+                    tag = "#3175-resume-other-quarantine",
+                    error = %e,
+                    "resume submit-only inject failed with Other — agent QUARANTINED \
+                     (draft may remain; held wakes blocked pending recovery)"
+                );
+                crate::event_log::log(
+                    home,
+                    "inject_resume_other_quarantined",
+                    agent,
+                    "resume submit-only inject failed — agent quarantined; held wakes blocked pending recovery",
+                );
             }
             tracing::debug!(agent = %agent, error = %e, "delivery_worker: PTY wake inject failed");
         }
@@ -510,25 +639,36 @@ where
             Ok(()) => {}
             Err(InjectDeliveryFailure::Unconfirmed(message)) => {
                 if notification.attempts >= MAX_RESUME_ATTEMPTS {
-                    // Give-up is terminal for THIS wake too: its draft is
-                    // declared unrecoverable and the next held wake may
-                    // proceed (uniform with the resume give-up path).
+                    // Give-up here is the same LIVENESS terminal as in
+                    // `dispatch_pty_wake`: the budget is exhausted but that is
+                    // NOT proof the stranded draft was submitted/cleared. The
+                    // remainder must NOT release over it — quarantine the agent
+                    // and hold the rest behind (never writes on an unproven
+                    // draft). `take_held` already removed this FIFO from the
+                    // map, so re-insert the held remainder.
+                    set_quarantined(home, agent);
+                    pending_unconfirmed_map()
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .entry(pending_key(home, agent))
+                        .or_default()
+                        .extend(held);
                     tracing::warn!(
                         agent = %agent,
                         tag = "#3175-resume-give-up",
                         attempts = notification.attempts,
                         error = %message,
                         "typed inject unconfirmed after {MAX_RESUME_ATTEMPTS} resume attempts \
-                         — wake dropped (pane never settled; check the pane for a stranded \
-                         draft)"
+                         — agent QUARANTINED (pane never settled; stranded draft may remain; \
+                         held wakes blocked pending recovery)"
                     );
                     crate::event_log::log(
                         home,
                         "inject_unconfirmed_gave_up",
                         agent,
-                        "typed inject payload unconfirmed after resume budget — wake dropped",
+                        "typed inject payload unconfirmed after resume budget — agent quarantined",
                     );
-                    continue;
+                    return;
                 }
                 set_pending_unconfirmed(home, agent);
                 crate::notification_queue::enqueue_resume(home, agent, &notification);
@@ -716,21 +856,27 @@ pub(crate) mod test_support {
         FORCE_FULL.load(Ordering::Relaxed)
     }
 
-    /// #3176: clear the process-global unconfirmed-pending registry. Tests key
-    /// their state on unique tempdir homes (no cross-talk), but a deterministic
-    /// reset also guards against a leaked entry surviving into another test.
-    /// MUST be called while holding [`pending_guard`] — the map is process-
-    /// global and parallel tests would otherwise wipe each other's live state.
+    /// #3176: clear the process-global unconfirmed-pending + quarantine
+    /// registries. Tests key their state on unique tempdir homes (no cross-talk),
+    /// but a deterministic reset also guards against a leaked entry surviving
+    /// into another test. MUST be called while holding [`pending_guard`] — both
+    /// registries are process-global and parallel tests would otherwise wipe
+    /// each other's live state.
     pub(crate) fn reset_pending_unconfirmed() {
         super::pending_unconfirmed_map()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        super::quarantined_set()
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
     }
 
     /// #3176: serialize tests that touch the process-global unconfirmed-pending
-    /// registry. Hold the returned guard across the whole
-    /// reset→dispatch→assert→reset window. Every pending-state test MUST hold it.
+    /// / quarantine registries. Hold the returned guard across the whole
+    /// reset→dispatch→assert→reset window. Every pending/quarantine-state test
+    /// MUST hold it.
     pub(crate) fn pending_guard() -> parking_lot::MutexGuard<'static, ()> {
         static PENDING_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
         PENDING_LOCK.lock()
@@ -812,14 +958,12 @@ mod tests {
         )
         .expect("fleet");
         let started = std::time::Instant::now();
-        assert!(
-            enqueue_transport_delivery(
-                &home,
-                "codex-agent",
-                crate::notification_queue::QueuedNotification::fresh("ping".to_string(), false)
-            )
-            .is_ok()
-        );
+        assert!(enqueue_transport_delivery(
+            &home,
+            "codex-agent",
+            crate::notification_queue::QueuedNotification::fresh("ping".to_string(), false)
+        )
+        .is_ok());
         assert!(
             started.elapsed() < std::time::Duration::from_millis(500),
             "transport enqueue must not run Codex readiness on the caller thread"
@@ -935,17 +1079,15 @@ mod tests {
         .expect("fleet");
 
         let cleanup = begin_transport_cleanup(&home, agent);
-        assert!(
-            enqueue_transport_delivery(
-                &home,
-                agent,
-                crate::notification_queue::QueuedNotification::fresh(
-                    "wake during teardown".to_string(),
-                    false,
-                ),
-            )
-            .is_ok()
-        );
+        assert!(enqueue_transport_delivery(
+            &home,
+            agent,
+            crate::notification_queue::QueuedNotification::fresh(
+                "wake during teardown".to_string(),
+                false,
+            ),
+        )
+        .is_ok());
         crate::transport::remove_instance_delivery_state(&home, agent).expect("cleanup");
         drop(cleanup);
 
@@ -1194,11 +1336,13 @@ mod tests {
         test_support::reset_pending_unconfirmed();
     }
 
-    /// #3176: give-up (resume budget exhausted) is a TERMINAL resume outcome —
-    /// the held fresh wakes are released rather than trapped forever behind a
-    /// pane that never settles.
+    /// #3176 (review R2): give-up (resume budget exhausted) is a LIVENESS
+    /// terminal condition — but NOT proof the stranded draft was submitted or
+    /// cleared. The pane never settled, so the unsubmitted draft may still sit
+    /// in the input box: the agent is QUARANTINED and held wakes stay blocked
+    /// (never physically written) until a provable recovery.
     #[test]
-    fn give_up_is_terminal_and_releases_held_wakes_3176() {
+    fn give_up_quarantines_held_wakes_3176() {
         let _pending_guard = test_support::pending_guard();
         test_support::reset_pending_unconfirmed();
         let home = tmp_home("3176-giveup");
@@ -1226,16 +1370,211 @@ mod tests {
             "B must be held while A is unresolved"
         );
 
-        // A's resume has exhausted the budget → give-up: A is declared terminal
-        // and B is physically released even though A never settled.
+        // A's resume has exhausted the budget → give-up. A never settled, so the
+        // draft may still be in the input box: QUARANTINE — B must NOT write.
         let mut resume_a = wake_a.clone();
         resume_a.resume = true;
         resume_a.attempts = MAX_RESUME_ATTEMPTS;
         dispatch_pty_wake(&home, agent, resume_a, &mut inject);
         assert_eq!(
             *written.borrow(),
+            ["WAKE_A", "WAKE_A"],
+            "give-up must NOT release held wake B while A's stranded draft remains"
+        );
+        assert!(
+            is_quarantined(&home, agent),
+            "give-up must quarantine the agent pending recovery"
+        );
+
+        // A later FRESH wake must stay blocked too while quarantined.
+        let wake_c = crate::notification_queue::QueuedNotification::fresh("WAKE_C".into(), false);
+        dispatch_pty_wake(&home, agent, wake_c.clone(), &mut inject);
+        assert_eq!(
+            *written.borrow(),
+            ["WAKE_A", "WAKE_A"],
+            "a fresh wake must NOT write while the agent is quarantined"
+        );
+        test_support::reset_pending_unconfirmed();
+    }
+
+    /// #3176 (review R2): a resume submit-only write failing with `Other` does
+    /// NOT prove the pre-existing draft was cleared (e.g. self-IPC failed
+    /// before the submit landed). The agent is QUARANTINED and held wakes stay
+    /// blocked — B is never physically written while A's draft may remain.
+    #[test]
+    fn resume_other_quarantines_held_wakes_3176() {
+        let _pending_guard = test_support::pending_guard();
+        test_support::reset_pending_unconfirmed();
+        let home = tmp_home("3176-other");
+        let agent = "agentA";
+        let written: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        let mut inject = |_: &std::path::Path,
+                          _: &str,
+                          n: &crate::notification_queue::QueuedNotification|
+         -> Result<(), crate::inbox::notify::InjectDeliveryFailure> {
+            written.borrow_mut().push(n.text.clone());
+            if n.resume {
+                Err(crate::inbox::notify::InjectDeliveryFailure::Other(
+                    "self-IPC failed before submit".to_string(),
+                ))
+            } else {
+                Err(crate::inbox::notify::InjectDeliveryFailure::Unconfirmed(
+                    "forced abort".to_string(),
+                ))
+            }
+        };
+
+        let wake_a = crate::notification_queue::QueuedNotification::fresh("WAKE_A".into(), true);
+        let wake_b = crate::notification_queue::QueuedNotification::fresh("WAKE_B".into(), false);
+
+        // A aborts → pending; B held.
+        dispatch_pty_wake(&home, agent, wake_a.clone(), &mut inject);
+        dispatch_pty_wake(&home, agent, wake_b.clone(), &mut inject);
+        assert_eq!(
+            *written.borrow(),
+            ["WAKE_A"],
+            "B must be held while A is unresolved"
+        );
+
+        // A's resume fails with `Other` → QUARANTINE; B must NOT write.
+        let mut resume_a = wake_a.clone();
+        resume_a.resume = true;
+        resume_a.attempts = 1;
+        dispatch_pty_wake(&home, agent, resume_a, &mut inject);
+        assert_eq!(
+            *written.borrow(),
+            ["WAKE_A", "WAKE_A"],
+            "resume Other must NOT release held wake B while A's draft may remain"
+        );
+        assert!(
+            is_quarantined(&home, agent),
+            "resume Other must quarantine the agent pending recovery"
+        );
+
+        // A later FRESH wake must stay blocked too while quarantined.
+        let wake_c = crate::notification_queue::QueuedNotification::fresh("WAKE_C".into(), false);
+        dispatch_pty_wake(&home, agent, wake_c.clone(), &mut inject);
+        assert_eq!(
+            *written.borrow(),
+            ["WAKE_A", "WAKE_A"],
+            "a fresh wake must NOT write while the agent is quarantined"
+        );
+        test_support::reset_pending_unconfirmed();
+    }
+
+    /// #3176 (review R2): quarantine is lifted by a PROVEN recovery — a later
+    /// resume reaching `Ok` clears the marker and releases held wakes in order.
+    #[test]
+    fn resume_ok_lifts_quarantine_and_releases_3176() {
+        let _pending_guard = test_support::pending_guard();
+        test_support::reset_pending_unconfirmed();
+        let home = tmp_home("3176-oklift");
+        let agent = "agentA";
+        let written: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        let mut inject = |_: &std::path::Path,
+                          _: &str,
+                          n: &crate::notification_queue::QueuedNotification|
+         -> Result<(), crate::inbox::notify::InjectDeliveryFailure> {
+            written.borrow_mut().push(n.text.clone());
+            if n.resume {
+                Ok(())
+            } else {
+                Err(crate::inbox::notify::InjectDeliveryFailure::Unconfirmed(
+                    "forced abort".to_string(),
+                ))
+            }
+        };
+
+        let wake_a = crate::notification_queue::QueuedNotification::fresh("WAKE_A".into(), true);
+        let wake_b = crate::notification_queue::QueuedNotification::fresh("WAKE_B".into(), false);
+
+        // A aborts → pending; B held. Quarantine A manually to model an earlier
+        // unsettled terminal outcome whose quarantine is still in force.
+        dispatch_pty_wake(&home, agent, wake_a.clone(), &mut inject);
+        dispatch_pty_wake(&home, agent, wake_b.clone(), &mut inject);
+        set_quarantined(&home, agent);
+        assert!(is_quarantined(&home, agent));
+
+        // A's resume reaches `Ok` (draft provably submitted/cleared) → the
+        // quarantine is lifted and held B is released.
+        let mut resume_a = wake_a.clone();
+        resume_a.resume = true;
+        resume_a.attempts = 1;
+        dispatch_pty_wake(&home, agent, resume_a, &mut inject);
+        assert_eq!(
+            *written.borrow(),
             ["WAKE_A", "WAKE_A", "WAKE_B"],
-            "give-up is a terminal resume outcome: held wakes may write afterwards"
+            "resume Ok proves the draft cleared: quarantine lifted, held B released"
+        );
+        assert!(
+            !is_quarantined(&home, agent),
+            "resume Ok must lift the quarantine"
+        );
+        test_support::reset_pending_unconfirmed();
+    }
+
+    /// #3176 (review R2): explicit operator / lifecycle recovery lifts the
+    /// quarantine and re-enqueues the held wakes as fresh deliveries.
+    #[test]
+    fn lift_quarantine_releases_held_wakes_3176() {
+        let _pending_guard = test_support::pending_guard();
+        test_support::reset_pending_unconfirmed();
+        let home = tmp_home("3176-lift");
+        let agent = "agentA";
+        let written: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        let mut inject = |_: &std::path::Path,
+                          _: &str,
+                          n: &crate::notification_queue::QueuedNotification|
+         -> Result<(), crate::inbox::notify::InjectDeliveryFailure> {
+            written.borrow_mut().push(n.text.clone());
+            if written.borrow().len() == 1 {
+                Err(crate::inbox::notify::InjectDeliveryFailure::Unconfirmed(
+                    "forced abort".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        };
+
+        let wake_a = crate::notification_queue::QueuedNotification::fresh("WAKE_A".into(), true);
+        let wake_b = crate::notification_queue::QueuedNotification::fresh("WAKE_B".into(), false);
+        let wake_c = crate::notification_queue::QueuedNotification::fresh("WAKE_C".into(), false);
+
+        // A aborts → pending; B, C held; agent quarantined (unsettled terminal).
+        dispatch_pty_wake(&home, agent, wake_a.clone(), &mut inject);
+        dispatch_pty_wake(&home, agent, wake_b.clone(), &mut inject);
+        dispatch_pty_wake(&home, agent, wake_c.clone(), &mut inject);
+        set_quarantined(&home, agent);
+        assert!(is_quarantined(&home, agent));
+
+        // Lifecycle/operator recovery lifts the quarantine; held B, C are
+        // re-released in order (the scripted inject records them).
+        lift_quarantine_with(&home, agent, &mut inject);
+        assert!(
+            !is_quarantined(&home, agent),
+            "lift must clear the quarantine marker"
+        );
+        assert!(
+            !has_pending_unconfirmed(&home, agent),
+            "lift must clear the held-wakes FIFO"
+        );
+        assert_eq!(
+            *written.borrow(),
+            ["WAKE_A", "WAKE_B", "WAKE_C"],
+            "held wakes must be re-enqueued in FIFO order by the lift"
+        );
+
+        // A fresh wake writes again immediately (block removed).
+        dispatch_pty_wake(
+            &home,
+            agent,
+            crate::notification_queue::QueuedNotification::fresh("WAKE_D".into(), false),
+            &mut inject,
+        );
+        assert_eq!(
+            *written.borrow(),
+            ["WAKE_A", "WAKE_B", "WAKE_C", "WAKE_D"],
+            "fresh wakes may write again after the quarantine is lifted"
         );
         test_support::reset_pending_unconfirmed();
     }
