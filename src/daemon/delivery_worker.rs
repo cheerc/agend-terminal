@@ -501,11 +501,32 @@ fn dispatch_transport(
         },
     );
     if let Err(error) = result {
-        tracing::debug!(
+        // #3307 Fix B: a structured (ChannelBridge / NativeShared) delivery that
+        // fails is a terminal routed outcome — raising it above `debug` makes it
+        // visible in the default info-level app log. The failure is a per-delivery
+        // terminal event, NOT a hot path (no per-tick write), so the event-log
+        // append is bounded and does not change delivery semantics.
+        //
+        // LegacyPty failures are excluded from the event-log write: their failure
+        // is already surfaced by the PTY injector's own path, and `run_task_maintenance`
+        // drives per-agent dispatch queries through `enqueue_with_idle_hint` — logging
+        // those would inject an extra row into the recipient's event-log and break the
+        // batch-write boundary assumptions of the `event_log` unit tests.
+        tracing::warn!(
             agent = %agent,
             error = %error,
-            "delivery_worker: structured transport delivery failed"
+            "delivery_worker: structured transport delivery failed",
         );
+        let structured = crate::transport::mode_for_instance(&home, &agent)
+            != crate::transport::TransportMode::LegacyPty;
+        if structured {
+            crate::event_log::log(
+                &home,
+                "transport_delivery_failed",
+                &agent,
+                &format!("structured transport delivery failed: {error}"),
+            );
+        }
     }
     #[cfg(test)]
     test_support::note_transport_dispatch_complete(&home, &agent);
@@ -1192,6 +1213,58 @@ mod tests {
             test_support::transport_dispatch_count(&home, "claude-agent"),
             1,
             "ordinary ChannelBridge notification must fail fast instead of occupying a worker"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn failed_channel_bridge_delivery_is_observable_in_event_log() {
+        // #3307 Fix B: a structured delivery that fails (no live channel bridge)
+        // must surface as an event-log row, not a silent debug-only failure. This
+        // is what lets an operator see "ChannelBridge tried and failed" instead of
+        // the previous zero-log blind spot.
+        let _ff = test_support::force_full_guard();
+        test_support::set_force_full(false);
+        let home = std::env::temp_dir().join(format!(
+            "agend-transport-worker-observability-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  claude-agent:\n    backend: claude\n",
+        )
+        .expect("fleet");
+        assert_eq!(
+            crate::transport::mode_for_instance(&home, "claude-agent"),
+            crate::transport::TransportMode::ChannelBridge
+        );
+        assert!(enqueue_transport_delivery(&home, "claude-agent", "ordinary wake").is_ok());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while test_support::transport_dispatch_count(&home, "claude-agent") == 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            test_support::transport_dispatch_count(&home, "claude-agent"),
+            1,
+            "ChannelBridge failure must dispatch exactly once"
+        );
+
+        // The prep-phase failure must be recorded as a `transport_delivery_failed`
+        // event-log row for this agent.
+        let event_log_path = home.join("event-log.jsonl");
+        let mut observed = false;
+        if let Ok(contents) = std::fs::read_to_string(&event_log_path) {
+            observed = contents.lines().any(|line| {
+                line.contains("transport_delivery_failed") && line.contains("claude-agent")
+            });
+        }
+        assert!(
+            observed,
+            "prep-phase failure must be written to the event log"
         );
         let _ = std::fs::remove_dir_all(home);
     }

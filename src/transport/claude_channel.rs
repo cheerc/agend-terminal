@@ -1459,11 +1459,64 @@ fn ensure_claude_bridge_owned(locator: &SessionLocator) -> anyhow::Result<()> {
             locator.backend
         );
     }
-    let (Some(pid), Some(start_token)) = (locator.server_pid, locator.server_start_token) else {
-        anyhow::bail!("Claude ChannelBridge locator has no live bridge identity");
-    };
-    if crate::process::process_start_token(pid) != Some(start_token) {
+    if !claude_bridge_identity_live(locator) {
         anyhow::bail!("Claude ChannelBridge locator is not owned by a live bridge");
+    }
+    Ok(())
+}
+
+/// Whether the locator carries a live Claude bridge identity: a backend of
+/// `claude` AND a pid/start-token pair that still resolves to the same process.
+/// Shared by the ownership check and the stale-locator recover path so the two
+/// never disagree about what "live" means.
+fn claude_bridge_identity_live(locator: &SessionLocator) -> bool {
+    let (Some(pid), Some(start_token)) = (locator.server_pid, locator.server_start_token) else {
+        return false;
+    };
+    crate::process::process_start_token(pid) == Some(start_token)
+}
+
+/// #3307: recover a stale session locator before a fresh Claude bridge
+/// publishes. A backend switch (e.g. opencode→claude) leaves an old locator
+/// whose `backend != "claude"`; the new channel-bridge process would otherwise
+/// hard-fail on it (bind_and_publish_channel's attach check) and never come
+/// up — so fleet `send` deliveries then fail-closed at prepare with no live
+/// bridge to reach. Removing the stale artifact lets the fresh Claude locator
+/// publish cleanly.
+///
+/// Safety boundary: ONLY this instance's own locator is examined (instance-
+/// keyed); a LIVE claude-owned locator (backend `claude` + pid/start-token
+/// matching a running bridge) is never touched, and a foreign/unreadable
+/// artifact that cannot describe a live Claude bridge is cleared. Other
+/// instances' and other backends' live state is out of reach — the path is
+/// `sessions/<instance>.json` for this `instance` only.
+fn recover_stale_locator_for_bridge(home: &Path, instance: &str) -> anyhow::Result<()> {
+    // A live claude-owned locator always reads back as Ok(Some(locator)) and
+    // passes the identity check; everything else here is stale by definition and
+    // safe to clear before the fresh bridge locator publishes.
+    match super::registry::claude_attach_locator(home, instance) {
+        Ok(Some(locator)) => {
+            if !claude_bridge_identity_live(&locator) {
+                tracing::info!(
+                    agent = %instance,
+                    "channel-bridge recovering stale claude locator (dead bridge identity)"
+                );
+                super::registry::remove_session_locator(home, instance)?;
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            // Foreign backend (`claude_attach_locator` bails) or an unreadable /
+            // irregular artifact. Neither can be a live claude-owned locator
+            // (those always load as Ok(Some) above), so clearing it is safe and
+            // unblocks publishing a fresh Claude bridge locator.
+            tracing::info!(
+                agent = %instance,
+                error = %error,
+                "channel-bridge recovering stale locator (foreign backend or unreadable artifact)"
+            );
+            super::registry::remove_session_locator(home, instance)?;
+        }
     }
     Ok(())
 }
@@ -1472,11 +1525,12 @@ fn bind_and_publish_channel(
     home: &Path,
     instance: &str,
 ) -> anyhow::Result<(SessionLocator, TcpListener)> {
-    // Inspect the old artifact only to reject a foreign backend. The new
-    // listener is always the source of truth; a rotated token/session makes
-    // reusing a now-free numeric port safe, and avoids allocator-dependent
-    // retry loops.
-    let _ = super::registry::claude_attach_locator(home, instance)?;
+    // #3307: clear a stale (foreign-backend / dead-identity / unreadable) locator
+    // before binding, so a backend switch cannot strand the bridge at startup.
+    // A live claude-owned locator is left untouched and atomically superseded by
+    // the fresh listener (safe even across daemon restart — the same-process
+    // restart reuses a now-free numeric port).
+    recover_stale_locator_for_bridge(home, instance)?;
     let pid = std::process::id();
     let start_token = crate::process::process_start_token(pid)
         .ok_or_else(|| anyhow::anyhow!("Claude ChannelBridge process identity is unavailable"))?;
