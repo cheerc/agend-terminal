@@ -100,6 +100,107 @@ fn existing_non_claude_locator_is_not_replaced() {
 }
 
 #[test]
+fn foreign_backend_locator_is_recovered_at_bridge_start() {
+    let home = home("foreign-recover");
+    let foreign = SessionLocator::opencode(
+        "http://127.0.0.1:43123".to_string(),
+        Some("opencode-session".to_string()),
+        "agend".to_string(),
+        "secret".to_string(),
+    );
+    super::super::registry::save_session_locator(&home, "claude-agent", &foreign)
+        .expect("plant foreign locator");
+
+    // A backend switch (opencode→claude) leaves a foreign locator behind. The
+    // Claude bridge must recover it — publish a fresh claude locator instead
+    // of hard-failing on the stale artifact (root cause #3307).
+    let (fresh, listener) =
+        bind_and_publish_channel(&home, "claude-agent").expect("recover and publish");
+    assert_eq!(fresh.backend, "claude");
+    assert!(fresh.session_id.is_some());
+    let stored = super::super::registry::load_session_locator(&home, "claude-agent")
+        .expect("stored locator");
+    assert_eq!(stored.backend, "claude");
+    assert_eq!(stored.session_id, fresh.session_id);
+    drop(listener);
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn stale_claude_locator_is_recovered_at_bridge_start() {
+    let home = home("stale-claude-recover");
+    let mut stale = SessionLocator::claude(
+        "http://127.0.0.1:43123".to_string(),
+        "stale-session".to_string(),
+        "stale-token".to_string(),
+    );
+    // A dead bridge identity (pid 0 has no start token) makes this stale.
+    stale.server_pid = Some(0);
+    stale.server_start_token = Some(1);
+    super::super::registry::save_session_locator(&home, "claude-agent", &stale)
+        .expect("plant stale claude locator");
+
+    // A locator whose bridge process is gone must be recovered by the new
+    // bridge, not carried forward as an unreachable target.
+    let (fresh, listener) =
+        bind_and_publish_channel(&home, "claude-agent").expect("recover stale claude locator");
+    assert_eq!(fresh.backend, "claude");
+    let stored = super::super::registry::load_session_locator(&home, "claude-agent")
+        .expect("stored locator");
+    assert_eq!(stored.backend, "claude");
+    assert_ne!(stored.password, stale.password);
+    drop(listener);
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn foreign_recover_is_instance_keyed_and_preserves_other_live_locator() {
+    let home = home("foreign-isolation");
+    let foreign = SessionLocator::opencode(
+        "http://127.0.0.1:43123".to_string(),
+        Some("opencode-session".to_string()),
+        "agend".to_string(),
+        "secret".to_string(),
+    );
+    super::super::registry::save_session_locator(&home, "claude-agent", &foreign)
+        .expect("plant foreign locator");
+    // A live claude-owned locator on a DIFFERENT instance must be untouched by
+    // recovering claude-agent's own stale locator (instance-keyed isolation).
+    let live_other = test_published_locator(&home, "other-agent");
+
+    let (fresh, listener) =
+        bind_and_publish_channel(&home, "claude-agent").expect("recover own locator");
+    assert_eq!(fresh.backend, "claude");
+    let other = super::super::registry::load_session_locator(&home, "other-agent")
+        .expect("other live locator");
+    assert_eq!(other, live_other);
+    drop(listener);
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn live_claude_locator_is_never_recovered_away() {
+    let home = home("live-safety");
+    // A live claude-owned locator: same-process pid + start token, backend claude.
+    let live = test_published_locator(&home, "claude-agent");
+    assert_eq!(live.backend, "claude");
+    assert!(super::super::registry::load_session_locator(&home, "claude-agent").is_ok());
+
+    // Re-publishing a fresh bridge on a live claude locator must NOT remove the
+    // live one first — the fresh listener atomically supersedes it, and the
+    // recover path leaves live claude locators alone.
+    let (fresh, listener) =
+        bind_and_publish_channel(&home, "claude-agent").expect("re-publish over live");
+    assert_eq!(fresh.backend, "claude");
+    let stored = super::super::registry::load_session_locator(&home, "claude-agent")
+        .expect("stored locator");
+    assert_eq!(stored.backend, "claude");
+    assert_eq!(stored.server_pid, Some(std::process::id()));
+    drop(listener);
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
 fn stale_locator_rejects_port_squatter_without_sending_bearer() {
     let home = home("port-squatter");
     let listener = TcpListener::bind("127.0.0.1:0").expect("squatter listener");
