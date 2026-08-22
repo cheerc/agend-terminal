@@ -543,16 +543,16 @@ impl Backend {
                 instructions_shared: true,
                 ready_timeout_secs: 20,
                 dismiss_patterns: &[
-                    // Trust directory prompt: "Yes, continue" is pre-selected → Enter.
-                    // CR (\r), not LF — Ink's keyboard reader treats CR as Enter.
-                    // macOS openpty doesn't translate LF→CR on input (ConPTY does),
-                    // so LF here would silently no-op on mac.
-                    // Issue #468: anchored regex (see ClaudeCode comment above).
-                    // #1087: `*` instead of `{0,8}` — TUI centered modals have 40+ char prefix.
-                    DismissPattern {
-                        label: r"(?m)^[^A-Za-z\n]*Do you trust",
-                        sequence: b"\r",
-                    },
+                    // #3317: the trust-directory matcher is DELIBERATELY ABSENT.
+                    // Measured at codex 0.149.0 — the prompt renders even under
+                    // `--dangerously-bypass-approvals-and-sandbox`, and answering it
+                    // makes codex WRITE `[projects."<ws>"] trust_level = "trusted"` into
+                    // the operator's `$CODEX_HOME/config.toml`: one permanent entry per
+                    // instance workspace, forever, i.e. the accumulation `722140bd`
+                    // removed, reauthored by codex. Fleet tools no longer need trust —
+                    // the bridge rides the child argv (`mcp_config::codex_mcp_config_args`).
+                    // Do not re-add; `codex_preset_has_no_trust_dismiss_matcher_3317`
+                    // (src/agent/tests.rs) pins its absence.
                     DismissPattern {
                         label: r"(?m)^[^A-Za-z\n]*Please restart",
                         sequence: b"\r",
