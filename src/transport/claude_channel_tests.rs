@@ -1033,6 +1033,7 @@ fn registry_delivery_waits_for_delayed_channel_bridge_without_pty_fallback() {
             &home,
             "claude-agent",
             "registry delivery",
+            None,
             move |_, _, _| {
                 legacy_called_by_closure.store(true, Ordering::Release);
                 Ok(())
@@ -1118,6 +1119,7 @@ fn permanently_terminated_channel_helper_surfaces_transport_error() {
             &home,
             "claude-agent",
             "registry delivery",
+            None,
             move |_, _, _| {
                 legacy_called_by_closure.store(true, Ordering::Release);
                 Ok(())
@@ -1723,6 +1725,370 @@ fn legacy_inbound_ambiguous_accepts_exact_start_ack() {
             .expect("exact start ack")
             .state,
         DeliveryState::TurnStarted
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// #3324: the bridge's own MCP instructions are one of the two signals that
+/// sent the agent to the wrong tool, and BOTH halves were wrong.
+///
+/// It described the envelope as `source="agend-terminal"` when the real wrapper
+/// is `source="agend-claude-channel" ... sender_id="agend-terminal"` — the two
+/// fields transposed — and then said "reply with the reply tool", which names
+/// two different tools in this environment. An agent reading it reasons
+/// correctly to the wrong conclusion.
+#[test]
+fn bridge_instructions_describe_the_real_envelope_and_the_exact_tool_3324() {
+    let home = home("instructions-3324");
+    let locator = test_published_locator(&home, "claude-agent");
+    let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+    let response = mcp_message(
+        json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{
+                "protocolVersion":"2025-06-18",
+                "clientInfo":{"name":"claude-code","version":"2.1.80"}
+            }
+        }),
+        &runtime,
+    )
+    .expect("initialize response");
+    let text = response["result"]["instructions"]
+        .as_str()
+        .expect("instructions")
+        .to_string();
+    let _ = fs::remove_dir_all(home);
+    assert!(
+        text.contains("source=\"agend-claude-channel\""),
+        "#3324: instructions must describe the envelope the agent actually \
+         receives; got {text:?}"
+    );
+    assert!(
+        !text.contains("source=\"agend-terminal\""),
+        "#3324: the transposed source/sender_id description must be gone; got {text:?}"
+    );
+    assert!(
+        text.contains("mcp__agend-terminal__reply"),
+        "#3324: instructions must name the tool that actually reaches an \
+         external channel, since this server's own `reply` does not; got {text:?}"
+    );
+}
+
+/// #3324: seed one delivery exactly as the daemon would, and hand the runtime
+/// the inbound mapping the bridge webhook records.
+fn seed_delivery(
+    home: &Path,
+    locator: &SessionLocator,
+    runtime: &ChannelRuntime,
+    body: &str,
+    origin: Option<crate::channel::ChannelKind>,
+) -> (Uuid, String) {
+    seed_delivery_with_logical_id(home, locator, runtime, body, origin, Some("m-3324"))
+}
+
+/// #3324 (N5): the logical id is what the refusal names as `message_id=`. It is
+/// absent whenever the notification carried no `[AGEND-MSG] id=…` header, so the
+/// refusal text has to be correct for both cases.
+fn seed_delivery_with_logical_id(
+    home: &Path,
+    locator: &SessionLocator,
+    runtime: &ChannelRuntime,
+    body: &str,
+    origin: Option<crate::channel::ChannelKind>,
+    logical_delivery_id: Option<&str>,
+) -> (Uuid, String) {
+    let mut envelope = DeliveryEnvelope::new(
+        "claude-agent",
+        locator.clone(),
+        crate::transport::envelope::DeliveryKind::Notification,
+        body,
+        None,
+    );
+    envelope.channel_origin = origin;
+    envelope.logical_delivery_id = logical_delivery_id.map(str::to_string);
+    let delivery_id = envelope.delivery_id;
+    let chat_id = chat_id_for_delivery("claude-agent", delivery_id);
+    let store = ReceiptStore::for_instance(home, "claude-agent").expect("store");
+    store.record_queued(&envelope).expect("queued receipt");
+    runtime
+        .remember_inbound(delivery_id, &chat_id, Some("agend-terminal"), body)
+        .expect("inbound mapping");
+    (delivery_id, chat_id)
+}
+
+fn call_bridge_reply(runtime: &ChannelRuntime, chat_id: &str, delivery_id: Uuid) -> Value {
+    mcp_message(
+        json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"tools/call",
+            "params": {
+                "name":"reply",
+                "arguments": {
+                    "chat_id": chat_id,
+                    "delivery_id": delivery_id,
+                    "text":"the answer the user is waiting for"
+                }
+            }
+        }),
+        runtime,
+    )
+    .expect("tool response")
+}
+
+/// #3324 RED: a delivery that ORIGINATED on an external channel must not be
+/// replied to through the bridge.
+///
+/// The bridge is an inbound transport. Its `reply` records a transport
+/// acknowledgement and never reaches Telegram — and the environment exposes a
+/// SECOND tool also called `reply` that does. The observed incident: the agent
+/// called this one twice, got success twice, and the user received nothing for
+/// eleven minutes while the escalation ladder ran.
+///
+/// Fail CLOSED, and fail BEFORE the Reply record: a recorded reply is what makes
+/// the loss invisible afterwards.
+#[test]
+fn bridge_reply_is_refused_for_an_external_channel_origin_3324() {
+    let home = home("external-origin-refused-3324");
+    let locator = test_published_locator(&home, "claude-agent");
+    let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+    let (delivery_id, chat_id) = seed_delivery(
+        &home,
+        &locator,
+        &runtime,
+        "[user:chiachenghuang via telegram] please research this",
+        Some(crate::channel::ChannelKind::Telegram),
+    );
+
+    let response = call_bridge_reply(&runtime, &chat_id, delivery_id);
+
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+    assert_eq!(
+        response["error"]["code"], -32602,
+        "#3324: an external-origin delivery must be REFUSED, not acknowledged; got {response}"
+    );
+    assert!(
+        message.contains("mcp__agend-terminal__reply"),
+        "#3324: the refusal must name the exact tool that can deliver, or the \
+         agent picks the wrong `reply` again; got {message:?}"
+    );
+    assert!(
+        message.contains("m-3324"),
+        "#3324: the refusal must name the target identity so the agent can \
+         address the right message; got {message:?}"
+    );
+    assert!(
+        runtime.reply_for(delivery_id).is_none(),
+        "#3324: nothing may be recorded as replied — the obligation stays armed"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// #3324: a delivery with NO receipt is served, deliberately.
+///
+/// Unknown origin is not external origin. `deliver_resident` records the
+/// envelope before posting the webhook, so a live delivery has one; the absent
+/// case is a pruned or pre-settle row (#3310), and refusing those would break
+/// internal replies with no way for the agent to tell why. Pinned so the choice
+/// is a decision rather than an accident — a later "fail closed on anything
+/// unknown" would break legacy rows and this test says so.
+#[test]
+fn bridge_reply_serves_a_delivery_with_no_receipt_3324() {
+    let home = home("no-receipt-served-3324");
+    let locator = test_published_locator(&home, "claude-agent");
+    let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+    let delivery_id = Uuid::new_v4();
+    let chat_id = chat_id_for_delivery("claude-agent", delivery_id);
+    // Inbound mapping only — no receipt is ever written for this delivery.
+    runtime
+        .remember_inbound(
+            delivery_id,
+            &chat_id,
+            Some("agend-terminal"),
+            "orphaned row",
+        )
+        .expect("inbound mapping");
+
+    let response = call_bridge_reply(&runtime, &chat_id, delivery_id);
+
+    assert!(
+        response.get("error").is_none(),
+        "#3324: an unknown-origin delivery must still be answerable; got {response}"
+    );
+    assert!(
+        runtime.reply_for(delivery_id).is_some(),
+        "#3324: and its reply must be recorded"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// #3324 RED: the bracket-in-name case, pinned at the GUARD.
+///
+/// The typed-source unit test says the classification is right; this says the
+/// DELIVERY is actually refused, which is the property the user's message
+/// depends on. The origin here comes from `NotifySource::external_channel`,
+/// exactly as production takes it — so the header this body renders (an
+/// operator whose configured allowlist name contains `]`) is along for the
+/// ride, not the evidence. Both channel kinds, because the guard must key on
+/// "external", not on Telegram.
+#[test]
+fn bridge_reply_is_refused_for_a_bracketed_display_name_3324() {
+    for kind in [
+        crate::channel::ChannelKind::Telegram,
+        crate::channel::ChannelKind::Discord,
+    ] {
+        let home = home(&format!("bracket-name-refused-3324-{kind:?}"));
+        let locator = test_published_locator(&home, "claude-agent");
+        let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+        let source = crate::inbox::NotifySource::Channel("alice]", kind);
+        let body = crate::inbox::notify::format_notification_for_inject(
+            false,
+            &source,
+            "please help",
+            &[],
+        );
+        let (delivery_id, chat_id) =
+            seed_delivery(&home, &locator, &runtime, &body, source.external_channel());
+
+        let response = call_bridge_reply(&runtime, &chat_id, delivery_id);
+
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "#3324: a `]` in the display name must not let an external delivery \
+             through the bridge (kind={kind:?}); got {response}"
+        );
+        assert!(
+            runtime.reply_for(delivery_id).is_none(),
+            "#3324: and nothing may be recorded as replied (kind={kind:?})"
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+}
+
+/// #3324 (N5): when the envelope carries no logical id, the refusal must not
+/// name one.
+///
+/// The first cut rendered prose into the value slot —
+/// `message_id=the original message id from the inbox` — which reads as a
+/// literal id an agent can pass straight through to the other tool, turning a
+/// helpful refusal into a second failed call.
+#[test]
+fn the_refusal_omits_message_id_when_the_envelope_has_none_3324() {
+    let home = home("no-logical-id-refusal-3324");
+    let locator = test_published_locator(&home, "claude-agent");
+    let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+    let (delivery_id, chat_id) = seed_delivery_with_logical_id(
+        &home,
+        &locator,
+        &runtime,
+        "[user:alice via telegram] no AGEND-MSG header here",
+        Some(crate::channel::ChannelKind::Telegram),
+        None,
+    );
+
+    let response = call_bridge_reply(&runtime, &chat_id, delivery_id);
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+
+    assert_eq!(
+        response["error"]["code"], -32602,
+        "#3324: it is still an external delivery and still refused; got {response}"
+    );
+    assert!(
+        !message.contains("message_id="),
+        "#3324 (N5): no `message_id=` may be named when the envelope has no \
+         logical id — got {message:?}"
+    );
+    assert!(
+        message.contains("mcp__agend-terminal__reply"),
+        "#3324: the exact delivering tool must still be named; got {message:?}"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// #3324 (N2): the self-kick refusal runs BEFORE the origin guard, and that
+/// ordering is what makes `deliver_self_kick_notification`'s unconditional
+/// `None` safe.
+///
+/// Production composes the self-kick prompt itself, so it has no external
+/// origin by construction and passes `None`. Primary review's N2: the safety of
+/// that `None` therefore rests on `reject_self_kick_reply` refusing every
+/// self-kick reply first — a call order nothing pinned. This seeds the
+/// adversarial combination (a self-kick envelope that DOES carry an external
+/// origin) and asserts the self-kick refusal is the one that fires, so a future
+/// reorder is a test failure rather than a silent change of which guard owns
+/// the case.
+#[test]
+fn the_self_kick_refusal_runs_before_the_origin_guard_3324() {
+    let home = home("self-kick-before-origin-3324");
+    let locator = test_published_locator(&home, "claude-agent");
+    let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+    let mut envelope = DeliveryEnvelope::self_kick(
+        "claude-agent",
+        locator.clone(),
+        "[AGEND-RESUME] recover your own state",
+    );
+    envelope.channel_origin = Some(crate::channel::ChannelKind::Telegram);
+    envelope.logical_delivery_id = Some("m-3324-self-kick".to_string());
+    let delivery_id = envelope.delivery_id;
+    let chat_id = chat_id_for_delivery("claude-agent", delivery_id);
+    let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+    store.record_queued(&envelope).expect("queued receipt");
+    runtime
+        .remember_inbound(
+            delivery_id,
+            &chat_id,
+            Some("agend-terminal"),
+            &envelope.body,
+        )
+        .expect("inbound mapping");
+
+    let response = call_bridge_reply(&runtime, &chat_id, delivery_id);
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+
+    assert_eq!(
+        response["error"]["code"], -32602,
+        "#3324: it must still be refused; got {response}"
+    );
+    assert!(
+        message.contains("ack_complete"),
+        "#3324 (N2): the SELF-KICK refusal must be the one that fires — it runs \
+         first, which is what lets the self-kick path pass `None` safely; \
+         got {message:?}"
+    );
+    assert!(
+        runtime.reply_for(delivery_id).is_none(),
+        "#3324: and nothing may be recorded as replied"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// #3324: the guard must not overreach. A delivery that originated INSIDE AgEnD
+/// is the bridge's own to answer, and refusing it would break every internal
+/// query.
+#[test]
+fn bridge_reply_still_serves_an_internal_delivery_3324() {
+    let home = home("internal-origin-served-3324");
+    let locator = test_published_locator(&home, "claude-agent");
+    let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+    let (delivery_id, chat_id) = seed_delivery(
+        &home,
+        &locator,
+        &runtime,
+        "[from:codex-125550] status?",
+        None,
+    );
+
+    let response = call_bridge_reply(&runtime, &chat_id, delivery_id);
+
+    assert!(
+        response.get("error").is_none(),
+        "#3324: an internal delivery must still be accepted; got {response}"
+    );
+    assert!(
+        runtime.reply_for(delivery_id).is_some(),
+        "#3324: the internal reply must still be recorded"
     );
     let _ = fs::remove_dir_all(home);
 }
