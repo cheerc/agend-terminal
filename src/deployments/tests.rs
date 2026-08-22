@@ -2067,6 +2067,169 @@ templates:
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3327: a template stanza's team-level `project_id:` must reach the
+/// deployment team created via the LEGACY raw-args path (`deploy()` with no
+/// runtime → `create_deployment_team_legacy`). Before the fix the field was
+/// silently dropped (same class as #2104's hardcoded-None instance fields),
+/// so a team whose clone path mis-slugs (#2509) lost its board override on
+/// every deploy — and teardown deletes the whole team entry, so the operator
+/// hand-patch did not survive a teardown+redeploy cycle.
+#[test]
+fn deploy_propagates_template_project_id_to_team_legacy_path_3327() {
+    let home = tmp_home("tpl_pid_legacy_3327");
+    let yaml = r#"
+templates:
+  svc:
+    source_repo: /repos/team-project
+    project_id: team-project
+    instances:
+      lead:
+        backend: claude
+      dev:
+        backend: kiro-cli
+"#;
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+    let args = serde_json::json!({
+        "template": "svc",
+        "directory": home.display().to_string(),
+    });
+    let _ = deploy(&home, "caller", &args);
+
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    let team = fleet.teams.get("svc").expect("team 'svc' must exist");
+    assert_eq!(
+        team.project_id.as_deref(),
+        Some("team-project"),
+        "#3327: template team-level project_id must persist via the legacy path"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3327: the RUNTIME path (`deploy_with_runtime` with Some(runtime) →
+/// `team_ops::create` / `CreateTeamRequest`) must carry the same field.
+/// Covers the other half of AC1/AC2: both creation paths, not just legacy.
+#[test]
+fn deploy_propagates_template_project_id_to_team_runtime_path_3327() {
+    let home = tmp_home("tpl_pid_runtime_3327");
+    let yaml = r#"
+templates:
+  svc:
+    source_repo: /repos/team-project
+    project_id: team-project
+    instances:
+      lead:
+        backend: claude
+      dev:
+        backend: kiro-cli
+"#;
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+    // A minimal in-process runtime routes create_deployment_team through
+    // team_ops::create instead of the legacy api::call fallback.
+    let configs = crate::api::ConfigRegistry::default();
+    let registry = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let externals = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let runtime = DeploymentRuntime {
+        registry: &registry,
+        configs: &configs,
+        externals: &externals,
+        notifier: None,
+    };
+    let args = serde_json::json!({
+        "template": "svc",
+        "directory": home.display().to_string(),
+    });
+    let _ = deploy_with_runtime(&home, "caller", &args, Some(&runtime));
+
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    let team = fleet.teams.get("svc").expect("team 'svc' must exist");
+    assert_eq!(
+        team.project_id.as_deref(),
+        Some("team-project"),
+        "#3327: template team-level project_id must persist via the runtime path"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3327 AC3: a template WITHOUT `project_id` stays byte-identical — the
+/// team is still created (source_repo propagates) but project_id remains
+/// None, preserving #2509's source_repo-derived board guess with no warning.
+#[test]
+fn deploy_without_template_project_id_leaves_team_project_id_none_3327() {
+    let home = tmp_home("tpl_pid_absent_3327");
+    let yaml = r#"
+templates:
+  svc:
+    source_repo: /repos/team-project
+    instances:
+      lead:
+        backend: claude
+      dev:
+        backend: kiro-cli
+"#;
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+    let args = serde_json::json!({
+        "template": "svc",
+        "directory": home.display().to_string(),
+    });
+    let _ = deploy(&home, "caller", &args);
+
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    let team = fleet.teams.get("svc").expect("team 'svc' must exist");
+    assert_eq!(
+        team.source_repo.as_ref().map(|p| p.display().to_string()),
+        Some("/repos/team-project".to_string()),
+        "sanity: source_repo propagation unaffected"
+    );
+    assert!(
+        team.project_id.is_none(),
+        "#3327: absent template project_id must leave team project_id None (byte-identical)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3327 AC4: teardown deletes the whole team entry; a redeploy of the same
+/// template must rebuild the team WITH the template-declared project_id —
+/// this is exactly where the pre-fix hand-patch was lost.
+#[test]
+fn teardown_redeploy_rebuilds_team_project_id_from_template_3327() {
+    let home = tmp_home("tpl_pid_teardown_3327");
+    let yaml = r#"
+templates:
+  svc:
+    source_repo: /repos/team-project
+    project_id: team-project
+    instances:
+      lead:
+        backend: claude
+      dev:
+        backend: kiro-cli
+"#;
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+    let args = serde_json::json!({
+        "template": "svc",
+        "directory": home.display().to_string(),
+    });
+
+    let _ = deploy(&home, "caller", &args);
+    let _ = teardown(&home, &serde_json::json!({"name": "svc"}));
+    let after_teardown =
+        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    assert!(
+        !after_teardown.teams.contains_key("svc"),
+        "sanity: teardown removes the team entry"
+    );
+
+    let _ = deploy(&home, "caller", &args);
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    let team = fleet.teams.get("svc").expect("redeployed team must exist");
+    assert_eq!(
+        team.project_id.as_deref(),
+        Some("team-project"),
+        "#3327: teardown+redeploy must rebuild project_id from the template"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 // #1629 invariant (#1617 lock-while-blocking class): the deployment-store
 // flock must be acquired AFTER the loopback `api::call`s (SPAWN/CREATE_TEAM
 // in deploy, DELETE in teardown), never around them — a self-IPC held under
