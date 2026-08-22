@@ -15,17 +15,20 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub(crate) mod dev_modal;
 mod dismiss;
 #[allow(unused_imports)]
 pub use dismiss::try_dismiss_dialog;
 pub(crate) mod crash_disposition;
 use dismiss::{
-    dismiss_scan_armed, is_dismissible_prompt_state, prepare_dismiss_patterns,
+    dismiss_scan_armed, dismiss_scan_scope, is_dismissible_prompt_state, prepare_dismiss_patterns,
     try_prepared_dismiss_dialog, PreparedDismissPattern,
 };
 
 pub mod deleting;
 
+/// #3315 B3: platform shim so the write path never names `write_actor` directly.
+mod actor_write;
 #[cfg(unix)]
 mod write_actor;
 
@@ -804,7 +807,9 @@ fn provision_opencode_data_dir(
 /// Extracted from `spawn_agent` so the command-construction logic (arg
 /// enrichment, env filtering, PATH prepend, cwd validation) is isolated
 /// from the PTY plumbing that follows.
-fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option<Backend>)> {
+fn build_command(
+    config: &SpawnConfig,
+) -> anyhow::Result<(CommandBuilder, Option<Backend>, dev_modal::SpawnProvenance)> {
     let SpawnConfig {
         name,
         backend: _,
@@ -888,6 +893,11 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
         which::which(backend_command).unwrap_or_else(|_| std::path::PathBuf::from(backend_command));
     let mut cmd = CommandBuilder::new(&resolved_command);
     cmd.args(&enriched_args);
+    // #3314 B1: capture the arming facts from the command we JUST built — the
+    // argv read back off the builder, and the path we resolved for it — before
+    // anything can exec or a config/symlink can move under us. Re-deriving them
+    // after the spawn is what made r1 fail open.
+    let spawn_provenance = dev_modal::SpawnProvenance::capture(&cmd, &resolved_command);
 
     // #1440: agent-backend env isolation. INVARIANT: env_clear() must run here,
     // before any env injection below, or the explicit keys we set would be wiped.
@@ -1244,7 +1254,7 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
     // git shim (which checks the var), not inherit a blanket bypass.
     cmd.env_remove("AGEND_GIT_BYPASS");
 
-    Ok((cmd, detected_backend))
+    Ok((cmd, detected_backend, spawn_provenance))
 }
 
 /// Resolve the authoritative registry `InstanceId` for a spawn (#1441).
@@ -1369,7 +1379,7 @@ pub(crate) fn spawn_agent_with_capture_home(
         }
     }
 
-    let (cmd, detected_backend) = build_command(config)?;
+    let (cmd, detected_backend, spawn_provenance) = build_command(config)?;
 
     // #995 Bug 3: emit a warning when spawning a backend whose MCP
     // discovery is incompatible with fleet's `<workdir>/.<vendor>/mcp_config.json`
@@ -1539,6 +1549,9 @@ pub(crate) fn spawn_agent_with_capture_home(
         })
         .unwrap_or_default();
     let dismiss = prepare_dismiss_patterns(&dismiss);
+    // #3314 B1: arming is a PURE function of the provenance captured from the
+    // command that was actually built and spawned — never a post-spawn re-read.
+    let dev_modal_armed = dev_modal::armed_for_spawn(&spawn_provenance, name);
     let shutdown_for_reaper = shutdown.clone();
     let deleted_for_reaper = {
         let reg = lock_registry(registry);
@@ -1556,6 +1569,7 @@ pub(crate) fn spawn_agent_with_capture_home(
         home: home_for_reaper,
         crash_tx: crash_tx_for_reaper,
         dismiss_patterns: dismiss,
+        dev_modal_armed,
         shutdown: shutdown_for_reaper,
         deleted: deleted_for_reaper,
         generation,
@@ -2012,6 +2026,9 @@ struct PtyReadContext {
     home: Option<std::path::PathBuf>,
     crash_tx: Option<CrashChannel>,
     dismiss_patterns: Vec<PreparedDismissPattern>,
+    /// #3314: this generation's argv actually carried
+    /// `--dangerously-load-development-channels`.
+    dev_modal_armed: bool,
     shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
     deleted: Arc<std::sync::atomic::AtomicBool>,
     generation: crash_disposition::SpawnGeneration,
@@ -2075,6 +2092,7 @@ fn pty_read_loop(
         home,
         crash_tx,
         dismiss_patterns,
+        dev_modal_armed,
         shutdown,
         deleted,
         generation,
@@ -2082,6 +2100,19 @@ fn pty_read_loop(
     let mut buf = [0u8; 8192];
     let mut dismiss_cooldown_until: Option<std::time::Instant> = None;
     let mut dismiss_scan_enabled = !dismiss_patterns.is_empty();
+    // #3314: per-generation gate — a plain local, generation-scoped by
+    // construction. #3315 B2: the guard ends the generation (cancel, then
+    // disarm) from its Drop, so EVERY exit of this loop is covered, including
+    // an unwind — which the trailing statements it replaces silently skipped.
+    let (dev_modal_guard, mut dev_modal_gate) =
+        dev_modal::arm_generation(pty_writer, *dev_modal_armed, Arc::clone(deleted));
+    // Monotonic base for the stability window; the gate never reads a clock.
+    let dev_modal_clock = std::time::Instant::now();
+    // #3314: has the agent reached Idle at least once? That is the point after
+    // which a daemon-caused STARTUP modal can no longer legitimately appear, so
+    // the post-latch re-arm narrows to workspace-trust only. See
+    // `dismiss_scan_scope`.
+    let mut dismiss_agent_ever_idle = false;
     // #t-23: debug-only seam — verbose per-read PTY logging (read counts / byte
     // totals). Off by default; enable with `AGEND_DEBUG_PTY_READ=1`. Tightened
     // from presence-based (`is_ok()`: any value, even `=0`, enabled it) to the
@@ -2131,7 +2162,7 @@ fn pty_read_loop(
                 // post-render means we match what the user actually sees —
                 // Ink-style TUIs that draw char-by-char with cursor positioning
                 // won't defeat us (VTerm resolves the geometry). Cooldown: 10s.
-                let (screen, state_changed, dismiss_latch_off, prompt_blocked) = {
+                let (screen, state_changed, dismiss_latch_off, prompt_blocked, agent_is_idle) = {
                     let mut c = core.lock();
                     // Disjoint field borrows so the lazy-fg closure may read
                     // `vterm` while `state` is borrowed mutably (both fields of
@@ -2166,8 +2197,17 @@ fn pty_read_loop(
                     // past the startup latch — agy's banner trips the latch before
                     // its trust modal renders. See `dismiss_scan_armed`.
                     let prompt_blocked = is_dismissible_prompt_state(cur);
+                    // #3314: recorded AFTER this frame's scan (below), so the very
+                    // frame that first settles the agent is still scanned pre-Idle.
+                    let agent_is_idle = cur == crate::state::AgentState::Idle;
                     broadcast_pty_output(subscribers, data, &mut dropped_chunks, name);
-                    (screen, state_changed, dismiss_latch_off, prompt_blocked)
+                    (
+                        screen,
+                        state_changed,
+                        dismiss_latch_off,
+                        prompt_blocked,
+                        agent_is_idle,
+                    )
                 };
 
                 let in_cooldown = dismiss_cooldown_until
@@ -2181,9 +2221,14 @@ fn pty_read_loop(
                         pty_writer,
                         dismiss_patterns,
                         // #2473 (r6): a post-latch re-arm (scan_enabled==false,
-                        // armed only via prompt_blocked) scans ONLY workspace-
-                        // trust patterns — never runtime-approval `Yes, proceed`.
-                        !dismiss_scan_enabled,
+                        // armed only via prompt_blocked) never reaches runtime-
+                        // approval `Yes, proceed`. #3314: before the agent has ever
+                        // been Idle it additionally reaches daemon-caused startup
+                        // modals, which is the window a fresh spawn's dev-channel
+                        // modal falls into.
+                        dismiss_scan_scope(dismiss_scan_enabled, dismiss_agent_ever_idle),
+                        &mut dev_modal_gate,
+                        dev_modal::LogicalMs(dev_modal_clock.elapsed().as_millis() as u64),
                     )
                 {
                     dismiss_cooldown_until =
@@ -2191,6 +2236,9 @@ fn pty_read_loop(
                 }
                 if dismiss_latch_off {
                     dismiss_scan_enabled = false;
+                }
+                if agent_is_idle {
+                    dismiss_agent_ever_idle = true;
                 }
             }
             Err(e) => {
@@ -2204,6 +2252,11 @@ fn pty_read_loop(
             }
         }
     }
+
+    // #3315 B2: explicit so the ordering the trailing statements had is kept —
+    // the generation ends BEFORE `handle_pty_close`. On an unwind this line is
+    // skipped and Drop does it anyway, which is the whole point.
+    drop(dev_modal_guard);
 
     // #1144: handle_pty_close runs after BOTH exit paths (EOF and read error).
     // Previously only the Ok(0) branch called it; the Err branch broke without
@@ -2641,19 +2694,6 @@ fn write_in_progress_set() -> &'static parking_lot::Mutex<std::collections::Hash
     WRITE_IN_PROGRESS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
 }
 
-/// `Some(Ok/Err)` -> `writer` is registered with `write_actor`, use its
-/// result directly. `None` -> not registered (Windows; synthetic/test
-/// writer) -- fall through to the thread-per-write mechanism below.
-#[cfg(unix)]
-fn try_actor_write(writer: &PtyWriter, data: &[u8]) -> Option<std::io::Result<()>> {
-    write_actor::write(writer, data.to_vec(), PTY_WRITE_TIMEOUT)
-}
-
-#[cfg(not(unix))]
-fn try_actor_write(_writer: &PtyWriter, _data: &[u8]) -> Option<std::io::Result<()>> {
-    None
-}
-
 /// Test-only cross-module registration check (used by `daemon::lifecycle`'s
 /// Unix-only test — `write_actor` doesn't exist on other platforms).
 #[cfg(all(test, unix))]
@@ -2662,7 +2702,20 @@ pub(crate) fn write_actor_is_registered(writer: &PtyWriter) -> bool {
 }
 
 fn write_with_timeout(writer: &PtyWriter, data: &[u8]) -> std::io::Result<()> {
-    if let Some(result) = try_actor_write(writer, data) {
+    write_with_timeout_guarded(writer, data, None)
+}
+
+/// As [`write_with_timeout`], but the write carries a #3314 barrier re-checked
+/// immediately before the syscall on the registered-writer (actor) path.
+fn write_with_timeout_guarded(
+    writer: &PtyWriter,
+    data: &[u8],
+    barrier: Option<crate::agent::dev_modal::WriteBarrier>,
+) -> std::io::Result<()> {
+    // #3314: THE chokepoint for every PTY byte write — `write_to_pty` delegates
+    // here, as do inject, dismiss and the TUI socket. See `agent::dev_modal`.
+    crate::agent::dev_modal::note_pty_write(writer);
+    if let Some(result) = actor_write::try_actor_write_guarded(writer, data, barrier) {
         return result;
     }
 

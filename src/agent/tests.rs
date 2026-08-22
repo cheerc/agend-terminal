@@ -1792,7 +1792,7 @@ fn build_command_strips_agend_git_bypass() {
         crash_tx: None,
         shutdown: None,
     };
-    let (cmd, _) = build_command(&config).expect("build_command");
+    let (cmd, _, _prov) = build_command(&config).expect("build_command");
     // #t-3 audit: actually assert the strip. portable_pty's CommandBuilder
     // captures the FULL parent env into its `envs` map at `::new()`, and
     // `env_remove` deletes the key from that map — so `get_env` DOES reflect
@@ -1839,7 +1839,7 @@ fn build_command_sets_git_editor_defaults() {
         crash_tx: None,
         shutdown: None,
     };
-    let (cmd, _) = build_command(&config).expect("build_command");
+    let (cmd, _, _prov) = build_command(&config).expect("build_command");
     for key in &["GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "EDITOR", "VISUAL"] {
         let value = cmd
             .get_env(key)
@@ -1848,6 +1848,93 @@ fn build_command_sets_git_editor_defaults() {
             value.to_string_lossy(),
             "true",
             "{key} must default to `true` (no-op editor binary), got {value:?}"
+        );
+    }
+}
+
+/// #3315 (pins the #3314 B1 fix): `SpawnProvenance` must report the argv this
+/// generation was ACTUALLY built with — not a re-derivation, and not a constant.
+///
+/// The existing B1 pin, `arming_must_not_re_derive_from_mutable_sources_3314`,
+/// is a NEGATIVE source-grep: it proves `spawn_flags`/`which::which` have not
+/// come back, and nothing more. It cannot see whether the replacement reads the
+/// real argv. An exact-head adversarial review demonstrated the gap by forcing
+/// `argv_has_dev_channel_flag: true` in `capture`, which arms EVERY generation
+/// regardless of argv and survived every target — a fail-open on an
+/// auto-keystroke gate, hidden behind a pin that only watched the old code.
+///
+/// This drives the real `build_command` in both directions and compares the
+/// provenance against the argv computed from the same `CommandBuilder`. The
+/// per-case direction is asserted too: equality alone would hold vacuously if
+/// both sides collapsed to false.
+#[test]
+fn spawn_provenance_flag_matches_the_built_argv_3315() {
+    const FLAG: &str = "--dangerously-load-development-channels";
+
+    // (label, mcp-config.json contents, the flag this workspace must produce)
+    let cases: [(&str, &str, bool); 2] = [
+        (
+            "bridge-declared",
+            r#"{"mcpServers":{"agend-claude-channel":{"command":"agend-channel"}}}"#,
+            true,
+        ),
+        (
+            "no-bridge",
+            r#"{"mcpServers":{"other":{"command":"x"}}}"#,
+            false,
+        ),
+    ];
+
+    for (label, mcp_config, expected_flag) in cases {
+        let workspace = resolve_test_home(&format!("provenance-argv-3315-{label}"));
+        std::fs::create_dir_all(workspace.join(".claude")).expect(".claude dir");
+        std::fs::write(workspace.join(".claude/agend.md"), "fleet instructions").expect("agend.md");
+        std::fs::write(workspace.join("mcp-config.json"), mcp_config).expect("mcp-config.json");
+
+        let config = SpawnConfig {
+            name: "provenance-argv-3315",
+            backend: Some(&Backend::ClaudeCode),
+            backend_command: "claude",
+            args: &[],
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: Some(&workspace),
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        };
+
+        let (cmd, _detected, provenance) = build_command(&config).expect("build_command");
+        let argv: Vec<String> = cmd
+            .get_argv()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let argv_carries_flag = argv.iter().any(|arg| arg == FLAG);
+
+        assert_eq!(
+            argv_carries_flag,
+            expected_flag,
+            "[{label}] fixture check: this workspace must build an argv that \
+             {} {FLAG}; argv={argv:?}",
+            if expected_flag { "carries" } else { "omits" }
+        );
+        assert_eq!(
+            provenance.argv_has_dev_channel_flag,
+            argv_carries_flag,
+            "[{label}] #3314 B1: provenance must be a fact ABOUT THE BUILT ARGV. \
+             It reported {} while the argv it was captured from {} the flag — so a \
+             generation could be armed on something other than what it is running. \
+             argv={argv:?}",
+            provenance.argv_has_dev_channel_flag,
+            if argv_carries_flag {
+                "carries"
+            } else {
+                "omits"
+            }
         );
     }
 }
@@ -1879,7 +1966,7 @@ fn build_command_wrapper_uses_declared_backend_for_presets_and_flags_2801() {
         shutdown: None,
     };
 
-    let (cmd, detected) = build_command(&config).expect("build_command");
+    let (cmd, detected, _prov) = build_command(&config).expect("build_command");
     assert_eq!(
         detected,
         Some(Backend::ClaudeCode),
@@ -1966,7 +2053,7 @@ fn build_command_without_declared_backend_keeps_legacy_inference_2801() {
         shutdown: None,
     };
 
-    let (cmd, detected) = build_command(&config).expect("build_command");
+    let (cmd, detected, _prov) = build_command(&config).expect("build_command");
     assert_eq!(detected, Some(Backend::ClaudeCode));
     let argv: Vec<String> = cmd
         .get_argv()
@@ -2011,7 +2098,7 @@ fn build_command_allows_operator_backend_credential_2106() {
         crash_tx: None,
         shutdown: None,
     };
-    let (cmd, _) = build_command(&config).expect("build_command");
+    let (cmd, _, _prov) = build_command(&config).expect("build_command");
     assert_eq!(
         cmd.get_env("ANTHROPIC_AUTH_TOKEN")
             .map(|v| v.to_string_lossy().into_owned()),
@@ -2059,7 +2146,7 @@ fn build_command_credential_override_is_per_backend_2106() {
         crash_tx: None,
         shutdown: None,
     };
-    let (cmd, _) = build_command(&config).expect("build_command");
+    let (cmd, _, _prov) = build_command(&config).expect("build_command");
     assert_ne!(
         cmd.get_env("ANTHROPIC_AUTH_TOKEN")
             .map(|v| v.to_string_lossy().into_owned()),
@@ -2106,7 +2193,7 @@ fn build_command_disables_opencode_autoupdate_only_for_opencode() {
         crate::backend::SpawnMode::Fresh,
         crate::backend::SpawnMode::Resume,
     ] {
-        let (oc, _) = build_command(&cfg("opencode", mode)).expect("build_command opencode");
+        let (oc, _, _prov) = build_command(&cfg("opencode", mode)).expect("build_command opencode");
         let content = oc
             .get_env("OPENCODE_CONFIG_CONTENT")
             .and_then(|v| v.to_str().map(String::from))
@@ -2128,7 +2215,7 @@ fn build_command_disables_opencode_autoupdate_only_for_opencode() {
     }
     // Non-OpenCode backends must NOT receive either env (no cross-backend leakage).
     for cmd in ["claude", "codex", "echo"] {
-        let (c, _) =
+        let (c, _, _prov) =
             build_command(&cfg(cmd, crate::backend::SpawnMode::Fresh)).expect("build_command");
         assert!(
             c.get_env("OPENCODE_CONFIG_CONTENT").is_none(),
@@ -2180,7 +2267,7 @@ fn build_command_reinjects_agend_home_under_env_isolation_med5() {
         None => std::env::remove_var("AGEND_ENV_ISOLATION"),
     }
 
-    let (cmd, _) = built.expect("build_command");
+    let (cmd, _, _prov) = built.expect("build_command");
     let v = cmd
         .get_env("AGEND_HOME")
         .expect("MED-5: AGEND_HOME must survive env_clear under isolation");
@@ -2225,7 +2312,7 @@ fn build_agy_cmd(
         crash_tx: None,
         shutdown: None,
     };
-    let (cmd, backend) = build_command(&config).expect("build_command");
+    let (cmd, backend, _prov) = build_command(&config).expect("build_command");
     assert_eq!(backend, Some(Backend::Agy));
     (cmd, crate::agy_workspace::link_path(home, "agy-int"))
 }
@@ -3034,6 +3121,7 @@ fn pty_read_error_triggers_cleanup() {
     );
 
     let ctx = PtyReadContext {
+        dev_modal_armed: false,
         name: agent_name.to_string(),
         instance_id,
         core,
@@ -3182,6 +3270,7 @@ fn run_pty_close_capturing_crash(
     let (tx, rx) = crossbeam_channel::unbounded();
     let tx_guard = tx.clone();
     let ctx = PtyReadContext {
+        dev_modal_armed: false,
         name: "rank4-guard".to_string(),
         instance_id: id,
         core,
@@ -3407,6 +3496,7 @@ fn run_pty_read_loop_for_r8(
         observed_status: None,
     }));
     let ctx = PtyReadContext {
+        dev_modal_armed: false,
         name: "r8-dismiss-test".to_string(),
         instance_id: crate::types::InstanceId::default(),
         core,
@@ -3505,6 +3595,120 @@ fn r8_startup_dialog_still_dismisses_before_latch_off() {
         b"\r",
         "R8: startup trust dialog must still send the configured dismiss keystroke"
     );
+}
+
+/// #3315 B2 (unit): forced unwind with the guard live. BOTH halves of the
+/// end-of-generation must happen — cancel the in-flight CR and stop tracking the
+/// writer. The two used to be trailing statements in `pty_read_loop`, which an
+/// unwind skips; `dismiss::InFlightGuard` is the same shape for the same reason.
+///
+/// The panic is injected, not awaited: no timing, no backend, no PTY.
+#[test]
+fn generation_guard_ends_the_generation_on_unwind_3315() {
+    let writer: PtyWriter = Arc::new(Mutex::new(Box::new(RecordingWriter {
+        bytes: Arc::new(Mutex::new(Vec::new())),
+    })));
+    let (guard, gate) = crate::agent::dev_modal::arm_generation(
+        &writer,
+        true,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    // The snapshot a queued keystroke carries into its 300ms sleep.
+    let barrier = gate.write_barrier();
+    assert!(
+        barrier.still_valid() && crate::agent::dev_modal::epoch_is_armed(&writer),
+        "precondition: the generation is live and tracked before the unwind"
+    );
+
+    let h = std::thread::Builder::new()
+        .name("gen-guard-panic-3315".into())
+        .spawn(move || {
+            let _guard = guard;
+            panic!("injected unwind before any normal end-of-generation");
+        })
+        .expect("spawn");
+    assert!(h.join().is_err(), "the injected panic must propagate");
+
+    assert!(
+        !barrier.still_valid(),
+        "#3315 B2: an unwind must CANCEL the generation — a CR still queued \
+         behind the 300ms write delay would otherwise pass its barrier and land \
+         on a PTY whose read loop is already gone"
+    );
+    assert!(
+        !crate::agent::dev_modal::epoch_is_armed(&writer),
+        "#3315 B2: an unwind must also stop tracking this writer — a leaked epoch \
+         entry keeps counting for a dead generation and is inherited by the next \
+         writer allocated at the same address"
+    );
+}
+
+/// #3315 B2 (integration): the unit test above proves the guard's Drop does the
+/// right thing; this one proves the REAL `pty_read_loop` is what arms it, by
+/// making the loop die the way trailing statements cannot survive — a panic out
+/// of `read()`, not EOF. Deterministic: the panic is in the fixture reader.
+///
+/// The normal-exit half is asserted too, because moving teardown into a Drop is
+/// only safe if the ordinary EOF path still tears down exactly as before.
+#[test]
+fn pty_read_loop_ends_the_generation_on_both_exits_3315() {
+    struct PanickingReader;
+    impl Read for PanickingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            panic!("injected read-loop unwind (#3315 B2)");
+        }
+    }
+
+    for (label, panicking) in [("EOF", false), ("unwind", true)] {
+        let writer: PtyWriter = Arc::new(Mutex::new(Box::new(RecordingWriter {
+            bytes: Arc::new(Mutex::new(Vec::new())),
+        })));
+        let ctx = PtyReadContext {
+            dev_modal_armed: true,
+            name: format!("gen-guard-{label}-3315"),
+            instance_id: crate::types::InstanceId::default(),
+            core: Arc::new(crate::sync_audit::CoreMutex::new(AgentCore {
+                vterm: VTerm::new(80, 24),
+                subscribers: Vec::new(),
+                state: StateTracker::new(Some(&Backend::ClaudeCode)),
+                health: HealthTracker::new(),
+                api_activity: crate::agent::ApiActivity::default(),
+                observed_status: None,
+            })),
+            pty_writer: Arc::clone(&writer),
+            registry: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            home: None,
+            crash_tx: None,
+            dismiss_patterns: Vec::new(),
+            shutdown: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+            deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            generation: crate::agent::crash_disposition::SpawnGeneration::default(),
+        };
+        let capture = crate::capture::make_capture_writer(None, "gen-guard-3315", "claude");
+        let ran = std::thread::Builder::new()
+            .name(format!("read-loop-{label}-3315"))
+            .spawn(move || {
+                let mut eof = ChunkReader {
+                    chunks: Vec::new(),
+                    next: 0,
+                };
+                let mut boom = PanickingReader;
+                let reader: &mut dyn Read = if panicking { &mut boom } else { &mut eof };
+                pty_read_loop(reader, &ctx, capture);
+            })
+            .expect("spawn")
+            .join();
+        assert_eq!(
+            ran.is_err(),
+            panicking,
+            "fixture check: the {label} run must exit the way this case intends"
+        );
+        assert!(
+            !crate::agent::dev_modal::epoch_is_armed(&writer),
+            "#3315 B2: `pty_read_loop` must stop tracking the writer on its {label} \
+             exit. A trailing statement covers only the first case; a Drop covers both"
+        );
+    }
 }
 
 /// #1145: write_with_timeout stuck thread must clear WRITE_IN_PROGRESS
@@ -4985,7 +5189,7 @@ fn codex_argv_3317(
         crash_tx: None,
         shutdown: None,
     };
-    let (cmd, detected) = build_command(&config).expect("build_command codex");
+    let (cmd, detected, _provenance) = build_command(&config).expect("build_command codex");
     assert_eq!(detected, Some(Backend::Codex));
     argv_of_3317(&cmd)
 }
@@ -5106,7 +5310,7 @@ fn non_codex_backends_get_no_mcp_overrides_3317() {
             crash_tx: None,
             shutdown: None,
         };
-        let (cmd, _) = build_command(&config).expect("build_command");
+        let (cmd, _, _) = build_command(&config).expect("build_command");
         let argv = argv_of_3317(&cmd);
         assert!(
             !argv
