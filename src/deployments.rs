@@ -573,6 +573,12 @@ fn create_deployment_team(
         return false;
     }
     let description = format!("Template deployment: {template}");
+    // #3327: team-level `project_id` override (#2509) was unreachable from a
+    // template deploy — this used to hardcode None, so teams whose clone path
+    // mis-slugs lost their board override on every redeploy (teardown deletes
+    // the whole team entry). Read the optional field from the same
+    // template_def the sibling `orchestrator` parse uses.
+    let template_project_id = yaml_str(template_def, "project_id");
     let orchestrator = template_def
         .get("orchestrator")
         .and_then(|value| value.as_str())
@@ -598,7 +604,7 @@ fn create_deployment_team(
             orchestrator,
             description: Some(description),
             repository_path: template_source_repo.clone(),
-            project_id: None,
+            project_id: template_project_id,
             accept_from: Vec::new(),
         };
         let result = crate::team_ops::create(
@@ -614,6 +620,7 @@ fn create_deployment_team(
         home,
         deploy_name,
         template_source_repo,
+        template_project_id.as_ref(),
         created,
         &description,
         orchestrator.as_deref(),
@@ -624,6 +631,7 @@ fn create_deployment_team_legacy(
     home: &Path,
     deploy_name: &str,
     template_source_repo: &Option<String>,
+    template_project_id: Option<&String>,
     created: &[String],
     description: &str,
     orchestrator: Option<&str>,
@@ -635,6 +643,12 @@ fn create_deployment_team_legacy(
     });
     if let Some(ref sr) = template_source_repo {
         team_args["repository_path"] = serde_json::Value::String(sr.clone());
+    }
+    // #3327: the legacy fallback must carry the field too — teams::create
+    // reads `project_id` from raw args (#2509), so both creation paths
+    // land the same override.
+    if let Some(pid) = template_project_id {
+        team_args["project_id"] = serde_json::Value::String(pid.clone());
     }
     if let Some(orchestrator) = orchestrator {
         team_args["orchestrator"] = serde_json::Value::String(orchestrator.to_string());
