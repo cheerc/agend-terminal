@@ -342,7 +342,6 @@ pub fn try_prepared_dismiss_dialog(
         // whenever the phrase appeared anywhere on screen — including in agent
         // output and scrollback — sending input the user never authorized.
         if pattern.regex.is_match(screen) {
-            tracing::info!(agent = name, pattern = %pattern.pattern, "auto-dismissing dialog");
             // Delayed write: TUI escape-sequence parsers need time to distinguish
             // \x1b (ESC key) from \x1b[ (CSI start).  Writing immediately causes
             // Ink-based TUIs (kiro-cli) to interpret \x1b as "ESC to cancel".
@@ -378,6 +377,7 @@ pub fn try_prepared_dismiss_dialog(
             let writer = Arc::clone(pty_writer);
             let keys = pattern.key_seq.clone();
             let agent = name.to_string();
+            let pattern_text = pattern.pattern.clone();
             // #3314: the barrier is scoped to the startup-modal class ONLY.
             // Other backends send multi-chunk sequences (agy's up-up-Enter), and
             // each chunk's own write bumps the epoch — applying the barrier
@@ -389,18 +389,29 @@ pub fn try_prepared_dismiss_dialog(
             // spending early strands it as Refused(Spent) with the modal
             // unanswered, which is the exact failure the rule exists to prevent.
             let barrier = pattern.rearm_pre_idle.then(|| dev_gate.write_barrier());
+            let enqueue_receipt = pattern.rearm_pre_idle.then(|| dev_gate.enqueue_receipt());
             #[cfg(test)]
             if INLINE_DISMISS_WRITE.with(std::cell::Cell::get) {
                 let _guard = InFlightGuard(agent.clone());
                 run_pre_write_rendezvous();
-                if barrier
+                let result = if barrier
                     .as_ref()
                     .is_none_or(crate::agent::dev_modal::WriteBarrier::still_valid)
                 {
-                    let _ = write_with_timeout(&writer, &keys);
+                    write_with_timeout(&writer, &keys)
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "PTY write cancelled by stale-frame barrier",
+                    ))
+                };
+                if result.is_ok() {
+                    if let Some(receipt) = enqueue_receipt.as_ref() {
+                        receipt.mark_enqueued();
+                    }
                 }
-                if pattern.rearm_pre_idle {
-                    dev_gate.mark_enqueued();
+                if result.is_ok() {
+                    tracing::info!(agent = name, pattern = %pattern.pattern, "dialog dismiss submitted");
                 }
                 return true;
             }
@@ -435,40 +446,55 @@ pub fn try_prepared_dismiss_dialog(
                     // state that triggers a dismiss — would otherwise pin the writer
                     // lock forever, wedging every future inject to that agent until
                     // daemon restart. `write_with_timeout` flushes internally.
-                    let mut start = 0;
-                    for (i, &b) in keys.iter().enumerate() {
-                        if b == b'\r' || b == b'\n' {
-                            // Send everything up to (not including) this Enter
-                            if start < i {
-                                let _ = write_with_timeout_guarded(
+                    let result = (|| -> std::io::Result<()> {
+                        let mut start = 0;
+                        for (i, &b) in keys.iter().enumerate() {
+                            if b == b'\r' || b == b'\n' {
+                                // Send everything up to (not including) this Enter
+                                if start < i {
+                                    write_with_timeout_guarded(
+                                        &writer,
+                                        &keys[start..i],
+                                        barrier.clone(),
+                                    )?;
+                                    std::thread::sleep(std::time::Duration::from_millis(200));
+                                }
+                                // Send the Enter
+                                write_with_timeout_guarded(
                                     &writer,
-                                    &keys[start..i],
+                                    &keys[i..=i],
                                     barrier.clone(),
-                                );
-                                std::thread::sleep(std::time::Duration::from_millis(200));
+                                )?;
+                                start = i + 1;
                             }
-                            // Send the Enter
-                            let _ =
-                                write_with_timeout_guarded(&writer, &keys[i..=i], barrier.clone());
-                            start = i + 1;
+                        }
+                        if start < keys.len() {
+                            write_with_timeout_guarded(
+                                &writer,
+                                &keys[start..],
+                                barrier.clone(),
+                            )?;
+                        }
+                        Ok(())
+                    })();
+                    match result {
+                        Ok(()) => {
+                            if let Some(receipt) = enqueue_receipt {
+                                receipt.mark_enqueued();
+                            }
+                            tracing::info!(agent = %agent, pattern = %pattern_text, "dialog dismiss submitted");
+                            tracing::debug!(agent = %agent, "dismiss keystrokes sent");
+                        }
+                        Err(error) => {
+                            tracing::debug!(agent = %agent, %error, "dialog dismiss write failed");
                         }
                     }
-                    if start < keys.len() {
-                        let _ =
-                            write_with_timeout_guarded(&writer, &keys[start..], barrier.clone());
-                    }
-                    tracing::debug!(agent = %agent, "dismiss keystrokes sent");
                     // H2: in-flight slot freed by `_guard` on scope exit.
                 })
                 .is_err()
             {
                 tracing::warn!(agent = name, "failed to spawn dismiss-dialog thread");
                 DISMISS_IN_FLIGHT.lock().remove(name);
-            } else if pattern.rearm_pre_idle {
-                // P2-D: submitted. Only now is the generation's single answer
-                // spent; the spawn-failure branch above deliberately leaves it
-                // unspent so the modal can still be answered.
-                dev_gate.mark_enqueued();
             }
             return true;
         }
@@ -568,6 +594,24 @@ mod tests {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.bytes.lock().extend_from_slice(buf);
             Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailingWriter {
+        attempted: std::sync::mpsc::Sender<()>,
+    }
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            let _ = self.attempted.send(());
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "injected PTY write failure",
+            ))
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
@@ -1243,6 +1287,10 @@ WARNING: Loading development channels
     const FRAME_COMPETING_3314: &str =
         include_str!("../../tests/fixtures/devchannel-3314/competing.txt");
     const FRAME_QUOTED_3314: &str = include_str!("../../tests/fixtures/devchannel-3314/quoted.txt");
+    const FRAME_LIVE_MODAL_2_1_240_WRAPPED_3314: &str =
+        include_str!("../../tests/fixtures/devchannel-3314/live_modal_2_1_240_wrapped.txt");
+    const FRAME_LIVE_MODAL_2_1_241_3314: &str =
+        include_str!("../../tests/fixtures/devchannel-3314/live_modal_2_1_241.txt");
 
     /// One process generation, driven deterministically.
     struct Generation3314 {
@@ -1418,13 +1466,136 @@ WARNING: Loading development channels
         assert!(gen.bytes().is_empty());
     }
 
+    /// #3314: production capture from Claude 2.1.240 at the operator's real
+    /// pane width. The explanatory sentence wraps between `this` and `option`;
+    /// terminal geometry must not make an otherwise complete modal invisible.
+    #[test]
+    fn production_wrapped_2_1_240_modal_is_complete_3314() {
+        use crate::agent::dev_modal::complete_modal_digest;
+        assert!(
+            complete_modal_digest(FRAME_LIVE_MODAL_2_1_240_WRAPPED_3314).is_some(),
+            "#3314: a width-induced line wrap must preserve the modal fingerprint"
+        );
+    }
+
+    /// #3329: production capture from the operator's Claude 2.1.241 startup.
+    #[test]
+    fn production_2_1_241_modal_is_complete_3329() {
+        use crate::agent::dev_modal::complete_modal_digest;
+        assert!(complete_modal_digest(FRAME_LIVE_MODAL_2_1_241_3314).is_some());
+    }
+
+    /// #3314: recognizing the headline is not a successful dismiss. A refused
+    /// generation must not emit the success signal that operators rely on.
+    #[test]
+    #[tracing_test::traced_test]
+    fn refused_startup_modal_is_not_logged_as_dismissed_3314() {
+        let mut gen = Generation3314::new("3314-refused-log", false);
+        assert!(!gen.stable_frame(FRAME_LIVE_MODAL_3314));
+        assert!(gen.bytes().is_empty());
+        assert!(
+            !logs_contain("auto-dismissing dialog") && !logs_contain("dialog dismiss submitted"),
+            "a refused generation must not emit a dismiss-success log"
+        );
+    }
+
+    /// #3314: the replacement success signal is emitted only after the write
+    /// has crossed the generation gate and been submitted.
+    #[test]
+    #[tracing_test::traced_test]
+    fn submitted_startup_modal_has_truthful_success_log_3314() {
+        let mut gen = Generation3314::new("3314-submitted-log", true);
+        assert!(gen.stable_frame(FRAME_LIVE_MODAL_3314));
+        assert_eq!(gen.bytes().as_slice(), b"\r");
+        assert!(logs_contain("dialog dismiss submitted"));
+    }
+
+    /// #3314: the real detached writer sleeps before its final barrier check.
+    /// Cancelling in that window is not a submission: it must neither spend the
+    /// generation nor emit the success signal.
+    #[test]
+    #[tracing_test::traced_test]
+    fn cancelled_detached_write_is_not_a_submission_3314() {
+        let mut gen = Generation3314::new("3314-detached-cancel", true);
+        assert!(!gen.frame(FRAME_LIVE_MODAL_3314));
+        gen.now += crate::agent::dev_modal::MIN_STABLE_MS;
+        set_inline_dismiss_write_for_test(false);
+        assert!(try_prepared_dismiss_dialog(
+            &gen.tag,
+            FRAME_LIVE_MODAL_3314,
+            &gen.writer,
+            &gen.prepared,
+            DismissScanScope::Startup,
+            &mut gen.gate,
+            LogicalMs(gen.now),
+        ));
+
+        gen.note_activity();
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        assert!(gen.bytes().is_empty());
+        assert!(!logs_contain("dialog dismiss submitted"));
+        assert_ne!(
+            gen.gate.observe(FRAME_LIVE_MODAL_3314, LogicalMs(gen.now)),
+            GateOutcome::Refuse(crate::agent::dev_modal::Refused::Spent),
+            "a barrier-cancelled detached write must leave the one-shot unspent"
+        );
+    }
+
+    /// #3314: a valid barrier does not make a failed PTY write a submission.
+    /// This reaches the detached writer's result arm rather than its earlier
+    /// stale-frame check, pinning the production path that review found absent.
+    #[test]
+    fn failed_detached_write_leaves_the_one_shot_unspent_3314() {
+        let mut gen = Generation3314::new("3314-detached-failure", true);
+        assert!(!gen.frame(FRAME_LIVE_MODAL_3314));
+        gen.now += crate::agent::dev_modal::MIN_STABLE_MS;
+        set_inline_dismiss_write_for_test(false);
+        let (attempted, observed) = std::sync::mpsc::channel();
+        gen.writer = Arc::new(Mutex::new(Box::new(FailingWriter { attempted })));
+        assert!(try_prepared_dismiss_dialog(
+            &gen.tag,
+            FRAME_LIVE_MODAL_3314,
+            &gen.writer,
+            &gen.prepared,
+            DismissScanScope::Startup,
+            &mut gen.gate,
+            LogicalMs(gen.now),
+        ));
+        observed
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the detached writer must attempt the PTY write");
+        for _ in 0..100 {
+            if !DISMISS_IN_FLIGHT.lock().contains(&gen.tag) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            !DISMISS_IN_FLIGHT.lock().contains(&gen.tag),
+            "the detached writer must finish before the gate is inspected"
+        );
+        assert_ne!(
+            gen.gate.observe(FRAME_LIVE_MODAL_3314, LogicalMs(gen.now)),
+            GateOutcome::Refuse(crate::agent::dev_modal::Refused::Spent),
+            "a failed detached write must leave the one-shot unspent"
+        );
+    }
+
     /// #3314 version-drift gate: an unrecognised backend version disarms rather
     /// than assuming the modal still renders the way our captures recorded it.
-    /// The fleet auto-updates — 2.1.235 -> .236 -> .237 -> .238 across four days
+    /// The fleet auto-updates — 2.1.235 -> .236 -> .237 -> .238 -> .240
     /// — so this is a live concern, not a hypothetical.
     #[test]
     fn only_validated_backend_versions_are_armed_3314() {
         use crate::agent::dev_modal::{version_is_validated, VALIDATED_CLAUDE_VERSIONS};
+        assert!(
+            version_is_validated(Some("2.1.240")),
+            "#3314: the production-captured 2.1.240 modal must be armed"
+        );
+        assert!(
+            version_is_validated(Some("2.1.241")),
+            "#3329: the production-captured 2.1.241 modal must be armed"
+        );
         assert!(version_is_validated(Some("2.1.238")));
         assert!(version_is_validated(Some("2.1.237")));
         assert!(
@@ -1434,6 +1605,14 @@ WARNING: Loading development channels
         assert!(
             !version_is_validated(None),
             "#3314: an unresolvable binary identity must disarm, not default open"
+        );
+        assert!(
+            VALIDATED_CLAUDE_VERSIONS.contains(&"2.1.240"),
+            "the production-captured version must be listed"
+        );
+        assert!(
+            VALIDATED_CLAUDE_VERSIONS.contains(&"2.1.241"),
+            "the current production-captured version must be listed"
         );
         assert!(
             VALIDATED_CLAUDE_VERSIONS.contains(&"2.1.238"),
@@ -1548,6 +1727,42 @@ WARNING: Loading development channels
         );
     }
 
+    #[test]
+    fn failed_pty_write_does_not_bump_the_epoch_3314() {
+        let (attempted, observed) = std::sync::mpsc::channel();
+        let writer: PtyWriter = Arc::new(Mutex::new(Box::new(FailingWriter { attempted })));
+        let epoch = crate::agent::dev_modal::arm_epoch(&writer);
+        let before = epoch.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            write_with_timeout(&writer, b"anything")
+                .expect_err("the injected write must fail")
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        observed.recv().expect("the writer must be attempted");
+        let after = epoch.load(std::sync::atomic::Ordering::SeqCst);
+        crate::agent::dev_modal::disarm_epoch(&writer);
+        assert_eq!(
+            after, before,
+            "#3314: a failed write delivered no input and must not invalidate the candidate"
+        );
+    }
+
+    #[test]
+    fn fallback_write_rechecks_the_barrier_3314() {
+        let (writer, written) = recording_writer_3314();
+        let mut gate = DevModalGate::new(true);
+        let barrier = gate.write_barrier();
+        gate.note_pty_activity();
+        assert_eq!(
+            write_with_timeout_guarded(&writer, b"\r", Some(barrier))
+                .expect_err("an invalid barrier must cancel the fallback write")
+                .kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert!(written.lock().is_empty());
+    }
+
     /// #3314: an UNARMED writer's writes are a no-op, so the registry cannot
     /// grow unbounded and a disarmed generation costs nothing.
     #[test]
@@ -1630,8 +1845,8 @@ WARNING: Loading development channels
              `pty_read_loop_ends_the_generation_on_both_exits_3315`; this pins the call site"
         );
         assert!(
-            agent_src.contains("crate::agent::dev_modal::note_pty_write(writer);"),
-            "#3314: write_with_timeout must bump the epoch for every PTY write"
+            agent_src.contains("actor_write::record_successful_write"),
+            "#3314: write_with_timeout must bump the epoch after successful PTY writes"
         );
         let pane_src = include_str!("../layout/pane.rs");
         assert!(
@@ -1734,24 +1949,22 @@ WARNING: Loading development channels
         );
     }
 
-    /// #3314 r2 RED-4 (P2-D): the one-shot must be spent only AFTER the write is
-    /// successfully submitted. Today `mark_enqueued` runs before the thread spawn
-    /// and before the actor enqueue, so a spawn failure or a full queue leaves the
-    /// generation permanently `Refused(Spent)` with the modal unanswered — the
-    /// exact stranding the rule exists to prevent.
+    /// #3314 r2 (P2-D): the one-shot must be spent only AFTER the write is
+    /// successfully delivered. A spawn, queue, barrier, or write failure must
+    /// leave the generation eligible for another observed attempt.
     #[test]
     fn one_shot_is_spent_only_after_successful_submission_3314() {
         let src = include_str!("dismiss.rs");
-        // Anchored on the WRITE, not the thread spawn: the first `mark_enqueued`
-        // in the file lives in the inline test branch, so comparing against the
-        // spawn measured the wrong occurrence. (My first draft of this pin did
-        // exactly that and stayed red against correct code.)
-        let spend = src
-            .find("dev_gate.mark_enqueued()")
-            .expect("the one-shot spend must exist");
-        let write = src
-            .find("let _ = write_with_timeout(&writer, &keys);")
-            .expect("the dismiss write must exist");
+        let detached = src
+            .find("let result = (|| -> std::io::Result<()>")
+            .expect("the detached dismiss writer must retain its result");
+        let production = &src[detached..];
+        let write = production
+            .find("write_with_timeout_guarded(")
+            .expect("the detached dismiss write must exist");
+        let spend = production
+            .find("receipt.mark_enqueued()")
+            .expect("the detached one-shot spend must exist");
         assert!(
             spend > write,
             "#3314 P2-D: the one-shot is spent BEFORE the write is submitted; a \

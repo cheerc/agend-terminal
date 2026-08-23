@@ -707,7 +707,10 @@ fn service_once(state: &WriterState) {
         // it closes the queue+service window, which is the wide one.
         if job.barrier.as_ref().is_some_and(|b| !b.still_valid()) {
             let job = q.pop_front().expect("front() just returned Some");
-            let _ = job.done.try_send(Ok(()));
+            let _ = job.done.try_send(Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "PTY write cancelled by stale-frame barrier",
+            )));
             return;
         }
         let remaining = job.remaining();
@@ -912,8 +915,8 @@ mod tests {
     }
 
     /// #3314 P1-B: a job whose barrier is already invalid is DROPPED at the
-    /// front of the queue instead of being written, and the caller sees the
-    /// normal completion contract rather than an error.
+    /// front of the queue instead of being written, and the caller can
+    /// distinguish cancellation from successful delivery.
     ///
     /// HONEST LIMIT: this asserts the drop path's caller-visible outcome on a
     /// real registered writer. It does NOT assert byte-level that the fd
@@ -943,9 +946,12 @@ mod tests {
             Some(barrier),
         )
         .expect("a registered writer must resolve to Some");
-        assert!(
-            result.is_ok(),
-            "#3314: a cancelled job completes normally rather than erroring: {result:?}"
+        assert_eq!(
+            result
+                .expect_err("a cancelled barrier is not a successful delivery")
+                .kind(),
+            std::io::ErrorKind::Interrupted,
+            "#3314: cancellation must be observable by the one-shot owner"
         );
 
         let _ = child.kill();

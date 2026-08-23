@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 pub(crate) mod dev_modal;
 mod dismiss;
+mod executable;
 #[allow(unused_imports)]
 pub use dismiss::try_dismiss_dialog;
 pub(crate) mod crash_disposition;
@@ -880,24 +881,14 @@ fn build_command(
             .collect()
     };
 
-    // Resolve bare command names to absolute paths via `which` before handing
-    // them to `CommandBuilder`. On Windows, npm global installs drop both a
-    // Unix-style shell-script (no extension) and a `.cmd` wrapper in the same
-    // directory; `CreateProcessW`'s PATHEXT search walks the exact name first
-    // and picks the extensionless Unix script, which blows up with
-    // ERROR_BAD_EXE_FORMAT (193). Pre-resolving gives us the `.cmd` path
-    // unambiguously. On Unix this is a no-op — `execvp` already does the
-    // equivalent PATH walk — but keeping the same code path on both platforms
-    // avoids a `#[cfg(windows)]` split here.
-    let resolved_command =
-        which::which(backend_command).unwrap_or_else(|_| std::path::PathBuf::from(backend_command));
-    let mut cmd = CommandBuilder::new(&resolved_command);
+    let pinned_command = executable::resolve_and_pin(backend_command);
+    let mut cmd = CommandBuilder::new(&pinned_command);
     cmd.args(&enriched_args);
     // #3314 B1: capture the arming facts from the command we JUST built — the
     // argv read back off the builder, and the path we resolved for it — before
     // anything can exec or a config/symlink can move under us. Re-deriving them
     // after the spawn is what made r1 fail open.
-    let spawn_provenance = dev_modal::SpawnProvenance::capture(&cmd, &resolved_command);
+    let spawn_provenance = dev_modal::SpawnProvenance::capture(&cmd, &pinned_command);
 
     // #1440: agent-backend env isolation. INVARIANT: env_clear() must run here,
     // before any env injection below, or the explicit keys we set would be wiped.
@@ -2712,13 +2703,13 @@ fn write_with_timeout_guarded(
     data: &[u8],
     barrier: Option<crate::agent::dev_modal::WriteBarrier>,
 ) -> std::io::Result<()> {
-    // #3314: THE chokepoint for every PTY byte write — `write_to_pty` delegates
-    // here, as do inject, dismiss and the TUI socket. See `agent::dev_modal`.
-    crate::agent::dev_modal::note_pty_write(writer);
-    if let Some(result) = actor_write::try_actor_write_guarded(writer, data, barrier) {
-        return result;
+    // #3314: chokepoint for every PTY write; see `agent::dev_modal`.
+    if let Some(result) = actor_write::try_actor_write_guarded(writer, data, barrier.clone()) {
+        return actor_write::record_successful_write(writer, result);
     }
-
+    if barrier.as_ref().is_some_and(|b| !b.still_valid()) {
+        return Err(std::io::ErrorKind::Interrupted.into());
+    }
     let key = Arc::as_ptr(writer) as usize;
 
     // If a previous write is still stuck, fail fast.
@@ -2734,6 +2725,7 @@ fn write_with_timeout_guarded(
         guard.insert(key);
     }
 
+    let epoch_writer = Arc::clone(writer);
     let data = data.to_vec();
     let writer = Arc::clone(writer);
     let (tx, rx) = crossbeam_channel::bounded(1);
@@ -2793,7 +2785,7 @@ fn write_with_timeout_guarded(
         }
     };
 
-    result
+    actor_write::record_successful_write(&epoch_writer, result)
 }
 
 pub fn write_to_agent(agent: &AgentHandle, data: &[u8]) -> crate::error::Result<()> {
