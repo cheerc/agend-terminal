@@ -3493,6 +3493,7 @@ struct TimedChunkReader {
     chunks: Vec<(&'static [u8], std::time::Duration)>,
     next: usize,
     wait_for_dismiss: Option<&'static str>,
+    wait_for_first_write: Option<Arc<Mutex<Vec<u8>>>>,
 }
 
 impl std::io::Read for TimedChunkReader {
@@ -3508,6 +3509,21 @@ impl std::io::Read for TimedChunkReader {
             }
             return Ok(0);
         };
+        if self.next == 1 {
+            if let Some(written) = &self.wait_for_first_write {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while written.lock().is_empty() && std::time::Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                if let Some(name) = self.wait_for_dismiss {
+                    while dismiss::dismiss_in_flight_for_test(name)
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::yield_now();
+                    }
+                }
+            }
+        }
         std::thread::sleep(*delay);
         self.next += 1;
         let n = chunk.len().min(buf.len());
@@ -3608,6 +3624,13 @@ fn run_pty_read_loop_for_r8(
 fn run_dev_modal_pty_read_loop_3333(
     chunks: Vec<(&'static [u8], std::time::Duration)>,
 ) -> Arc<Mutex<Vec<u8>>> {
+    run_dev_modal_pty_read_loop_with_ordering_3333(chunks, false)
+}
+
+fn run_dev_modal_pty_read_loop_with_ordering_3333(
+    chunks: Vec<(&'static [u8], std::time::Duration)>,
+    second_chunk_follows_first_write: bool,
+) -> Arc<Mutex<Vec<u8>>> {
     let written = Arc::new(Mutex::new(Vec::new()));
     let writer: PtyWriter = Arc::new(Mutex::new(Box::new(RecordingWriter {
         bytes: Arc::clone(&written),
@@ -3645,6 +3668,7 @@ fn run_dev_modal_pty_read_loop_3333(
         chunks,
         next: 0,
         wait_for_dismiss: Some("dev-modal-3333"),
+        wait_for_first_write: second_chunk_follows_first_write.then(|| Arc::clone(&written)),
     };
     let capture = crate::capture::make_capture_writer(None, "dev-modal-3333", "claude");
     pty_read_loop(&mut reader, &ctx, capture);
@@ -3674,6 +3698,94 @@ fn pty_read_loop_answers_one_static_dev_modal_frame_3333() {
         written.lock().as_slice(),
         b"\r",
         "#3333: the production PTY entry point must answer a complete static modal without a second child frame"
+    );
+}
+
+#[test]
+fn pty_read_loop_answers_dev_modal_inside_trust_cooldown_3314() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let trust = b"\x1b[2J\x1b[H Accessing workspace:\r\n\r\n /private/tmp/claude-test\r\n\r\n Quick safety check: Is this a project you created or one you trust?\r\n\r\n \xe2\x9d\xaf 1. Yes, I trust this folder\r\n   2. No, exit\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
+    let modal = include_bytes!("../../tests/fixtures/devchannel-3314/live_modal_2_1_241.txt");
+
+    let written = run_dev_modal_pty_read_loop_with_ordering_3333(
+        vec![
+            (trust, std::time::Duration::ZERO),
+            (modal, std::time::Duration::ZERO),
+        ],
+        true,
+    );
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r\r",
+        "#3314: the static startup modal must not be stranded by the preceding trust-dismiss cooldown"
+    );
+}
+
+#[test]
+fn pty_read_loop_keeps_non_dev_prompt_inside_trust_cooldown_3314() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let trust = b"\x1b[2J\x1b[H Accessing workspace:\r\n\r\n /private/tmp/claude-test\r\n\r\n Quick safety check: Is this a project you created or one you trust?\r\n\r\n \xe2\x9d\xaf 1. Yes, I trust this folder\r\n   2. No, exit\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
+    let proceed = b"\x1b[2J\x1b[H quoted: WARNING: Loading development channels\r\n quoted: --dangerously-load-development-channels is for local channel development only. Do not use this option to run channels you have downloaded off the internet.\r\n quoted: Please use --channels to run a list of approved channels.\r\n quoted: Channels: server:agend-claude-channel\r\n quoted: I am using this for local development\r\n\r\n Do you want to continue?\r\n\r\n   1. No\r\n \xe2\x9d\xaf 2. Yes, proceed\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![
+        (trust, std::time::Duration::ZERO),
+        (proceed, std::time::Duration::from_millis(350)),
+    ]);
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r",
+        "#3314: a non-development-channel prompt must remain suppressed by the trust-dismiss cooldown"
+    );
+}
+
+#[test]
+fn pty_read_loop_does_not_reanswer_trust_without_complete_dev_modal_3314() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let trust = b"\x1b[2J\x1b[H Accessing workspace:\r\n\r\n /private/tmp/claude-test\r\n\r\n Quick safety check: Is this a project you created or one you trust?\r\n\r\n \xe2\x9d\xaf 1. Yes, I trust this folder\r\n   2. No, exit\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
+    let second_trust = b"\x1b[2J\x1b[H Accessing workspace:\r\n\r\n /private/tmp/claude-test-2\r\n\r\n Quick safety check: Is this a project you created or one you trust?\r\n\r\n \xe2\x9d\xaf 1. Yes, I trust this folder\r\n   2. No, exit\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
+
+    let written = run_dev_modal_pty_read_loop_with_ordering_3333(
+        vec![
+            (trust, std::time::Duration::ZERO),
+            (second_trust, std::time::Duration::ZERO),
+        ],
+        true,
+    );
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r",
+        "#3314: cooldown bypass requires a complete development-channel modal"
+    );
+}
+
+#[test]
+fn pty_read_loop_keeps_dev_modal_inside_cooldown_after_idle_3314() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let trust = b"\x1b[2J\x1b[H Accessing workspace:\r\n\r\n /private/tmp/claude-test\r\n\r\n Quick safety check: Is this a project you created or one you trust?\r\n\r\n \xe2\x9d\xaf 1. Yes, I trust this folder\r\n   2. No, exit\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
+    let idle = b"\x1b[2J\x1b[H bypass permissions on\r\n \xe2\x9d\xaf ";
+    let modal = include_bytes!("../../tests/fixtures/devchannel-3314/live_modal_2_1_241.txt");
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![
+        (trust, std::time::Duration::ZERO),
+        (idle, std::time::Duration::from_millis(2_500)),
+        (modal, std::time::Duration::from_millis(350)),
+    ]);
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r",
+        "#3314: the cooldown bypass must close permanently once Claude has reached idle"
     );
 }
 

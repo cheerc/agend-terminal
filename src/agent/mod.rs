@@ -2209,20 +2209,26 @@ fn pty_read_loop(
                 let in_cooldown = dismiss_cooldown_until
                     .map(|t| std::time::Instant::now() < t)
                     .unwrap_or(false);
+                // #3314: Claude renders its daemon-owned development-channel
+                // startup modal immediately after the trust prompt. Do not let
+                // the trust dismiss's cooldown strand that complete, gated modal.
+                let startup_dev_modal_in_cooldown = in_cooldown
+                    && !dismiss_agent_ever_idle
+                    && dev_modal::complete_modal_digest(&screen).is_some();
                 if dismiss_scan_armed(dismiss_scan_enabled, prompt_blocked, state_changed)
-                    && !in_cooldown
+                    && (!in_cooldown || startup_dev_modal_in_cooldown)
                     && try_prepared_dismiss_dialog(
                         name,
                         &screen,
                         pty_writer,
                         dismiss_patterns,
-                        // #2473 (r6): a post-latch re-arm (scan_enabled==false,
-                        // armed only via prompt_blocked) never reaches runtime-
-                        // approval `Yes, proceed`. #3314: before the agent has ever
-                        // been Idle it additionally reaches daemon-caused startup
-                        // modals, which is the window a fresh spawn's dev-channel
-                        // modal falls into.
-                        dismiss_scan_scope(dismiss_scan_enabled, dismiss_agent_ever_idle),
+                        // #3314: the cooldown bypass admits only the daemon-caused
+                        // startup modal, never runtime approval patterns.
+                        if startup_dev_modal_in_cooldown {
+                            dismiss::DismissScanScope::RearmPreIdle
+                        } else {
+                            dismiss_scan_scope(dismiss_scan_enabled, dismiss_agent_ever_idle)
+                        },
                         &mut dev_modal_gate,
                         dev_modal::LogicalMs(dev_modal_clock.elapsed().as_millis() as u64),
                     )
