@@ -823,6 +823,21 @@ fn start_owned_services(
             // and the Telegram bot (if any) runs under the other daemon which
             // already did its own attach.
             //
+            // TaskSweep (silent-dead-in-app class, mirrors #1694(a) recovery_dispatcher
+            // and #2413 shadow_observe): `TaskSweep::spawn`'s ONLY other call site is
+            // run_core's build_tick_infrastructure, and the LIVE fleet daemon runs THIS
+            // app-mode path — so sweep_tick / save_provenance / save_health never ran in
+            // production (task_sweep_provenance.json / task_sweep_health.json never
+            // existed). Owner-only (`!attached_mode`) like every service above: an
+            // attached TUI must not also tick the sweep; the daemon that owns the fleet
+            // already spawned it. Shutdown uses the app-mode global flag
+            // (`app_shutdown_flag()`), flipped by app_teardown — same lifetime as the
+            // other owned services.
+            let _task_sweep_keepalive = crate::daemon::task_sweep::TaskSweep::spawn(
+                home.to_path_buf(),
+                std::sync::Arc::clone(app_shutdown_flag()),
+            );
+            //
             // #945 Phase 1: telegram_init is now backgrounded; `telegram_state`
             // is always None at this point post-backgrounding. Publish registry
             // to the pending slot so the background thread can attach when its
@@ -1997,6 +2012,50 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// TaskSweep silent-dead-in-app fix companion (same class as #2413 below):
+    /// `TaskSweep::spawn`'s only other call site is run_core's
+    /// build_tick_infrastructure, and the LIVE fleet daemon runs THIS app-mode
+    /// path — so without an app-mode wiring, sweep_tick / save_provenance /
+    /// save_health never ran in production. This source-pins that the PRODUCTION
+    /// region of app/mod.rs spawns it inside `start_owned_services`, owner-only
+    /// (the attached branch must NOT also tick — the daemon that owns the fleet
+    /// already did). REVERSE-MUTATION verified: with the test present but the
+    /// production spawn removed, this fails; restoring the spawn turns it GREEN.
+    #[test]
+    fn run_app_wires_task_sweep_owner_only() {
+        let source = std::fs::read_to_string("src/app/mod.rs")
+            .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
+            .expect("source file must be readable from test cwd");
+        let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
+        let owned_block_start = prod
+            .find("fn start_owned_services(")
+            .expect("start_owned_services fn present in production region");
+        // Slice to the end of the fn (next top-level-in-module "\n}\n" after its
+        // body start) so an attached-branch copy can't satisfy the owned assertion.
+        let owned_block_end = prod[owned_block_start..]
+            .find("\nfn ")
+            .map(|rel| owned_block_start + rel)
+            .unwrap_or(prod.len());
+        let owned_block = &prod[owned_block_start..owned_block_end];
+
+        assert!(
+            owned_block.contains("crate::daemon::task_sweep::TaskSweep::spawn("),
+            "app mode must spawn TaskSweep inside start_owned_services' OWNED block — \
+             gating it to run_core left sweep_tick/save_provenance/save_health dead in \
+             the live fleet daemon (silent-dead-in-app class)"
+        );
+        // Exactly ONE spawn in this fn: a duplicate in the attached (`else`) arm
+        // would double-tick against the owning daemon.
+        let spawn_count = owned_block
+            .matches("crate::daemon::task_sweep::TaskSweep::spawn(")
+            .count();
+        assert_eq!(
+            spawn_count, 1,
+            "exactly one TaskSweep spawn in start_owned_services — an attached-mode \
+             spawn would double-tick against the owning daemon"
+        );
     }
 
     /// #2413 Phase B live-fix companion: the reducer driver is useless without the
