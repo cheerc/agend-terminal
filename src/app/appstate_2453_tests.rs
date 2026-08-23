@@ -38,15 +38,18 @@ const DURABLE_LOOP_OWNERS_2453: [&str; 16] = [
 fn app_prod_region() -> String {
     let source = std::fs::read_to_string("src/app/mod.rs")
         .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
-        .expect("source file must be readable from test cwd");
-    let cutoff = source.find("#[cfg(test)]").unwrap_or(source.len());
+        .expect("source file must be readable from test cwd")
+        .replace("\r\n", "\n");
+    let cutoff = source
+        .find("\n#[cfg(test)]\nmod tests")
+        .unwrap_or(source.len());
     let mut prod = source[..cutoff].to_string();
     for candidate in [
         "src/app/app_state.rs",
         "agend-terminal/src/app/app_state.rs",
     ] {
         if let Ok(extra) = std::fs::read_to_string(candidate) {
-            let extra_cutoff = extra.find("#[cfg(test)]").unwrap_or(extra.len());
+            let extra_cutoff = extra.rfind("\nmod tests {").unwrap_or(extra.len());
             prod.push_str(&extra[..extra_cutoff]);
             break;
         }

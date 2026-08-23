@@ -441,7 +441,7 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                     let _ = crate::fleet::remove_instance_from_yaml(ctx.home, &fleet_name);
                 }
                 super::kill_agent(ctx.home, ctx.registry, name);
-                super::tui_events::remove_agent_pane(name, ctx.layout);
+                remove_agent_pane(name, ctx.layout);
                 return true;
             }
         }
@@ -633,6 +633,24 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
     false
 }
 
+fn remove_agent_pane(name: &str, layout: &mut Layout) {
+    loop {
+        let target = layout.tabs.iter().enumerate().find_map(|(tab_idx, tab)| {
+            tab.root()
+                .find_pane_id_by_agent(name)
+                .map(|pane_id| (tab_idx, pane_id))
+        });
+        let Some((tab_idx, pane_id)) = target else {
+            break;
+        };
+        if layout.tabs[tab_idx].root().pane_count() <= 1 {
+            layout.close_tab(tab_idx);
+        } else {
+            layout.tabs[tab_idx].close_pane_by_id(pane_id);
+        }
+    }
+}
+
 /// Handle `:config get <key>` / `:config set <key> <value>` / `:config list`.
 /// Mirrors the `config` MCP tool path (`runtime_config::get_key/set/list`) so the
 /// operator can toggle runtime config from the TUI without invoking an MCP tool.
@@ -725,6 +743,28 @@ mod tests {
             offthread: None,
             _fwd_cancel: None,
         }
+    }
+
+    #[test]
+    fn remove_agent_pane_closes_single_pane_tab() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("opencode".into(), test_pane(1, "opencode", None)));
+        layout.add_tab(Tab::new("kiro".into(), test_pane(2, "kiro", None)));
+
+        remove_agent_pane("opencode", &mut layout);
+
+        assert_eq!(layout.tabs.len(), 1, "single-pane tab should be removed");
+        assert_eq!(layout.tabs[0].name, "kiro");
+    }
+
+    #[test]
+    fn remove_agent_pane_noop_when_agent_missing() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("kiro".into(), test_pane(1, "kiro", None)));
+
+        remove_agent_pane("ghost", &mut layout);
+
+        assert_eq!(layout.tabs.len(), 1);
     }
 
     #[test]
