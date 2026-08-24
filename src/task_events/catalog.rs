@@ -52,6 +52,33 @@ pub enum OrderedApplyError {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HotLogStamp {
+    inode: u64,
+    len: u64,
+    mtime_ns: i128,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HotLogFreshness {
+    Current,
+    CatchUp { start: u64, end: u64 },
+    Stale,
+}
+
+fn classify_hot_log(cursor: HotLogStamp, observed: HotLogStamp) -> HotLogFreshness {
+    if observed == cursor {
+        HotLogFreshness::Current
+    } else if observed.inode == cursor.inode && observed.len > cursor.len {
+        HotLogFreshness::CatchUp {
+            start: cursor.len,
+            end: observed.len,
+        }
+    } else {
+        HotLogFreshness::Stale
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Phase {
     Building,
@@ -1242,6 +1269,63 @@ mod tests {
                 boards: vec!["a-board".into(), "b-board".into()],
             })
         );
+    }
+
+    #[test]
+    fn hot_log_freshness_shapes_are_fail_closed() {
+        let cursor = HotLogStamp {
+            inode: 7,
+            len: 10,
+            mtime_ns: 100,
+        };
+
+        assert_eq!(classify_hot_log(cursor, cursor), HotLogFreshness::Current);
+        assert_eq!(
+            classify_hot_log(
+                cursor,
+                HotLogStamp {
+                    inode: 7,
+                    len: 14,
+                    mtime_ns: 101,
+                },
+            ),
+            HotLogFreshness::CatchUp { start: 10, end: 14 }
+        );
+        assert_eq!(
+            classify_hot_log(
+                cursor,
+                HotLogStamp {
+                    inode: 7,
+                    len: 14,
+                    mtime_ns: 100,
+                },
+            ),
+            HotLogFreshness::CatchUp { start: 10, end: 14 }
+        );
+        for stale in [
+            HotLogStamp {
+                inode: 8,
+                len: 10,
+                mtime_ns: 100,
+            },
+            HotLogStamp {
+                inode: 8,
+                len: 14,
+                mtime_ns: 101,
+            },
+            HotLogStamp {
+                inode: 7,
+                len: 9,
+                mtime_ns: 101,
+            },
+            HotLogStamp {
+                inode: 7,
+                len: 10,
+                mtime_ns: 101,
+            },
+        ] {
+            assert_eq!(classify_hot_log(cursor, stale), HotLogFreshness::Stale);
+        }
     }
 
     #[test]
