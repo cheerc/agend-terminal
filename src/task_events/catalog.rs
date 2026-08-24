@@ -138,6 +138,48 @@ impl From<TaskRecord> for ProjectedTaskRecord {
     }
 }
 
+impl ProjectedTaskRecord {
+    fn matches_replay(&self, task: &TaskRecord) -> bool {
+        let recent_start = task.history.len().saturating_sub(RECENT_HISTORY_LIMIT);
+        self.id == task.id
+            && self.title == task.title
+            && self.description == task.description
+            && self.priority == task.priority
+            && self.status == task.status
+            && self.owner == task.owner
+            && self.linked_prs == task.linked_prs
+            && self.block_reason == task.block_reason
+            && self.created_by == task.created_by
+            && self.created_at == task.created_at
+            && self.updated_at == task.updated_at
+            && self.due_at == task.due_at
+            && self.depends_on == task.depends_on
+            && self.routed_to == task.routed_to
+            && self.result == task.result
+            && self.superseded_by == task.superseded_by
+            && self.branch == task.branch
+            && self.bind == task.bind
+            && self.started_at == task.started_at
+            && self.eta_secs == task.eta_secs
+            && self.tags == task.tags
+            && self.parent_id == task.parent_id
+            && self.metadata == task.metadata
+            && self.history_len == task.history.len() as u64
+            && self
+                .last_folded_event
+                .as_ref()
+                .map(|(instance, seq)| (instance, *seq))
+                == task
+                    .history
+                    .last()
+                    .map(|entry| (&entry.instance, entry.seq))
+            && self
+                .recent_history
+                .iter()
+                .eq(task.history[recent_start..].iter())
+    }
+}
+
 /// One board's bounded shadow snapshot, built from the incumbent replay.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct BoardProjection {
@@ -187,6 +229,20 @@ impl BoardProjection {
 
     pub fn events_folded(&self) -> u64 {
         self.events_folded
+    }
+
+    /// Compare the bounded shadow with the incumbent replay without cloning
+    /// its unbounded audit history.
+    pub fn matches_replay(&self, replay: &TaskBoardState) -> bool {
+        self.events_folded == replay.events_folded
+            && self.last_seq_per_instance == replay.last_seq_per_instance
+            && self.tasks.len() == replay.tasks.len()
+            && self.tasks.iter().all(|(id, task)| {
+                replay
+                    .tasks
+                    .get(id)
+                    .is_some_and(|replayed| task.matches_replay(replayed))
+            })
     }
 
     pub fn last_order_key(&self) -> Option<&OrderKey> {
@@ -583,6 +639,99 @@ mod tests {
         );
         assert_eq!(projection.events_folded(), 21);
         assert_eq!(projection.tasks().count(), 1);
+    }
+
+    #[test]
+    fn shadow_equivalence_detects_current_state_and_high_water_mismatches() {
+        let task_id = TaskId::from("t-20260824000000000000-1-1");
+        let replay = replay_with_metadata_events(20);
+        let projection = BoardProjection::from_replay(replay.clone());
+
+        assert!(projection.matches_replay(&replay));
+
+        macro_rules! field_mismatch {
+            ($field:ident, $value:expr) => {{
+                let mut changed = replay.clone();
+                changed
+                    .tasks
+                    .get_mut(&task_id)
+                    .expect("replayed task")
+                    .$field = $value;
+                assert!(
+                    !projection.matches_replay(&changed),
+                    "{} mismatch must be detected",
+                    stringify!($field)
+                );
+            }};
+        }
+        field_mismatch!(id, TaskId::from("different-id"));
+        field_mismatch!(title, "different title".into());
+        field_mismatch!(description, "different description".into());
+        field_mismatch!(priority, "low".into());
+        field_mismatch!(status, TaskStatus::Claimed);
+        field_mismatch!(owner, None);
+        field_mismatch!(linked_prs, vec![PrId(1)]);
+        field_mismatch!(block_reason, Some("blocked".into()));
+        field_mismatch!(created_by, InstanceName::from("different"));
+        field_mismatch!(created_at, "different".into());
+        field_mismatch!(updated_at, "different".into());
+        field_mismatch!(due_at, None);
+        field_mismatch!(depends_on, Vec::new());
+        field_mismatch!(routed_to, None);
+        field_mismatch!(result, Some("different".into()));
+        field_mismatch!(superseded_by, Some(TaskId::from("successor")));
+        field_mismatch!(branch, None);
+        field_mismatch!(bind, Some(false));
+        field_mismatch!(started_at, Some("different".into()));
+        field_mismatch!(eta_secs, None);
+        field_mismatch!(tags, Vec::new());
+        field_mismatch!(parent_id, Some(TaskId::from("parent")));
+        field_mismatch!(metadata, BTreeMap::new());
+
+        let mut changed_history_len = replay.clone();
+        let history = &mut changed_history_len
+            .tasks
+            .get_mut(&task_id)
+            .expect("replayed task")
+            .history;
+        history.insert(0, history[0].clone());
+        assert!(!projection.matches_replay(&changed_history_len));
+
+        let mut changed_last_folded = projection.clone();
+        changed_last_folded
+            .tasks
+            .get_mut(&task_id)
+            .expect("projected task")
+            .last_folded_event = None;
+        assert!(!changed_last_folded.matches_replay(&replay));
+
+        let mut changed_recent = projection.clone();
+        changed_recent
+            .tasks
+            .get_mut(&task_id)
+            .expect("projected task")
+            .recent_history
+            .back_mut()
+            .expect("recent history")
+            .kind = "different";
+        assert!(!changed_recent.matches_replay(&replay));
+
+        let mut changed_task_set = replay.clone();
+        let extra_id = TaskId::from("extra-task");
+        let mut extra = changed_task_set.tasks[&task_id].clone();
+        extra.id = extra_id.clone();
+        changed_task_set.tasks.insert(extra_id, extra);
+        assert!(!projection.matches_replay(&changed_task_set));
+
+        let mut changed_high_water = replay.clone();
+        changed_high_water
+            .last_seq_per_instance
+            .insert(InstanceName::from("writer"), 999);
+        assert!(!projection.matches_replay(&changed_high_water));
+
+        let mut changed_event_count = replay;
+        changed_event_count.events_folded += 1;
+        assert!(!projection.matches_replay(&changed_event_count));
     }
 
     #[test]
