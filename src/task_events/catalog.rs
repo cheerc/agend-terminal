@@ -161,6 +161,36 @@ impl StrictTaskCatalog {
             .ok_or(CatalogRouteError::NotFound)
     }
 
+    pub fn statuses(
+        &self,
+        task_ids: &[TaskId],
+    ) -> Result<Vec<(TaskId, Option<TaskStatus>)>, CatalogRouteError> {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.phase != Phase::Ready {
+            return Err(CatalogRouteError::Unreadable);
+        }
+
+        let mut statuses = Vec::with_capacity(task_ids.len());
+        for task_id in task_ids {
+            if let Some(boards) = inner.duplicates.get(task_id) {
+                return Err(CatalogRouteError::Ambiguous {
+                    boards: boards.clone(),
+                });
+            }
+            let status = inner.index.get(task_id).map(|board_id| {
+                inner.boards[board_id]
+                    .task(task_id)
+                    .expect("catalog index must reference its source record")
+                    .status
+            });
+            statuses.push((task_id.clone(), status));
+        }
+        Ok(statuses)
+    }
+
     pub fn snapshot_advisory(&self) -> (Phase, Vec<Arc<ProjectedTaskRecord>>) {
         let inner = self
             .inner
@@ -1142,6 +1172,76 @@ mod tests {
         assert_eq!(board.len(), 1);
         assert!(Arc::ptr_eq(&board[0], &second_snapshot));
         assert_eq!(ready.board("missing"), Err(CatalogRouteError::NotFound));
+    }
+
+    #[test]
+    fn catalog_statuses_are_ready_only_ordered_and_fail_closed() {
+        let unique_id = TaskId::from("t-20260824000000000000-1-1");
+        let duplicate_id = TaskId::from("t-20260824000000000000-1-2");
+        let missing_id = TaskId::from("missing");
+        let create = |task_id: TaskId| TaskEvent::Created {
+            task_id,
+            title: "status fixture".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            owner: None,
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: None,
+            bind: None,
+            eta_secs: None,
+            tags: Vec::new(),
+            parent_id: None,
+        };
+        let first = BoardProjection::from_sorted_envelopes(&[
+            envelope(1, create(unique_id.clone())),
+            envelope(
+                2,
+                TaskEvent::Claimed {
+                    task_id: unique_id.clone(),
+                    by: InstanceName::from("owner"),
+                },
+            ),
+            envelope(3, create(duplicate_id.clone())),
+        ])
+        .expect("first board");
+        let second =
+            BoardProjection::from_sorted_envelopes(&[envelope(1, create(duplicate_id.clone()))])
+                .expect("second board");
+        let boards = BTreeMap::from([("a-board".into(), first), ("b-board".into(), second)]);
+
+        let requested = vec![unique_id.clone(), missing_id.clone(), unique_id.clone()];
+        let building = StrictTaskCatalog::new(Phase::Building, boards.clone());
+        assert_eq!(
+            building.statuses(&requested),
+            Err(CatalogRouteError::Unreadable)
+        );
+
+        let ready = StrictTaskCatalog::new(Phase::Ready, boards);
+        assert_eq!(
+            ready.statuses(&requested),
+            Ok(vec![
+                (unique_id, Some(TaskStatus::Claimed)),
+                (missing_id, None),
+                (
+                    TaskId::from("t-20260824000000000000-1-1"),
+                    Some(TaskStatus::Claimed),
+                ),
+            ])
+        );
+        assert_eq!(
+            ready.statuses(std::slice::from_ref(&duplicate_id)),
+            Err(CatalogRouteError::Ambiguous {
+                boards: vec!["a-board".into(), "b-board".into()],
+            })
+        );
+        assert_eq!(
+            ready.statuses(&[TaskId::from("t-20260824000000000000-1-1"), duplicate_id,]),
+            Err(CatalogRouteError::Ambiguous {
+                boards: vec!["a-board".into(), "b-board".into()],
+            })
+        );
     }
 
     #[test]
