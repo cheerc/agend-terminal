@@ -14,7 +14,7 @@ use super::{
     TaskId, TaskRecord, TaskStatus,
 };
 use serde::Serialize;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, RwLock};
 
 /// Enough recent activity for the task-board detail view without retaining an
@@ -76,6 +76,27 @@ fn classify_hot_log(cursor: HotLogStamp, observed: HotLogStamp) -> HotLogFreshne
         }
     } else {
         HotLogFreshness::Stale
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BoardSetFreshness {
+    Current,
+    New { names: Vec<String> },
+    Missing { names: Vec<String> },
+}
+
+fn classify_board_set(known: &BTreeSet<String>, observed: &BTreeSet<String>) -> BoardSetFreshness {
+    let missing: Vec<_> = known.difference(observed).cloned().collect();
+    if !missing.is_empty() {
+        return BoardSetFreshness::Missing { names: missing };
+    }
+
+    let added: Vec<_> = observed.difference(known).cloned().collect();
+    if added.is_empty() {
+        BoardSetFreshness::Current
+    } else {
+        BoardSetFreshness::New { names: added }
     }
 }
 
@@ -1326,6 +1347,52 @@ mod tests {
         ] {
             assert_eq!(classify_hot_log(cursor, stale), HotLogFreshness::Stale);
         }
+    }
+
+    #[test]
+    fn board_set_freshness_compares_names_and_fails_closed_on_missing() {
+        let known =
+            std::collections::BTreeSet::from(["default".to_string(), "research".to_string()]);
+
+        assert_eq!(
+            classify_board_set(&known, &known),
+            BoardSetFreshness::Current
+        );
+        assert_eq!(
+            classify_board_set(
+                &known,
+                &std::collections::BTreeSet::from([
+                    "default".to_string(),
+                    "research".to_string(),
+                    "support".to_string(),
+                ]),
+            ),
+            BoardSetFreshness::New {
+                names: vec!["support".to_string()],
+            }
+        );
+        assert_eq!(
+            classify_board_set(
+                &known,
+                &std::collections::BTreeSet::from(["default".to_string(), "support".to_string(),]),
+            ),
+            BoardSetFreshness::Missing {
+                names: vec!["research".to_string()],
+            }
+        );
+        assert_eq!(
+            classify_board_set(
+                &std::collections::BTreeSet::from([
+                    "a-second-one".to_string(),
+                    "default".to_string(),
+                    "research".to_string(),
+                ]),
+                &std::collections::BTreeSet::from(["default".to_string()]),
+            ),
+            BoardSetFreshness::Missing {
+                names: vec!["a-second-one".to_string(), "research".to_string()],
+            }
+        );
     }
 
     #[test]
