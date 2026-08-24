@@ -150,6 +150,38 @@ impl StrictTaskCatalog {
         }
     }
 
+    pub fn observe_board_set(
+        &self,
+        observed: &BTreeSet<String>,
+        since: &str,
+    ) -> Result<(), CatalogRouteError> {
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let known = inner.boards.keys().cloned().collect();
+        match classify_board_set(&known, observed) {
+            BoardSetFreshness::Current => {
+                if inner.phase == Phase::Ready {
+                    Ok(())
+                } else {
+                    Err(CatalogRouteError::Unreadable)
+                }
+            }
+            BoardSetFreshness::New { .. } => {
+                inner.phase = Phase::Building;
+                Err(CatalogRouteError::Unreadable)
+            }
+            BoardSetFreshness::Missing { names } => {
+                inner.phase = Phase::Unhealthy {
+                    since: since.to_string(),
+                    causes: vec![format!("missing boards: {}", names.join(", "))],
+                };
+                Err(CatalogRouteError::Unreadable)
+            }
+        }
+    }
+
     pub fn route(
         &self,
         task_id: &TaskId,
@@ -1391,6 +1423,64 @@ mod tests {
             ),
             BoardSetFreshness::Missing {
                 names: vec!["a-second-one".to_string(), "research".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn board_set_observation_updates_phase_without_discovering_or_folding() {
+        let boards = BTreeMap::from([
+            ("default".to_string(), BoardProjection::default()),
+            ("research".to_string(), BoardProjection::default()),
+        ]);
+
+        let current = StrictTaskCatalog::new(Phase::Ready, boards.clone());
+        assert_eq!(
+            current.observe_board_set(
+                &BTreeSet::from(["default".to_string(), "research".to_string()]),
+                "2026-08-24T15:40:00Z",
+            ),
+            Ok(())
+        );
+        assert_eq!(current.snapshot_advisory().0, Phase::Ready);
+
+        let building = StrictTaskCatalog::new(Phase::Building, boards.clone());
+        assert_eq!(
+            building.observe_board_set(
+                &BTreeSet::from(["default".to_string(), "research".to_string()]),
+                "2026-08-24T15:40:00Z",
+            ),
+            Err(CatalogRouteError::Unreadable)
+        );
+        assert_eq!(building.snapshot_advisory().0, Phase::Building);
+
+        let added = StrictTaskCatalog::new(Phase::Ready, boards.clone());
+        assert_eq!(
+            added.observe_board_set(
+                &BTreeSet::from([
+                    "default".to_string(),
+                    "research".to_string(),
+                    "support".to_string(),
+                ]),
+                "2026-08-24T15:40:00Z",
+            ),
+            Err(CatalogRouteError::Unreadable)
+        );
+        assert_eq!(added.snapshot_advisory().0, Phase::Building);
+
+        let missing = StrictTaskCatalog::new(Phase::Ready, boards);
+        assert_eq!(
+            missing.observe_board_set(
+                &BTreeSet::from(["support".to_string()]),
+                "2026-08-24T15:40:00Z",
+            ),
+            Err(CatalogRouteError::Unreadable)
+        );
+        assert_eq!(
+            missing.snapshot_advisory().0,
+            Phase::Unhealthy {
+                since: "2026-08-24T15:40:00Z".to_string(),
+                causes: vec!["missing boards: default, research".to_string()],
             }
         );
     }
