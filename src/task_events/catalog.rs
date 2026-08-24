@@ -15,7 +15,7 @@ use super::{
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// Enough recent activity for the task-board detail view without retaining an
 /// unbounded audit timeline in memory.
@@ -50,6 +50,43 @@ pub enum OrderedApplyError {
         previous: OrderKey,
         received: OrderKey,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Phase {
+    Building,
+    Ready,
+    Unhealthy { since: String, causes: Vec<String> },
+}
+
+pub struct StrictTaskCatalog {
+    inner: RwLock<CatalogInner>,
+}
+
+struct CatalogInner {
+    phase: Phase,
+    boards: BTreeMap<String, BoardProjection>,
+}
+
+impl StrictTaskCatalog {
+    pub fn new(phase: Phase, boards: BTreeMap<String, BoardProjection>) -> Self {
+        Self {
+            inner: RwLock::new(CatalogInner { phase, boards }),
+        }
+    }
+
+    pub fn snapshot_advisory(&self) -> (Phase, Vec<Arc<ProjectedTaskRecord>>) {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let snapshots = inner
+            .boards
+            .values()
+            .flat_map(BoardProjection::task_snapshots)
+            .collect();
+        (inner.phase.clone(), snapshots)
+    }
 }
 
 /// Current task state stored by the catalog. Unlike [`TaskRecord`], this type
@@ -859,6 +896,52 @@ mod tests {
             changed_after.metadata.get("updated"),
             Some(&serde_json::json!(true))
         );
+    }
+
+    #[test]
+    fn advisory_catalog_snapshot_is_phase_labelled_and_pointer_only() {
+        let first_id = TaskId::from("t-20260824000000000000-1-1");
+        let second_id = TaskId::from("t-20260824000000000000-1-2");
+        let create = |task_id: TaskId| TaskEvent::Created {
+            task_id,
+            title: "advisory fixture".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            owner: None,
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: None,
+            bind: None,
+            eta_secs: None,
+            tags: Vec::new(),
+            parent_id: None,
+        };
+        let first =
+            BoardProjection::from_sorted_envelopes(&[envelope(1, create(first_id.clone()))])
+                .expect("first board");
+        let second =
+            BoardProjection::from_sorted_envelopes(&[envelope(1, create(second_id.clone()))])
+                .expect("second board");
+        let first_snapshot = first.task_snapshot(&first_id).expect("first snapshot");
+        let second_snapshot = second.task_snapshot(&second_id).expect("second snapshot");
+        let catalog = StrictTaskCatalog::new(
+            Phase::Building,
+            BTreeMap::from([("a-board".into(), first), ("b-board".into(), second)]),
+        );
+
+        let (phase, snapshots) = catalog.snapshot_advisory();
+
+        assert_eq!(phase, Phase::Building);
+        assert_eq!(
+            snapshots
+                .iter()
+                .map(|task| task.id.clone())
+                .collect::<Vec<_>>(),
+            vec![first_id, second_id]
+        );
+        assert!(Arc::ptr_eq(&snapshots[0], &first_snapshot));
+        assert!(Arc::ptr_eq(&snapshots[1], &second_snapshot));
     }
 
     #[test]
