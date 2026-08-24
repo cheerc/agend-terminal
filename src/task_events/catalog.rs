@@ -59,6 +59,13 @@ pub enum Phase {
     Unhealthy { since: String, causes: Vec<String> },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CatalogRouteError {
+    NotFound,
+    Unreadable,
+    Ambiguous { boards: Vec<String> },
+}
+
 pub struct StrictTaskCatalog {
     inner: RwLock<CatalogInner>,
 }
@@ -66,13 +73,59 @@ pub struct StrictTaskCatalog {
 struct CatalogInner {
     phase: Phase,
     boards: BTreeMap<String, BoardProjection>,
+    index: BTreeMap<TaskId, String>,
+    duplicates: BTreeMap<TaskId, Vec<String>>,
 }
 
 impl StrictTaskCatalog {
     pub fn new(phase: Phase, boards: BTreeMap<String, BoardProjection>) -> Self {
-        Self {
-            inner: RwLock::new(CatalogInner { phase, boards }),
+        let mut index = BTreeMap::new();
+        let mut duplicates: BTreeMap<TaskId, Vec<String>> = BTreeMap::new();
+        for (board_id, board) in &boards {
+            for task_id in board.tasks.keys() {
+                if let Some(candidates) = duplicates.get_mut(task_id) {
+                    candidates.push(board_id.clone());
+                } else if let Some(first) = index.remove(task_id) {
+                    duplicates.insert(task_id.clone(), vec![first, board_id.clone()]);
+                } else {
+                    index.insert(task_id.clone(), board_id.clone());
+                }
+            }
         }
+        Self {
+            inner: RwLock::new(CatalogInner {
+                phase,
+                boards,
+                index,
+                duplicates,
+            }),
+        }
+    }
+
+    pub fn route(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<(String, Arc<ProjectedTaskRecord>), CatalogRouteError> {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.phase != Phase::Ready {
+            return Err(CatalogRouteError::Unreadable);
+        }
+        if let Some(boards) = inner.duplicates.get(task_id) {
+            return Err(CatalogRouteError::Ambiguous {
+                boards: boards.clone(),
+            });
+        }
+        let board_id = inner
+            .index
+            .get(task_id)
+            .ok_or(CatalogRouteError::NotFound)?;
+        let task = inner.boards[board_id]
+            .task_snapshot(task_id)
+            .expect("catalog index must reference its source record");
+        Ok((board_id.clone(), task))
     }
 
     pub fn snapshot_advisory(&self) -> (Phase, Vec<Arc<ProjectedTaskRecord>>) {
@@ -942,6 +995,69 @@ mod tests {
         );
         assert!(Arc::ptr_eq(&snapshots[0], &first_snapshot));
         assert!(Arc::ptr_eq(&snapshots[1], &second_snapshot));
+    }
+
+    #[test]
+    fn catalog_route_is_ready_only_and_rejects_duplicate_ids() {
+        let unique_id = TaskId::from("t-20260824000000000000-1-1");
+        let duplicate_id = TaskId::from("t-20260824000000000000-1-2");
+        let create = |task_id: TaskId| TaskEvent::Created {
+            task_id,
+            title: "route fixture".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            owner: None,
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: None,
+            bind: None,
+            eta_secs: None,
+            tags: Vec::new(),
+            parent_id: None,
+        };
+        let first = BoardProjection::from_sorted_envelopes(&[
+            envelope(1, create(unique_id.clone())),
+            envelope(2, create(duplicate_id.clone())),
+        ])
+        .expect("first board");
+        let unique_snapshot = first.task_snapshot(&unique_id).expect("unique snapshot");
+        let second =
+            BoardProjection::from_sorted_envelopes(&[envelope(1, create(duplicate_id.clone()))])
+                .expect("second board");
+        let boards = BTreeMap::from([
+            ("a-board".into(), first.clone()),
+            ("b-board".into(), second.clone()),
+        ]);
+
+        for phase in [
+            Phase::Building,
+            Phase::Unhealthy {
+                since: "2026-08-24T00:00:00Z".into(),
+                causes: vec!["fixture".into()],
+            },
+        ] {
+            let catalog = StrictTaskCatalog::new(phase, boards.clone());
+            assert!(matches!(
+                catalog.route(&unique_id),
+                Err(CatalogRouteError::Unreadable)
+            ));
+        }
+
+        let catalog = StrictTaskCatalog::new(Phase::Ready, boards);
+        let (board, task) = catalog.route(&unique_id).expect("unique route");
+        assert_eq!(board, "a-board");
+        assert!(Arc::ptr_eq(&task, &unique_snapshot));
+        assert_eq!(
+            catalog.route(&duplicate_id),
+            Err(CatalogRouteError::Ambiguous {
+                boards: vec!["a-board".into(), "b-board".into()],
+            })
+        );
+        assert_eq!(
+            catalog.route(&TaskId::from("missing")),
+            Err(CatalogRouteError::NotFound)
+        );
     }
 
     #[test]
