@@ -643,6 +643,58 @@ pub struct HistoryEntry {
     pub kind: &'static str,
 }
 
+impl<'de> Deserialize<'de> for HistoryEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct OwnedHistoryEntry {
+            seq: u64,
+            timestamp: String,
+            instance: InstanceName,
+            kind: String,
+        }
+
+        let entry = OwnedHistoryEntry::deserialize(deserializer)?;
+        let kind = match entry.kind.as_str() {
+            "created" => "created",
+            "claimed" => "claimed",
+            "in_progress" => "in_progress",
+            "verified" => "verified",
+            "done" => "done",
+            "cancelled" => "cancelled",
+            "superseded" => "superseded",
+            "linked" => "linked",
+            "blocked" => "blocked",
+            "unblocked" => "unblocked",
+            "reopened" => "reopened",
+            "released" => "released",
+            "moved_to_backlog" => "moved_to_backlog",
+            "moved_to_review" => "moved_to_review",
+            "task_close_proposed" => "task_close_proposed",
+            "owner_assigned" => "owner_assigned",
+            "priority_changed" => "priority_changed",
+            "description_updated" => "description_updated",
+            "tags_set" => "tags_set",
+            "result_set" => "result_set",
+            "metadata_set" => "metadata_set",
+            "branch_linked" => "branch_linked",
+            unknown => {
+                return Err(serde::de::Error::custom(format!(
+                    "unknown task history kind: {unknown}"
+                )))
+            }
+        };
+        Ok(Self {
+            seq: entry.seq,
+            timestamp: entry.timestamp,
+            instance: entry.instance,
+            kind,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct TaskRecord {
     pub id: TaskId,
@@ -1195,46 +1247,10 @@ pub(crate) fn append_batch_at(
     instance: &InstanceName,
     events: Vec<TaskEvent>,
 ) -> anyhow::Result<Vec<u64>> {
-    if events.is_empty() {
-        return Ok(Vec::new());
+    match catalog::commit_at(board, instance, |_| Ok(events))? {
+        Ok(seqs) => Ok(seqs),
+        Err(reason) => anyhow::bail!("fixed task-event commit rejected: {reason}"),
     }
-    let instance = instance.clone();
-    let count = events.len();
-    let mut seqs: Vec<u64> = Vec::with_capacity(count);
-    let now = chrono::Utc::now().to_rfc3339();
-
-    // Sprint 46 P3: resolve emitter's InstanceId for audit trail.
-    let emitter_id = match crate::agent::resolve_instance(board, instance.as_str()) {
-        Ok((id, _)) => Some(id.full()),
-        Err(e) => {
-            tracing::debug!(instance = %instance, error = %e, "emitter ID resolution failed");
-            None
-        }
-    };
-
-    let mut hot_lines = 0usize;
-    crate::event_log::append_lines_under_lock(board, LOG_NAME, |log_path| {
-        let (start_seq, pre_lines) = next_seq_under_lock(board, log_path, &instance, count as u64)?;
-        hot_lines = pre_lines;
-        let mut lines = Vec::with_capacity(count);
-        for (i, event) in events.into_iter().enumerate() {
-            let seq = start_seq + i as u64;
-            seqs.push(seq);
-            let envelope = TaskEventEnvelope {
-                schema_version: SCHEMA_VERSION,
-                seq,
-                timestamp: now.clone(),
-                instance: instance.clone(),
-                emitter_id: emitter_id.clone(),
-                event,
-            };
-            lines.push(serde_json::to_string(&envelope)?);
-        }
-        Ok(lines)
-    })?;
-    invalidate_replay_cache();
-    maybe_compact_events(board, hot_lines + count);
-    Ok(seqs)
 }
 
 /// Batch variant of [`append_checked`] (#1868): append ALL `events` atomically
@@ -1276,55 +1292,10 @@ pub(crate) fn append_batch_checked_at<F>(
 where
     F: FnOnce(&TaskBoardState) -> Result<(), String>,
 {
-    if events.is_empty() {
-        return Ok(Ok(Vec::new()));
-    }
-    let instance = instance.clone();
-    let count = events.len();
-    let mut seqs: Vec<u64> = Vec::with_capacity(count);
-    let now = chrono::Utc::now().to_rfc3339();
-    let emitter_id = match crate::agent::resolve_instance(board, instance.as_str()) {
-        Ok((id, _)) => Some(id.full()),
-        Err(e) => {
-            tracing::debug!(instance = %instance, error = %e, "emitter ID resolution failed");
-            None
-        }
-    };
-
-    let mut rejection: Option<String> = None;
-    let mut hot_lines = 0usize;
-    crate::event_log::append_lines_under_lock(board, LOG_NAME, |log_path| {
-        // FRESH replay under the lock — authoritative committed history.
-        let state = replay_uncached(board)?;
-        if let Err(reason) = precondition(&state) {
-            rejection = Some(reason);
-            return Ok(Vec::new()); // empty ⇒ no write
-        }
-        let (start_seq, pre_lines) = next_seq_under_lock(board, log_path, &instance, count as u64)?;
-        hot_lines = pre_lines;
-        let mut lines = Vec::with_capacity(count);
-        for (i, event) in events.into_iter().enumerate() {
-            let seq = start_seq + i as u64;
-            seqs.push(seq);
-            let envelope = TaskEventEnvelope {
-                schema_version: SCHEMA_VERSION,
-                seq,
-                timestamp: now.clone(),
-                instance: instance.clone(),
-                emitter_id: emitter_id.clone(),
-                event,
-            };
-            lines.push(serde_json::to_string(&envelope)?);
-        }
-        Ok(lines)
-    })?;
-
-    if let Some(reason) = rejection {
-        return Ok(Err(reason));
-    }
-    invalidate_replay_cache();
-    maybe_compact_events(board, hot_lines + count);
-    Ok(Ok(seqs))
+    catalog::commit_at(board, instance, |state| {
+        precondition(state)?;
+        Ok(events)
+    })
 }
 
 /// #2760 R2: append events that are **COMPUTED from the FRESH on-disk replay under
@@ -1349,62 +1320,7 @@ pub(crate) fn append_batch_computed_at<F>(
 where
     F: FnOnce(&TaskBoardState) -> Result<Vec<TaskEvent>, String>,
 {
-    let instance = instance.clone();
-    let now = chrono::Utc::now().to_rfc3339();
-    let emitter_id = match crate::agent::resolve_instance(board, instance.as_str()) {
-        Ok((id, _)) => Some(id.full()),
-        Err(e) => {
-            tracing::debug!(instance = %instance, error = %e, "emitter ID resolution failed");
-            None
-        }
-    };
-
-    let mut rejection: Option<String> = None;
-    let mut seqs: Vec<u64> = Vec::new();
-    let mut hot_lines = 0usize;
-    let mut appended = 0usize;
-    crate::event_log::append_lines_under_lock(board, LOG_NAME, |log_path| {
-        // FRESH replay under the lock — authoritative committed history.
-        let state = replay_uncached(board)?;
-        let events = match compute(&state) {
-            Ok(events) => events,
-            Err(reason) => {
-                rejection = Some(reason);
-                return Ok(Vec::new()); // empty ⇒ no write
-            }
-        };
-        if events.is_empty() {
-            return Ok(Vec::new()); // computed no-op (e.g. already-acked)
-        }
-        let count = events.len();
-        appended = count;
-        let (start_seq, pre_lines) = next_seq_under_lock(board, log_path, &instance, count as u64)?;
-        hot_lines = pre_lines;
-        let mut lines = Vec::with_capacity(count);
-        for (i, event) in events.into_iter().enumerate() {
-            let seq = start_seq + i as u64;
-            seqs.push(seq);
-            let envelope = TaskEventEnvelope {
-                schema_version: SCHEMA_VERSION,
-                seq,
-                timestamp: now.clone(),
-                instance: instance.clone(),
-                emitter_id: emitter_id.clone(),
-                event,
-            };
-            lines.push(serde_json::to_string(&envelope)?);
-        }
-        Ok(lines)
-    })?;
-
-    if let Some(reason) = rejection {
-        return Ok(Err(reason));
-    }
-    if appended > 0 {
-        invalidate_replay_cache();
-        maybe_compact_events(board, hot_lines + appended);
-    }
-    Ok(Ok(seqs))
+    catalog::commit_at(board, instance, compute)
 }
 
 /// Append `event` atomically iff `precondition` — evaluated under the append
@@ -1453,50 +1369,11 @@ pub(crate) fn append_checked_at<F>(
 where
     F: FnOnce(&TaskBoardState) -> Result<(), String>,
 {
-    let instance = instance.clone();
-    let now = chrono::Utc::now().to_rfc3339();
-    let emitter_id = match crate::agent::resolve_instance(board, instance.as_str()) {
-        Ok((id, _)) => Some(id.full()),
-        Err(e) => {
-            tracing::debug!(instance = %instance, error = %e, "emitter ID resolution failed");
-            None
-        }
-    };
-
-    let mut assigned_seq: Option<u64> = None;
-    let mut rejection: Option<String> = None;
-    let mut hot_lines = 0usize;
-
-    crate::event_log::append_lines_under_lock(board, LOG_NAME, |log_path| {
-        // FRESH replay under the lock — authoritative committed history.
-        let state = replay_uncached(board)?;
-        if let Err(reason) = precondition(&state) {
-            rejection = Some(reason);
-            return Ok(Vec::new()); // empty ⇒ no write
-        }
-        let (seq, pre_lines) = next_seq_under_lock(board, log_path, &instance, 1)?;
-        assigned_seq = Some(seq);
-        hot_lines = pre_lines;
-        let envelope = TaskEventEnvelope {
-            schema_version: SCHEMA_VERSION,
-            seq,
-            timestamp: now.clone(),
-            instance: instance.clone(),
-            emitter_id: emitter_id.clone(),
-            event,
-        };
-        Ok(vec![serde_json::to_string(&envelope)?])
-    })?;
-
-    if let Some(reason) = rejection {
-        return Ok(Err(reason));
-    }
-    invalidate_replay_cache();
-    maybe_compact_events(board, hot_lines + 1);
-    if let Some(seq) = assigned_seq {
-        return Ok(Ok(seq));
-    }
-    Ok(Ok(0))
+    catalog::commit_at(board, instance, |state| {
+        precondition(state)?;
+        Ok(vec![event])
+    })
+    .map(|outcome| outcome.map(|seqs| seqs.into_iter().next().unwrap_or(0)))
 }
 
 /// #1873: append a DAEMON-originated →Done write (auto-close / sweep) iff the task
@@ -1814,6 +1691,12 @@ pub fn replay(home: &Path) -> anyhow::Result<TaskBoardState> {
 
 /// #2117 board-root variant of [`replay`].
 pub(crate) fn replay_at(board: &Path) -> anyhow::Result<TaskBoardState> {
+    let incumbent = replay_at_incumbent(board);
+    compare_catalog_shadow(board, incumbent.as_ref().ok());
+    incumbent
+}
+
+fn replay_at_incumbent(board: &Path) -> anyhow::Result<TaskBoardState> {
     let key = replay_cache_key(board);
     {
         let cache = REPLAY_CACHE.lock();
@@ -2026,6 +1909,12 @@ fn replay_strict_scan(board: &Path) -> Result<StrictScan, StrictReplayError> {
 
 /// #2760 item 1: the router-only strict replay. See the module comment above.
 pub(crate) fn replay_strict_at(board: &Path) -> Result<TaskBoardState, StrictReplayError> {
+    let incumbent = replay_strict_at_incumbent(board);
+    compare_catalog_shadow(board, incumbent.as_ref().ok());
+    incumbent
+}
+
+fn replay_strict_at_incumbent(board: &Path) -> Result<TaskBoardState, StrictReplayError> {
     match replay_strict_scan(board)? {
         StrictScan::Complete(state) => Ok(state),
         StrictScan::LiveFragment => {
@@ -2041,6 +1930,32 @@ pub(crate) fn replay_strict_at(board: &Path) -> Result<TaskBoardState, StrictRep
                 }),
             }
         }
+    }
+}
+
+fn compare_catalog_shadow(board: &Path, incumbent: Option<&TaskBoardState>) {
+    let identity = crate::task_events::catalog::board_identity(board);
+    let shadow = identity.and_then(|(home, board_id)| {
+        let catalog = crate::task_events::catalog::for_home(&home);
+        match incumbent {
+            Some(replay) => catalog
+                .board_matches_replay(&board_id, replay)
+                .map_err(|err| anyhow::anyhow!("{err:?}")),
+            None => Ok(matches!(
+                catalog.board(&board_id),
+                Err(crate::task_events::catalog::CatalogRouteError::Unreadable)
+            )),
+        }
+    });
+    if !matches!(shadow, Ok(true)) {
+        crate::task_events::catalog::record_shadow_divergence();
+        tracing::error!(
+            board = %board.display(),
+            incumbent_ok = incumbent.is_some(),
+            shadow = ?shadow,
+            divergence_count = crate::task_events::catalog::shadow_divergence_count(),
+            "task catalog board shadow diverged from incumbent replay"
+        );
     }
 }
 
@@ -2314,7 +2229,6 @@ pub fn recover_half_writes(home: &Path) {
 
 /// #2117 board-root variant of [`recover_half_writes`].
 pub(crate) fn recover_half_writes_at(board: &Path) {
-    use std::io::Write;
     let path = log_path(board);
     if !path.exists() {
         return;
@@ -2326,8 +2240,15 @@ pub(crate) fn recover_half_writes_at(board: &Path) {
     let Ok(_lock) = crate::store::acquire_file_lock(&lock_path) else {
         return;
     };
+    recover_half_writes_under_lock(board);
+}
+
+/// Variant for the catalog commit path, which already holds the board writer lock.
+pub(crate) fn recover_half_writes_under_lock(board: &Path) -> bool {
+    use std::io::Write;
+    let path = log_path(board);
     let Ok(content) = std::fs::read_to_string(&path) else {
-        return;
+        return false;
     };
     let mut kept: Vec<&str> = Vec::new();
     let mut bad: Vec<&str> = Vec::new();
@@ -2342,7 +2263,7 @@ pub(crate) fn recover_half_writes_at(board: &Path) {
         }
     }
     if bad.is_empty() {
-        return;
+        return false;
     }
     // Forensics: quarantine only the corrupt line(s) — never silently destroy.
     let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
@@ -2387,6 +2308,7 @@ pub(crate) fn recover_half_writes_at(board: &Path) {
             "recovered corrupt task-event line(s) — quarantined + hot log rewritten with good lines only"
         );
     }
+    rewrite.is_ok()
 }
 
 // ── Compaction ─────────────────────────────────────────────────────
@@ -2418,43 +2340,7 @@ pub(crate) fn compact_at(board: &Path) -> anyhow::Result<()> {
 /// per-instance seq sidecar is independent of this rewrite, so an instance whose
 /// events are all archived keeps a correct seq high-water ([`next_seq_under_lock`]).
 fn compact_at_with_keep(board: &Path, keep: usize) -> anyhow::Result<()> {
-    let log_path = log_path(board);
-    if !log_path.exists() {
-        return Ok(());
-    }
-    let suffix = chrono::Utc::now().format("%Y%m%dT%H%M%S%6fZ").to_string();
-
-    crate::event_log::append_lines_under_lock(board, LOG_NAME, |log_path| {
-        let content = std::fs::read_to_string(log_path)?;
-        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-        if lines.len() <= keep {
-            return Ok(Vec::new());
-        }
-        let split = lines.len() - keep;
-        let archived: String = lines[..split].iter().map(|l| format!("{l}\n")).collect();
-        let kept: String = lines[split..].iter().map(|l| format!("{l}\n")).collect();
-
-        let archive = archive_dir(
-            log_path
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("log_path has no parent"))?,
-        );
-        std::fs::create_dir_all(&archive)?;
-        let archive_path = archive.join(format!("task_events.{suffix}.jsonl"));
-        crate::store::atomic_write(&archive_path, archived.as_bytes())?;
-        crate::store::atomic_write(log_path, kept.as_bytes())?;
-        // S1: compaction just rewrote (shrank) the hot log. Invalidate the
-        // replay cache so the next reader replays the compacted file instead of
-        // a stale entry — mirrors every append path (:1124/:1211/:1297). Today
-        // this is correct-by-ACCIDENT (the shorter file changes the
-        // `(len, mtime)` cache key → key miss); the explicit bump makes it
-        // correct-by-CONTRACT and survives any future cache-key change.
-        invalidate_replay_cache();
-        // We've already rewritten the hot file — return no extra lines
-        // to append. (H10: no SEQ_CACHE to invalidate — `max_seq_for_instance`
-        // always re-scans the on-disk file, so the atomic replace is observed.)
-        Ok(Vec::new())
-    })
+    catalog::compact_at_with_keep(board, keep)
 }
 
 /// Opportunistic, non-fatal hot-log compaction after an append (mirrors
