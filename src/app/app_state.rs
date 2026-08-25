@@ -32,6 +32,10 @@ pub(super) struct AppState {
     /// publishes for each live agent; periodic sync diffs this against the
     /// filesystem so hot-reload-added agents auto-materialize as tabs.
     pub(super) known_remote_agents: std::collections::HashSet<String>,
+    /// Last daemon-authoritative state snapshot for attached panes. Missing
+    /// entries intentionally remain unknown to render; they must not become
+    /// a locally invented `Idle` state.
+    pub(super) remote_agent_states: rpc::AgentStateSnapshot,
     /// Placeholder forwarder senders, keyed by pane id, retained until the
     /// matching AttachOutcome is applied (or the pane is closed first).
     pub(super) pending_fwd: HashMap<usize, crossbeam_channel::Sender<Vec<u8>>>,
@@ -121,6 +125,7 @@ pub(super) struct AppDeps<'a> {
     pub attached_mode: bool,
     pub size_debug: bool,
     pub task_rpc_tx: &'a crossbeam_channel::Sender<rpc::TaskRequest>,
+    pub remote_state_rpc_tx: &'a crossbeam_channel::Sender<rpc::AgentStateRequest>,
 }
 
 /// #2453 Slice 2: the extracted run_app loop/setup logic, method-by-method.
@@ -142,6 +147,7 @@ impl AppState {
                 mouse_state: mouse::MouseState::default(),
             },
             known_remote_agents: std::collections::HashSet::new(),
+            remote_agent_states: HashMap::new(),
             pending_fwd: HashMap::new(),
             needs_resize: true,
             last_remote_sync: std::time::Instant::now(),
@@ -610,6 +616,7 @@ impl AppState {
                     binary_stale,
                     self.pending_decisions_total,
                     self.daemon_list_mode,
+                    deps.attached_mode.then_some(&self.remote_agent_states),
                 );
                 // &mut because ScratchShell needs to drain output and maybe
                 // resize its pane's VTerm/PTY during render.
@@ -858,12 +865,31 @@ impl AppState {
         self.dirty = true;
     }
 
+    pub(super) fn handle_agent_state_rpc_outcome(
+        &mut self,
+        outcome: Result<rpc::AgentStateOutcome, crossbeam_channel::RecvError>,
+    ) {
+        match outcome {
+            Ok(Ok(states)) => self.remote_agent_states = states,
+            Ok(Err(error)) => {
+                self.remote_agent_states.clear();
+                tracing::warn!(error, "daemon agent-state snapshot unavailable");
+            }
+            Err(_) => {
+                self.remote_agent_states.clear();
+                tracing::warn!("daemon agent-state RPC worker stopped");
+            }
+        }
+        self.dirty = true;
+    }
+
     pub(super) fn handle_idle_tick(&mut self, deps: &AppDeps<'_>) {
         let AppDeps {
             home,
             fleet_path,
             wakeup_tx,
             attached_run_dir,
+            remote_state_rpc_tx,
             ..
         } = *deps;
         // #t-84833-10: periodic idle refresh — mark self.dirty so the cap above
@@ -886,6 +912,7 @@ impl AppState {
         if attached_run_dir.is_some()
             && self.last_remote_sync.elapsed() >= std::time::Duration::from_secs(2)
         {
+            let _ = remote_state_rpc_tx.try_send(rpc::AgentStateRequest::Refresh);
             {
                 // #910 PR3 of 4: daemon-registry truth via runtime
                 // helper. The state-transition log gate inside the
