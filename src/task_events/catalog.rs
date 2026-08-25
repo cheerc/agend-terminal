@@ -52,7 +52,7 @@ pub enum OrderedApplyError {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 struct HotLogStamp {
     inode: u64,
     len: u64,
@@ -76,6 +76,40 @@ fn classify_hot_log(cursor: HotLogStamp, observed: HotLogStamp) -> HotLogFreshne
         }
     } else {
         HotLogFreshness::Stale
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct BoardCursor {
+    hot_log: HotLogStamp,
+    live_offset: u64,
+}
+
+impl BoardCursor {
+    pub fn from_folded_hot_log(inode: u64, len: u64, mtime_ns: i128) -> Self {
+        Self {
+            hot_log: HotLogStamp {
+                inode,
+                len,
+                mtime_ns,
+            },
+            live_offset: len,
+        }
+    }
+
+    pub fn live_offset(&self) -> u64 {
+        self.live_offset
+    }
+
+    fn classify_observed(&self, inode: u64, len: u64, mtime_ns: i128) -> HotLogFreshness {
+        classify_hot_log(
+            self.hot_log,
+            HotLogStamp {
+                inode,
+                len,
+                mtime_ns,
+            },
+        )
     }
 }
 
@@ -421,6 +455,7 @@ pub struct BoardProjection {
     last_seq_per_instance: BTreeMap<InstanceName, u64>,
     events_folded: u64,
     last_order_key: Option<OrderKey>,
+    cursor: Option<BoardCursor>,
 }
 
 impl BoardProjection {
@@ -446,6 +481,7 @@ impl BoardProjection {
             last_seq_per_instance: state.last_seq_per_instance,
             events_folded: state.events_folded,
             last_order_key: None,
+            cursor: None,
         }
     }
 
@@ -489,6 +525,14 @@ impl BoardProjection {
 
     pub fn last_order_key(&self) -> Option<&OrderKey> {
         self.last_order_key.as_ref()
+    }
+
+    pub fn cursor(&self) -> Option<&BoardCursor> {
+        self.cursor.as_ref()
+    }
+
+    pub fn set_cursor(&mut self, cursor: BoardCursor) {
+        self.cursor = Some(cursor);
     }
 
     /// Apply one canonical envelope only when its key advances.
@@ -1379,6 +1423,31 @@ mod tests {
         ] {
             assert_eq!(classify_hot_log(cursor, stale), HotLogFreshness::Stale);
         }
+    }
+
+    #[test]
+    fn board_cursor_records_the_folded_hot_log_position() {
+        let cursor = BoardCursor::from_folded_hot_log(7, 10, 100);
+
+        assert_eq!(cursor.live_offset(), 10);
+        assert_eq!(
+            cursor.classify_observed(7, 10, 100),
+            HotLogFreshness::Current
+        );
+        assert_eq!(
+            cursor.classify_observed(7, 14, 101),
+            HotLogFreshness::CatchUp { start: 10, end: 14 }
+        );
+    }
+
+    #[test]
+    fn board_projection_keeps_its_optional_source_cursor() {
+        let mut projection = BoardProjection::default();
+        assert!(projection.cursor().is_none());
+
+        projection.set_cursor(BoardCursor::from_folded_hot_log(7, 10, 100));
+
+        assert_eq!(projection.cursor().map(BoardCursor::live_offset), Some(10));
     }
 
     #[test]
