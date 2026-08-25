@@ -166,3 +166,29 @@ fn task_events_jsonl_only_referenced_by_task_events_module() {
         violations.join("\n")
     );
 }
+
+#[test]
+fn task_event_appends_have_one_catalog_commit_path() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let facade =
+        std::fs::read_to_string(root.join("src/task_events.rs")).expect("read task-events facade");
+    let catalog = std::fs::read_to_string(root.join("src/task_events/catalog.rs"))
+        .expect("read task catalog");
+    let needle = "crate::event_log::append_lines_under_lock";
+
+    assert_eq!(
+        catalog.matches("pub(crate) fn commit_at").count(),
+        1,
+        "catalog::commit_at must remain the single task-event commit primitive"
+    );
+    assert_eq!(
+        facade.matches(needle).count(),
+        0,
+        "task_events.rs must not write the task-event log directly"
+    );
+    assert_eq!(
+        catalog.matches(needle).count(),
+        1,
+        "catalog may lock the task-event log only for its compaction rewrite"
+    );
+}

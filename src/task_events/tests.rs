@@ -236,13 +236,25 @@ fn replay_skips_corrupt_midfile_line_keeps_full_lifecycle() {
     )
     .unwrap();
 
-    // The garbage really is in the log...
+    // The catalog write gate scrubs the malformed complete line before it
+    // accepts the next commit, preserving it under task_events.recovery.
     let raw = fs::read_to_string(&log).unwrap();
     assert!(
-        raw.contains("not valid json"),
-        "fixture must contain the bad line"
+        !raw.contains("not valid json"),
+        "catalog recovery must remove the bad line from the live log"
     );
-    // ...yet replay folds the full lifecycle, skipping it (no abort).
+    let recovered = fs::read_dir(home.join("task_events.recovery"))
+        .unwrap()
+        .flatten()
+        .flat_map(|entry| fs::read_dir(entry.path()).into_iter().flatten().flatten())
+        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+        .any(|content| content.contains("not valid json"));
+    assert!(
+        recovered,
+        "scrubbed bytes must remain available for forensics"
+    );
+
+    // Replay still folds the full lifecycle after the scrub.
     let state = replay(&home).expect("corrupt mid-line must NOT brick replay");
     let task = state
         .tasks
@@ -437,8 +449,13 @@ fn compact_archives_older_than_keep_threshold() {
     let kept = fs::read_to_string(&log).unwrap();
     assert_eq!(kept.lines().count(), COMPACTION_KEEP);
     let arc = archive_dir(&home);
-    let entries: Vec<_> = fs::read_dir(&arc).unwrap().flatten().collect();
+    let entries: Vec<_> = fs::read_dir(&arc)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        .collect();
     assert_eq!(entries.len(), 1, "exactly one archive file expected");
+    assert!(arc.join("MANIFEST.json").is_file());
     fs::remove_dir_all(&home).ok();
 }
 
@@ -691,12 +708,14 @@ fn hysteresis_replay_lossless_across_compaction() {
     // append (HIGH_WATER+1) triggers a trim that archives the early slice.
     let existing = fs::read_to_string(&log).unwrap();
     let start = existing.lines().filter(|l| !l.trim().is_empty()).count() + 1;
+    let first: TaskEventEnvelope = serde_json::from_str(existing.lines().next().unwrap()).unwrap();
+    let base = chrono::DateTime::parse_from_rfc3339(&first.timestamp).unwrap();
     let mut lines = existing;
     for i in start..=COMPACTION_HIGH_WATER {
         let env = TaskEventEnvelope {
             schema_version: SCHEMA_VERSION,
             seq: i as u64,
-            timestamp: format!("2026-06-21T{:02}:00:00Z", i % 24),
+            timestamp: (base + chrono::Duration::microseconds(i as i64)).to_rfc3339(),
             instance: InstanceName::from("filler"),
             emitter_id: None,
             event: sample_event(&format!("f-{i}")),
