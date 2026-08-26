@@ -139,9 +139,9 @@ fn task_events_jsonl_only_referenced_by_task_events_module() {
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        // Cut at first `#[cfg(test)]` so test fixtures aren't checked
-        // (they may emit hand-crafted envelopes for fail-closed asserts).
-        let cutoff = content.find("#[cfg(test)]").unwrap_or(content.len());
+        // Cut at the file's test module so earlier test-only items do not hide
+        // production code that follows them.
+        let cutoff = content.rfind("\nmod tests {").unwrap_or(content.len());
         let prod = &content[..cutoff];
         for (i, line) in prod.lines().enumerate() {
             let trim = line.trim_start();
@@ -190,5 +190,65 @@ fn task_event_appends_have_one_catalog_commit_path() {
         catalog.matches(needle).count(),
         1,
         "catalog may lock the task-event log only for its compaction rewrite"
+    );
+}
+
+#[test]
+fn task_authority_has_no_legacy_replay_or_index_path() {
+    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let forbidden = [
+        "task_events::replay(",
+        "task_events::replay_at(",
+        "task_events::replay_strict_at(",
+        "task_events::replay_uncached(",
+        "task_events::replay_strict_scan(",
+        "task_index.jsonl",
+        "REPLAY_GENERATION",
+    ];
+    let mut violations = Vec::new();
+
+    for path in rust_files_in_src() {
+        if is_test_only_file(&path) {
+            continue;
+        }
+        let rel_path = rel(&path, &src_root);
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let cutoff = content.rfind("\nmod tests {").unwrap_or(content.len());
+        for (line_no, line) in content[..cutoff].lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for needle in forbidden {
+                if line.contains(needle) {
+                    violations.push(format!("{rel_path}:{} contains {needle}", line_no + 1));
+                }
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "task catalog cutover regressed:\n{}",
+        violations.join("\n")
+    );
+
+    let task_events =
+        std::fs::read_to_string(src_root.join("task_events.rs")).expect("read task-events facade");
+    let tasks = std::fs::read_to_string(src_root.join("tasks/mod.rs")).expect("read task facade");
+    let router = std::fs::read_to_string(src_root.join("tasks/board_router.rs"))
+        .expect("read task board router");
+    assert!(
+        task_events.contains("catalog::for_home(&home)"),
+        "compatibility-shaped task state must resolve through the catalog"
+    );
+    assert!(
+        tasks.contains("crate::task_events::projected_state_at(board)"),
+        "task list facade must resolve through the catalog view"
+    );
+    assert!(
+        router.contains("crate::task_events::catalog::for_home(home)"),
+        "task routing and strict listing must resolve through the catalog"
     );
 }

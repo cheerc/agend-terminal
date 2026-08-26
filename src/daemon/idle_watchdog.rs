@@ -338,14 +338,14 @@ pub(crate) fn scan_and_emit(
 /// When the board has tasks, agents without assigned work should not
 /// trigger idle alerts — their silence is expected.
 fn task_board_is_active(home: &Path) -> bool {
-    crate::task_events::replay(home)
+    crate::task_events::projected_state(home)
         .map(|s| !s.tasks.is_empty())
         .unwrap_or(false)
 }
 
 /// Look up the current in-progress task for an agent (if any).
 fn current_agent_task(home: &Path, agent: &str) -> Option<String> {
-    let state = crate::task_events::replay(home).ok()?;
+    let state = crate::task_events::projected_state(home).ok()?;
     state
         .tasks
         .values()
@@ -371,7 +371,7 @@ fn parse_ts(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 /// ack timestamp. This is the "sprint resumed" signal that lifts a fleet-idle
 /// ack. Mere task creation (status Open) does NOT count as progress.
 fn board_progressed_since(home: &Path, since: &chrono::DateTime<chrono::Utc>) -> bool {
-    let Ok(state) = crate::task_events::replay(home) else {
+    let Ok(state) = crate::task_events::projected_state(home) else {
         return false;
     };
     state.tasks.values().any(|t| {
@@ -397,7 +397,7 @@ fn task_owner_active_since(
     since: &chrono::DateTime<chrono::Utc>,
     pairs: &[(String, chrono::DateTime<chrono::Utc>)],
 ) -> bool {
-    let Ok(state) = crate::task_events::replay(home) else {
+    let Ok(state) = crate::task_events::projected_state(home) else {
         return false;
     };
     let owners: HashSet<&str> = state
@@ -885,7 +885,7 @@ fn scan_fleet_vantage(
 
 /// #1141: Check if there's work the fleet should be doing.
 /// Returns true if open/claimed/in_progress tasks exist OR pending dispatches exist.
-/// Fail-open: if no task board file exists, assumes work may be expected.
+/// Fail-open when the authoritative catalog cannot be read.
 fn has_expected_work(home: &Path) -> bool {
     // Check pending dispatch sidecars first (cheap).
     let pending = crate::daemon::dispatch_idle::list_pending(home);
@@ -895,13 +895,8 @@ fn has_expected_work(home: &Path) -> bool {
     {
         return true;
     }
-    // Only suppress when we can confirm the task board is empty.
-    // If the event log doesn't exist, we can't determine → fail-open.
-    let log_path = home.join("task_events.jsonl");
-    if !log_path.exists() {
-        return true;
-    }
-    match crate::task_events::replay(home) {
+    // Only suppress when the authoritative projection confirms the board is empty.
+    match crate::task_events::projected_state(home) {
         Ok(state) => state.tasks.values().any(|r| {
             matches!(
                 r.status,
@@ -1270,6 +1265,7 @@ mod tests {
         write_activity_at(&home, "dev", stale_dev);
         write_activity_at(&home, "lead", stale_lead);
         write_activity_at(&home, "reviewer", stale_reviewer);
+        seed_task(&home, "t-fleet-idle", "dev");
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted, false);
         let recipient = crate::inbox::drain(&home, "lead");
@@ -1325,6 +1321,7 @@ mod tests {
             chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_threshold_secs() + 60);
         write_activity_at(&home, "dev", stale);
         write_activity_at(&home, "lead", stale);
+        seed_task(&home, "t-fleet-investigation", "dev");
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted, false);
         let recipient = crate::inbox::drain(&home, "lead");
@@ -1560,6 +1557,7 @@ mod tests {
         write_activity_at(&home, "lead", stale);
         write_activity_at(&home, "demo-lead", stale);
         write_activity_at(&home, "conflict-test-1", stale);
+        seed_task(&home, "t-fleet-ghost-filter", "dev");
         let mut last_alerted = HashMap::new();
         scan_and_emit(&home, &mut last_alerted, false);
         let recipient = crate::inbox::drain(&home, "lead");
@@ -1623,6 +1621,7 @@ mod tests {
             chrono::Utc::now() - chrono::Duration::seconds(fleet_idle_threshold_secs() + 60);
         write_activity_at(&home, "dev", stale);
         write_activity_at(&home, "lead", stale);
+        seed_task(&home, "t-snooze-expired", "dev");
         // Snooze with PAST timestamp (already expired)
         let past = chrono::Utc::now() - chrono::Duration::seconds(10);
         snooze_fleet_idle(&home, past, "test").unwrap();

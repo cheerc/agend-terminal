@@ -25,7 +25,7 @@ pub(super) fn read_task_record_at(
     board: &Path,
     id: &str,
 ) -> Option<crate::task_events::TaskRecord> {
-    let state = crate::task_events::replay_at(board).ok()?;
+    let state = crate::task_events::projected_state_at(board).ok()?;
     state
         .tasks
         .get(&crate::task_events::TaskId(id.to_string()))
@@ -323,7 +323,6 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
     }
     match crate::task_events::append_at(&board, &emitter, event) {
         Ok(_) => {
-            let _ = super::board_router::record_task_project(home, &id, &project);
             if args["project"].as_str().is_some() {
                 crate::daemon::task_sweep::note_explicit_project(home, &project);
             }
@@ -445,7 +444,16 @@ fn handle_list(home: &Path, caller: &str, args: &Value) -> Value {
         std::collections::HashMap::new();
     let tasks: Vec<Task> = if fleet_scope {
         let mut all = Vec::new();
-        for (project, ts) in super::board_router::list_all_boards(home) {
+        let boards = match super::board_router::list_all_boards_checked(home) {
+            Ok(boards) => boards,
+            Err(error) => {
+                return serde_json::json!({
+                    "error": format!("task catalog unreadable: {error}"),
+                    "code": "task_catalog_unreadable",
+                })
+            }
+        };
+        for (project, ts) in boards {
             for t in &ts {
                 project_of.insert(t.id.clone(), project.clone());
             }
@@ -457,7 +465,15 @@ fn handle_list(home: &Path, caller: &str, args: &Value) -> Value {
             .as_str()
             .map(String::from)
             .unwrap_or_else(|| super::board_router::resolve_current_project(home, caller));
-        super::list_all_at(home, &crate::task_events::board_root(home, &project))
+        match super::list_all_at_checked(home, &crate::task_events::board_root(home, &project)) {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                return serde_json::json!({
+                    "error": format!("task catalog unreadable: {error}"),
+                    "code": "task_catalog_unreadable",
+                })
+            }
+        }
     };
     let mut filtered: Vec<Task> = tasks
         .iter()
@@ -582,6 +598,13 @@ fn minimal_task_value(v: &mut Value) {
     obj.retain(|k, _| KEEP.contains(&k.as_str()));
 }
 
+fn catalog_unreadable(error: impl std::fmt::Display) -> Value {
+    serde_json::json!({
+        "error": format!("task catalog unreadable: {error}"),
+        "code": "task_catalog_unreadable",
+    })
+}
+
 /// #2475 Phase 2: single-task detail fetch. The terse-by-default `list` caps
 /// `description`/`result`; `get` is the companion that returns ONE task's FULL
 /// record by id, so a caller can pull the full text of just the task it cares
@@ -599,10 +622,11 @@ fn handle_get(home: &Path, _caller: &str, args: &Value) -> Value {
     // unreadable board fails closed instead of the old arbitrary first-hit scan.
     let (task, project) = if let Some(project) = args["project"].as_str() {
         let board = crate::task_events::board_root(home, project);
-        match super::list_all_at(home, &board)
-            .into_iter()
-            .find(|t| t.id == id)
-        {
+        let tasks = match super::list_all_at_checked(home, &board) {
+            Ok(tasks) => tasks,
+            Err(error) => return catalog_unreadable(error),
+        };
+        match tasks.into_iter().find(|t| t.id == id) {
             Some(t) => (t, project.to_string()),
             None => return serde_json::json!({"error": format!("task not found: {id}")}),
         }
@@ -611,10 +635,11 @@ fn handle_get(home: &Path, _caller: &str, args: &Value) -> Value {
             // Re-read via `list_all_at` on the ROUTED board so the response keeps
             // the dep-derived status (in-memory blocking), matching pre-#2760 `get`.
             Ok(rt) => {
-                match super::list_all_at(home, rt.board().path())
-                    .into_iter()
-                    .find(|t| t.id == id)
-                {
+                let tasks = match super::list_all_at_checked(home, rt.board().path()) {
+                    Ok(tasks) => tasks,
+                    Err(error) => return catalog_unreadable(error),
+                };
+                match tasks.into_iter().find(|t| t.id == id) {
                     Some(t) => (t, rt.board().project().to_string()),
                     None => return serde_json::json!({"error": format!("task not found: {id}")}),
                 }
@@ -2338,7 +2363,7 @@ fn cascade_cancel_children(
     // locks (which would require sorted multi-lock acquisition); the children are
     // all on this one board and the batch append rides its board writer lock. The
     // pre-#2760 batch semantics are unchanged.
-    let Ok(state) = crate::task_events::replay_at(board) else {
+    let Ok(state) = crate::task_events::projected_state_at(board) else {
         return;
     };
     let parent_tid = crate::task_events::TaskId(parent_id.to_string());
