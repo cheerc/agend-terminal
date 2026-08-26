@@ -72,6 +72,12 @@ pub fn rebuild_for_test(home: &Path) {
         .insert(key.clone(), Arc::new(build_catalog(&key)));
 }
 
+/// Rebuild after a rare operator board-set change such as guarded retirement.
+/// The caller already holds the board-set lock across the atomic move.
+pub(crate) fn rebuild_after_board_change_locked(home: &Path) -> Result<(), CatalogRouteError> {
+    for_home(home).rebuild_from_disk_with_hook_locked(home, |_| {})
+}
+
 fn needs_background_adoption(home: &Path) -> bool {
     board_paths(home).is_ok_and(|boards| {
         boards.values().any(|board| {
@@ -519,6 +525,16 @@ impl StrictTaskCatalog {
     fn rebuild_from_disk_with_hook(
         &self,
         home: &Path,
+        after_offline_build: impl FnMut(usize),
+    ) -> Result<(), CatalogRouteError> {
+        let _board_set_lock = super::acquire_board_set_lock(home)
+            .map_err(|error| self.mark_unhealthy(format!("lock board set: {error}")))?;
+        self.rebuild_from_disk_with_hook_locked(home, after_offline_build)
+    }
+
+    fn rebuild_from_disk_with_hook_locked(
+        &self,
+        home: &Path,
         mut after_offline_build: impl FnMut(usize),
     ) -> Result<(), CatalogRouteError> {
         {
@@ -810,6 +826,10 @@ where
     F: FnOnce(&TaskBoardState) -> Result<Vec<TaskEvent>, String>,
 {
     let (home, board_id) = board_identity(board)?;
+    let board_set_lock = super::acquire_board_set_lock(&home)?;
+    if home.join("boards-retired").join(&board_id).exists() {
+        anyhow::bail!("task board '{board_id}' is retired");
+    }
     // The legacy append path created a new project board lazily. Preserve that
     // behavior before catalog discovery so the board is folded before commit.
     std::fs::create_dir_all(board)?;
@@ -826,6 +846,7 @@ where
     let log_path = super::log_path(board);
     let lock_path = log_path.with_extension("jsonl.lock");
     let file_lock = crate::store::acquire_file_lock(&lock_path)?;
+    drop(board_set_lock);
     if super::recover_half_writes_under_lock(board) {
         let projection = load_board_projection(board, &board_id)
             .map_err(|cause| anyhow::anyhow!("task catalog recovery failed: {cause}"))?;
@@ -1143,10 +1164,11 @@ pub(super) fn refresh_archive_manifest(board: &Path) -> anyhow::Result<()> {
 }
 
 pub(super) fn compact_at_with_keep(board: &Path, keep: usize) -> anyhow::Result<()> {
-    if !super::log_path(board).exists() {
+    let (home, board_id) = board_identity(board)?;
+    let _board_set_lock = super::acquire_board_set_lock(&home)?;
+    if home.join("boards-retired").join(&board_id).exists() || !super::log_path(board).exists() {
         return Ok(());
     }
-    let (home, board_id) = board_identity(board)?;
     let catalog = for_home(&home);
     catalog
         .refresh_all(&home, true)
