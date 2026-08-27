@@ -941,6 +941,45 @@ pub(crate) fn codex_mcp_config_args(home: &Path, instance_name: Option<&str>) ->
     codex_mcp_config_args_from(&bridge_cmd, &bridge_args, &home_path(home), instance_name)
 }
 
+/// Build the invocation-only Codex project-trust override for a managed
+/// workspace. Codex resolves project identity using the canonical filesystem
+/// path, so the argv must use that same path (not a symlink or `/tmp` alias).
+/// This changes only the child process's effective config; it never writes the
+/// operator's `$CODEX_HOME/config.toml`. The full-table override intentionally
+/// exposes only this managed workspace to the child invocation.
+pub(crate) fn codex_project_trust_args(workspace: &Path) -> anyhow::Result<Vec<String>> {
+    let canonical = std::fs::canonicalize(workspace).map_err(|error| {
+        anyhow::anyhow!(
+            "canonicalize Codex workspace '{}' for invocation trust: {error}",
+            workspace.display()
+        )
+    })?;
+    Ok(codex_project_trust_args_from(&canonical.to_string_lossy()))
+}
+
+/// Compose all child-only Codex overrides for a managed fleet spawn.
+pub(crate) fn codex_managed_config_args(
+    home: &Path,
+    instance_name: Option<&str>,
+    workspace: Option<&Path>,
+) -> anyhow::Result<Vec<String>> {
+    let mut args = codex_mcp_config_args(home, instance_name);
+    if let Some(workspace) = workspace {
+        args.extend(codex_project_trust_args(workspace)?);
+    }
+    Ok(args)
+}
+
+fn codex_project_trust_args_from(path: &str) -> Vec<String> {
+    vec![
+        "-c".to_string(),
+        format!(
+            "projects={{{}={{trust_level='trusted'}}}}",
+            toml_string_value(path)
+        ),
+    ]
+}
+
 /// Pure core of [`codex_mcp_config_args`]: no filesystem, no process state, so
 /// the exact argv and TOML encoding are unit-testable for Windows paths,
 /// apostrophes and spaces.
@@ -998,12 +1037,14 @@ fn codex_mcp_config_args_from(
 /// survives on the target. Windows paths routinely contain `\U` / `\d` / …
 /// which a double-quoted basic string interprets as escapes and then fails
 /// to parse. Single-quoted literal strings don't interpret anything, so they
-/// round-trip any path. Fall back to an escaped basic string only if the
-/// value contains a `'`, which a single-line literal can't represent.
+/// round-trip ordinary paths. Fall back to a JSON-escaped basic string if the
+/// value contains a `'` or an ASCII control character. JSON string escaping is
+/// TOML-compatible except for DEL, which TOML also forbids unescaped.
 fn toml_string_value(s: &str) -> String {
-    if s.contains('\'') {
-        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-        format!("\"{escaped}\"")
+    if s.contains('\'') || s.chars().any(|ch| ch.is_ascii_control()) {
+        serde_json::to_string(s)
+            .expect("serializing a string cannot fail")
+            .replace('\u{7f}', "\\u007f")
     } else {
         format!("'{s}'")
     }
@@ -1803,6 +1844,35 @@ mod tests {
     }
 
     #[test]
+    fn codex_project_trust_override_is_valid_toml_and_preserves_windows_path_3402() {
+        let path = r"C:\Users\alice\Agend Workspace";
+        let args = codex_project_trust_args_from(path);
+        assert_eq!(
+            args,
+            vec![
+                "-c",
+                r"projects={'C:\Users\alice\Agend Workspace'={trust_level='trusted'}}"
+            ]
+        );
+        let parsed: toml::Value = toml::from_str(&args[1]).expect("valid TOML override");
+        assert_eq!(
+            parsed["projects"][path]["trust_level"].as_str(),
+            Some("trusted")
+        );
+    }
+
+    #[test]
+    fn codex_project_trust_override_escapes_apostrophe_path_3402() {
+        let path = r"C:\Users\alice\it's workspace";
+        let args = codex_project_trust_args_from(path);
+        let parsed: toml::Value = toml::from_str(&args[1]).expect("valid TOML override");
+        assert_eq!(
+            parsed["projects"][path]["trust_level"].as_str(),
+            Some("trusted")
+        );
+    }
+
+    #[test]
     fn toml_string_value_uses_literal_for_paths_with_backslashes() {
         // Windows paths contain `\U` / `\d` / … which a TOML basic string
         // interprets as escape triggers. Literal (single-quoted) form is the
@@ -1823,6 +1893,16 @@ mod tests {
             toml_string_value(r"C:\Program' Files\x"),
             r#""C:\\Program' Files\\x""#
         );
+    }
+
+    #[test]
+    fn toml_string_value_escapes_control_characters_3402() {
+        for value in ["workspace\nline", "it's\r\na workspace", "delete\u{7f}me"] {
+            let rendered = toml_string_value(value);
+            let parsed: toml::Value = toml::from_str(&format!("value={rendered}"))
+                .expect("control characters must remain valid TOML");
+            assert_eq!(parsed["value"].as_str(), Some(value));
+        }
     }
 
     #[test]

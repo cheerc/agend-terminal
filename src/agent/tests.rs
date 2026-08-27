@@ -5719,6 +5719,154 @@ fn codex_remote_attach_argv_carries_mcp_overrides_before_resume_3317() {
     );
 }
 
+fn codex_project_override_3402(argv: &[String]) -> &str {
+    argv.iter()
+        .find(|arg| arg.starts_with("projects={"))
+        .map(String::as_str)
+        .unwrap_or_else(|| panic!("#3402: invocation-scoped project trust missing; argv={argv:?}"))
+}
+
+/// #3402 RED: managed Codex must trust only its canonical workspace for this
+/// invocation. This enables project-local config/hooks without accepting the
+/// interactive prompt that persists into the operator's global config.
+#[test]
+fn codex_fresh_argv_carries_canonical_invocation_project_trust_3402() {
+    let (home, workspace) = codex_cfg_dirs_3317("trust-fresh", "home");
+    let argv = codex_argv_3317(
+        &home,
+        &workspace,
+        "codex-3402-fresh",
+        crate::backend::SpawnMode::Fresh,
+    );
+    let canonical = std::fs::canonicalize(&workspace).expect("canonical workspace");
+    let override_arg = codex_project_override_3402(&argv);
+    assert!(
+        override_arg.contains(&canonical.to_string_lossy().to_string()),
+        "#3402: trust must target the canonical workspace; override={override_arg}"
+    );
+    assert!(
+        override_arg.contains("trust_level='trusted'"),
+        "#3402: project override must grant invocation-only trust; override={override_arg}"
+    );
+    if let Some(base) = home.parent() {
+        std::fs::remove_dir_all(base).ok();
+    }
+}
+
+/// #3402 RED: `-c` is a global Codex option, so the trust override must be
+/// placed before the remote `resume` subcommand just like the bridge override.
+#[test]
+fn codex_resume_argv_places_invocation_project_trust_before_resume_3402() {
+    let (home, workspace) = codex_cfg_dirs_3317("trust-resume", "home");
+    let argv = codex_argv_3317(
+        &home,
+        &workspace,
+        "codex-3402-resume",
+        crate::backend::SpawnMode::Resume,
+    );
+    let trust_at = argv
+        .iter()
+        .position(|arg| arg.starts_with("projects={"))
+        .unwrap_or_else(|| panic!("#3402: trust override missing; argv={argv:?}"));
+    if let Some(resume_at) = argv.iter().position(|arg| arg == "resume") {
+        assert!(
+            trust_at < resume_at,
+            "#3402: trust override must precede resume; argv={argv:?}"
+        );
+    }
+    if let Some(base) = home.parent() {
+        std::fs::remove_dir_all(base).ok();
+    }
+}
+
+/// #3402: the NativeShared attach branch is assembled separately from preset
+/// spawns, so pin the production `build_command` route through a saved locator.
+#[test]
+fn codex_remote_attach_argv_carries_invocation_project_trust_3402() {
+    let (home, workspace) = codex_cfg_dirs_3317("trust-remote", "home");
+    let name = "codex-3402-remote";
+    let locator = crate::transport::SessionLocator::codex(
+        std::path::PathBuf::from("/tmp/codex-3402.sock"),
+        Some("thread-3402".to_string()),
+    );
+    crate::transport::save_session_locator(&home, name, &locator).expect("save Codex locator");
+
+    let argv = codex_argv_3317(&home, &workspace, name, crate::backend::SpawnMode::Resume);
+    let trust_at = argv
+        .iter()
+        .position(|arg| arg.starts_with("projects={"))
+        .unwrap_or_else(|| panic!("#3402: remote trust override missing; argv={argv:?}"));
+    let remote_at = argv
+        .iter()
+        .position(|arg| arg == "--remote")
+        .expect("remote endpoint flag");
+    let resume_at = argv
+        .iter()
+        .position(|arg| arg == "resume")
+        .expect("remote resume subcommand");
+    assert!(remote_at < trust_at, "#3402: argv={argv:?}");
+    assert!(trust_at < resume_at, "#3402: argv={argv:?}");
+
+    if let Some(base) = home.parent() {
+        std::fs::remove_dir_all(base).ok();
+    }
+}
+
+/// #3402 RED: constructing a managed spawn must never persist trust into the
+/// operator's config. The pre-existing bytes are the invariant.
+#[test]
+fn codex_invocation_project_trust_does_not_mutate_global_config_3402() {
+    let (home, workspace) = codex_cfg_dirs_3317("trust-global", "home");
+    let codex_home = home.join("operator-codex-home");
+    std::fs::create_dir_all(&codex_home).expect("codex home");
+    let config = codex_home.join("config.toml");
+    let before = b"model = 'operator-choice'\n";
+    std::fs::write(&config, before).expect("seed operator config");
+
+    let argv = codex_argv_3317(
+        &home,
+        &workspace,
+        "codex-3402-global",
+        crate::backend::SpawnMode::Fresh,
+    );
+    codex_project_override_3402(&argv);
+    assert_eq!(
+        std::fs::read(&config).expect("read operator config"),
+        before,
+        "#3402: command construction must not write persistent trust"
+    );
+    if let Some(base) = home.parent() {
+        std::fs::remove_dir_all(base).ok();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_invocation_project_trust_resolves_workspace_symlink_3402() {
+    let (home, workspace) = codex_cfg_dirs_3317("trust-symlink", "home");
+    let alias = home.join("workspace-alias");
+    std::os::unix::fs::symlink(&workspace, &alias).expect("workspace symlink");
+    let argv = codex_argv_3317(
+        &home,
+        &alias,
+        "codex-3402-symlink",
+        crate::backend::SpawnMode::Fresh,
+    );
+    let canonical = std::fs::canonicalize(&workspace).expect("canonical workspace");
+    let override_arg = codex_project_override_3402(&argv);
+    assert!(
+        override_arg.contains(&canonical.to_string_lossy().to_string()),
+        "#3402: override must use symlink target; override={override_arg}"
+    );
+    assert!(
+        !override_arg.contains(&alias.to_string_lossy().to_string()),
+        "#3402: alias must not become a distinct project identity; override={override_arg}"
+    );
+    if let Some(base) = home.parent() {
+        std::fs::remove_dir_all(base).ok();
+    }
+}
+
 /// #3317: the Codex trust-dismiss matcher must NOT exist.
 ///
 /// Measured at codex 0.149.0: the "Do you trust the contents of this
