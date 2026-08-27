@@ -4822,6 +4822,24 @@ fn opencode_attach_command_uses_one_model_parse_result() {
     .is_err());
 }
 
+/// #3398: a codex spawn with no session locator (no `home`, so
+/// `prepare_codex_tui_session` never runs and `codex_attach_locator` returns `None`)
+/// falls back to the `Backend::Codex` preset args. A global `resume --last` there
+/// adopts whatever thread the cwd used last — another fleet instance's when they
+/// share one. Exact-vector so the subcommand cannot reappear at any position; the
+/// locator path is pinned by `codex_managed_tui_resume_targets_the_persisted_thread`.
+#[test]
+fn codex_resume_preset_without_a_locator_starts_isolated_3398() {
+    assert_eq!(
+        Backend::Codex.preset_spawn_args(crate::backend::SpawnMode::Resume),
+        vec![
+            "-c",
+            "check_for_update_on_startup=false",
+            "--dangerously-bypass-approvals-and-sandbox",
+        ]
+    );
+}
+
 #[test]
 fn codex_managed_tui_resume_targets_the_persisted_thread() {
     let locator = crate::transport::SessionLocator::codex(
@@ -5533,14 +5551,20 @@ fn codex_resume_argv_places_mcp_overrides_before_the_resume_subcommand_3317() {
         .iter()
         .position(|a| a.starts_with("mcp_servers.agend-terminal."))
         .unwrap_or_else(|| panic!("#3317: resume argv must register the bridge; argv={argv:?}"));
-    let resume_at = argv
-        .iter()
-        .position(|a| a == "resume")
-        .unwrap_or_else(|| panic!("codex resume argv must contain the subcommand; argv={argv:?}"));
+    // #3398: this argv has no session locator, so it no longer carries a
+    // subcommand at all. The ordering guarantee is what #3317 pins, so assert it
+    // wherever a subcommand exists and assert the absence of the global fallback
+    // that #3398 removed.
+    if let Some(resume_at) = argv.iter().position(|a| a == "resume") {
+        assert!(
+            first_mcp < resume_at,
+            "#3317: `-c` overrides must precede the `resume` subcommand (0.148 treats \
+             `-c` as global-only); first_mcp={first_mcp} resume_at={resume_at} argv={argv:?}"
+        );
+    }
     assert!(
-        first_mcp < resume_at,
-        "#3317: `-c` overrides must precede the `resume` subcommand (0.148 treats \
-         `-c` as global-only); first_mcp={first_mcp} resume_at={resume_at} argv={argv:?}"
+        !argv.iter().any(|a| a == "--last"),
+        "#3398: a locator-less codex resume must not adopt the cwd's last thread; argv={argv:?}"
     );
     if let Some(base) = home.parent() {
         std::fs::remove_dir_all(base).ok();
