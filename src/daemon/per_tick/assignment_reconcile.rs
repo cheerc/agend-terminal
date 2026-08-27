@@ -1,7 +1,7 @@
 //! t-…-17 C12: per-tick reconciler for the durable reviewer-assignment authority
 //! ([`crate::daemon::assignment_authority`]).
 //!
-//! Every tick (cadence `new(1)` = one 10 s base tick) this converges the store
+//! At boot and every 60 base ticks this converges the store
 //! against reality for each active `(repo,branch)`:
 //!   - **A10a** terminal restart-repair: CAS-tombstone any record whose stored
 //!     `pr_number` is already in the RETAINED terminal-marker set (catches the A7
@@ -34,8 +34,8 @@ use crate::daemon::assignment_authority as store;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// C12 per-tick handler. `new(1)` runs every tick (~10 s); a larger cadence divides
-/// that down. Registered in [`crate::daemon::per_tick::build_default_handlers`].
+/// C12 per-tick handler. `new(60)` runs at boot and then at a low-frequency
+/// safety cadence. Registered in [`crate::daemon::per_tick::build_default_handlers`].
 pub(crate) struct AssignmentReconcileHandler {
     cadence: u64,
     tick: AtomicU64,
@@ -164,55 +164,55 @@ fn reconcile_all_collect_wakes(home: &Path, now: &str) -> ReconcileWakes {
     workset.extend(store::active_branches(home));
     workset.extend(crate::daemon::pr_state::list_state_identities(home));
 
+    let task_ids = workset
+        .iter()
+        .flat_map(|(repo, branch)| store::list_active(home, repo, branch))
+        .map(|record| crate::task_events::TaskId(record.task_id))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let terminal_tasks = match crate::task_events::catalog::for_home(home).statuses(&task_ids) {
+        Ok(statuses) => statuses
+            .into_iter()
+            .filter(|snapshot| snapshot.status.is_some_and(|status| status.is_terminal()))
+            .map(|snapshot| {
+                if let Some((instance, seq)) = snapshot.terminal_event {
+                    if let Err(error) = store::retire_for_terminal_event(
+                        home,
+                        &snapshot.board,
+                        &snapshot.task_id.0,
+                        &instance.0,
+                        seq,
+                        now,
+                    ) {
+                        tracing::error!(
+                            task_id = %snapshot.task_id,
+                            %error,
+                            "terminal assignment safety retirement failed"
+                        );
+                    }
+                }
+                snapshot.task_id.0
+            })
+            .collect::<std::collections::HashSet<_>>(),
+        Err(error) => {
+            tracing::error!(
+                ?error,
+                "assignment safety sweep could not read task catalog"
+            );
+            std::collections::HashSet::new()
+        }
+    };
+
     let mut wakes = ReconcileWakes::default();
-    // #3336: ONE memo per pass, shared by every branch. See `TaskTerminalMemo`.
-    let mut task_status = TaskTerminalMemo::default();
     for (repo, branch) in workset {
-        let branch_wakes = reconcile_branch(home, &repo, &branch, now, &mut task_status);
+        let branch_wakes = reconcile_branch(home, &repo, &branch, now, &terminal_tasks);
         wakes
             .assignment_targets
             .extend(branch_wakes.assignment_targets);
         wakes.continuations.extend(branch_wakes.continuations);
     }
     wakes
-}
-
-/// #3336: `crate::tasks::load_routed` costs ~4.7 s per call — `route_task` replays
-/// EVERY project board (13 here) and `replay_strict_at` has no cache at all. The
-/// inner loop below called it once per ACTIVE ASSIGNMENT RECORD, and this store's
-/// 360 record files carry only 2 DISTINCT task ids, so the same 13-board scan was
-/// repeated for every record. Worse, `reconcile_pass` runs inside the maintenance
-/// tick, which the owned-mode TUI executes ON THE MAIN LOOP (`app::run_app`'s
-/// `select!` tick arm) — so each repeat froze the whole UI.
-///
-/// Memoize per PASS. The call site reads exactly one thing (`status.is_terminal()`),
-/// so the memo stores exactly that, and `None` collapses EVERY `TaskRouteError`
-/// (Ambiguous / Unreadable / NotFound) into the same fail-closed "preserve the
-/// assignment" branch the `if let Ok(..)` already produced — behaviour is unchanged.
-///
-/// Freshness: all records in one pass now share the routing observed at that id's
-/// FIRST lookup in the pass, instead of re-routing per record. A pass already spans
-/// seconds, so per-record re-routing bought no real freshness; at worst a task that
-/// turns terminal mid-pass retires its assignment on the next tick.
-///
-/// This does NOT fix the underlying 4.7 s (that needs the #3336 board-index and
-/// strict-replay-cache work) — it stops paying it once per record.
-#[derive(Default)]
-struct TaskTerminalMemo {
-    seen: std::collections::HashMap<String, Option<crate::task_events::TaskStatus>>,
-}
-
-impl TaskTerminalMemo {
-    fn status_of(&mut self, home: &Path, task_id: &str) -> Option<crate::task_events::TaskStatus> {
-        if let Some(hit) = self.seen.get(task_id) {
-            return *hit;
-        }
-        let resolved = crate::tasks::load_routed(home, task_id)
-            .ok()
-            .map(|routed| routed.task.status);
-        self.seen.insert(task_id.to_string(), resolved);
-        resolved
-    }
 }
 
 /// One branch. Returns the targets to WAKE (A3). No lock is held across the calls
@@ -222,7 +222,7 @@ fn reconcile_branch(
     repo: &str,
     branch: &str,
     now: &str,
-    task_status: &mut TaskTerminalMemo,
+    terminal_tasks: &std::collections::HashSet<String>,
 ) -> ReconcileWakes {
     // A10a: terminal restart-repair FIRST — tombstoned records are then excluded
     // from the A2/A3/A4 sweep (the `list_active` read below runs after).
@@ -274,28 +274,23 @@ fn reconcile_branch(
         // Task-terminal gate (#2878-16): a cancelled/done task cannot produce a
         // valid review — retire the assignment instead of re-nudging it.
         // Fail-closed: route error or unknown task_id → preserve.
-        if let Some(status) = task_status.status_of(home, &record.task_id) {
-            if status.is_terminal() {
-                if store::retire_if_id_matches(
-                    home,
-                    repo,
-                    branch,
-                    &record.target,
-                    record.assignment_id,
-                    now,
-                )
-                .unwrap_or(false)
-                {
-                    tracing::info!(
-                        assignment_id = %record.assignment_id,
-                        target = %record.target,
-                        task_id = %record.task_id,
-                        task_status = %status,
-                        "assignment retired: owning task is terminal"
-                    );
-                }
-                continue;
+        if terminal_tasks.contains(&record.task_id) {
+            if let Err(error) = store::retire_if_id_matches(
+                home,
+                repo,
+                branch,
+                &record.target,
+                record.assignment_id,
+                now,
+            ) {
+                tracing::error!(
+                    assignment_id = %record.assignment_id,
+                    task_id = %record.task_id,
+                    %error,
+                    "terminal assignment safety retirement failed"
+                );
             }
+            continue;
         }
         // Classify against the LIVE pr_state for THIS record's generation (its
         // pr_number). A pr_state for a different generation, or none, ⇒ Unengaged.
@@ -466,62 +461,24 @@ mod tests {
         p
     }
 
-    /// #3336: the memo must resolve each DISTINCT task id at most once per pass.
-    /// `load_routed` costs ~4.7s (13 board replays, `replay_strict_at` uncached) and
-    /// the reconcile inner loop hits it once per ACTIVE ASSIGNMENT RECORD — this
-    /// store's 360 record files carry only 2 distinct ids, so the repeat was pure waste.
-    ///
-    /// Proof that the second lookup does NOT touch disk: resolve once against a real
-    /// home, then DELETE the home. A non-memoized second call would now route against
-    /// a missing board and answer differently (or `None`); a memoized one returns the
-    /// first answer verbatim.
     #[test]
-    fn task_terminal_memo_resolves_each_id_once_per_pass() {
-        let home = tmp_home("memo");
-        let tid = "t-memo-1";
-        crate::task_events::append(
-            &home,
-            &InstanceName("creator".into()),
-            TaskEvent::Created {
-                task_id: TaskId(tid.into()),
-                title: "t".into(),
-                description: String::new(),
-                priority: "normal".into(),
-                owner: None,
-                due_at: None,
-                depends_on: Vec::new(),
-                routed_to: None,
-                branch: None,
-                bind: None,
-                eta_secs: None,
-                tags: vec![],
-                parent_id: None,
-            },
-        )
-        .expect("seed task");
+    fn reconcile_uses_one_catalog_status_batch_per_pass() {
+        let home = tmp_home("one-status-batch");
+        seed_open_task(&home, "t-rev-1");
 
-        let mut memo = TaskTerminalMemo::default();
-        let first = memo.status_of(&home, tid);
-        assert!(first.is_some(), "a freshly created task must route");
-        assert_eq!(memo.seen.len(), 1, "one distinct id → one memo entry");
+        let a = mk("o/r", "feat/a", "reviewer-a", 41, "2026-08-27T00:00:00Z");
+        let b = mk("o/r", "feat/b", "reviewer-b", 42, "2026-08-27T00:00:00Z");
+        store::persist(&home, &a).unwrap();
+        store::persist(&home, &b).unwrap();
 
-        // Disk is gone: only the memo can answer now.
+        crate::task_events::catalog::reset_status_batch_queries_for_test();
+        let _ = reconcile_all_collect(&home, "2026-08-27T00:01:00Z");
+        assert_eq!(
+            crate::task_events::catalog::status_batch_queries_for_test(),
+            1,
+            "one safety pass must issue exactly one catalog batch query"
+        );
         std::fs::remove_dir_all(&home).ok();
-        let second = memo.status_of(&home, tid);
-        assert_eq!(
-            second, first,
-            "repeat lookup must come from the memo, not disk"
-        );
-        assert_eq!(memo.seen.len(), 1, "a repeat must not add an entry");
-
-        // A DIFFERENT id is a real (now-failing) lookup and is cached as such —
-        // an unroutable id collapses to None, the fail-closed "preserve" answer.
-        let other = memo.status_of(&home, "t-memo-2");
-        assert_eq!(
-            other, None,
-            "unroutable id must collapse to None (preserve)"
-        );
-        assert_eq!(memo.seen.len(), 2, "a distinct id adds exactly one entry");
     }
 
     fn mk(repo: &str, branch: &str, target: &str, pr: u64, created: &str) -> ActiveAssignment {
@@ -1063,7 +1020,7 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// T28 — the reconciler handler is registered at cadence `new(1)` and its `run`
+    /// T28 — the reconciler handler is registered at low-frequency cadence and its `run`
     /// actually drives the reconcile when the cadence permits (a lease-due Unengaged
     /// record is repaired). Cross-checked by a source-pin on the registration.
     #[test]
@@ -1072,13 +1029,13 @@ mod tests {
             AssignmentReconcileHandler::new(1).name(),
             "assignment_reconcile"
         );
-        // Source-pin: registered in build_default_handlers at new(1) (~10s).
+        // Source-pin: registered in build_default_handlers at new(60) (~10m).
         let src = std::fs::read_to_string("src/daemon/per_tick/mod.rs")
             .or_else(|_| std::fs::read_to_string("agend-terminal/src/daemon/per_tick/mod.rs"))
             .expect("per_tick/mod.rs readable");
         assert!(
-            src.contains("AssignmentReconcileHandler::new(1)"),
-            "reconciler must be registered at new(1) cadence in build_default_handlers"
+            src.contains("AssignmentReconcileHandler::new(60)"),
+            "reconciler must be registered at new(60) cadence in build_default_handlers"
         );
 
         // Functional: run() reconciles when the cadence gate opens (new(1) = always).
@@ -2145,6 +2102,80 @@ mod tests {
         assert!(
             store::get(&home, "o/r", "feat/y", "reviewer-b").is_none(),
             "retired assignment must be absent from active store"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cascade_cancelled_child_assignment_is_retired() {
+        let home = tmp_home("cascade-cancel-retire");
+        let parent = TaskId::from("t-parent-cancel-1");
+        let child = TaskId::from("t-child-cancel-1");
+        let inst = InstanceName::from("orchestrator");
+        crate::task_events::append_batch_at(
+            &home,
+            &inst,
+            vec![
+                TaskEvent::Created {
+                    task_id: parent.clone(),
+                    title: "parent".into(),
+                    description: String::new(),
+                    priority: "high".into(),
+                    owner: None,
+                    due_at: None,
+                    depends_on: vec![],
+                    routed_to: None,
+                    branch: None,
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: None,
+                },
+                TaskEvent::Created {
+                    task_id: child.clone(),
+                    title: "child review".into(),
+                    description: String::new(),
+                    priority: "high".into(),
+                    owner: None,
+                    due_at: None,
+                    depends_on: vec![],
+                    routed_to: None,
+                    branch: None,
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: Some(parent.clone()),
+                },
+                TaskEvent::Cancelled {
+                    task_id: parent,
+                    by: inst.clone(),
+                    reason: "parent cancelled".into(),
+                },
+            ],
+        )
+        .unwrap();
+
+        let rec = ActiveAssignment::new_pending(
+            "o/r",
+            "feat/cascade",
+            "reviewer-child",
+            10,
+            "lead",
+            &child.0,
+            ReviewClass::Single,
+            ReviewAuthor::External("octocat".into()),
+            "Please review child",
+            None,
+            None,
+            "2026-07-22T02:00:00Z",
+        );
+        store::persist(&home, &rec).unwrap();
+
+        let wakes = reconcile_all_collect(&home, "2026-07-22T02:00:01Z");
+        assert!(wakes.is_empty());
+        assert!(
+            store::get(&home, "o/r", "feat/cascade", "reviewer-child").is_none(),
+            "a child cancelled by parent cascade must not strand its assignment"
         );
         std::fs::remove_dir_all(&home).ok();
     }
