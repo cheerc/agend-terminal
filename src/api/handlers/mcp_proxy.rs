@@ -156,6 +156,18 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
         Some(t) if !t.is_empty() => t,
         _ => return json!({"ok": false, "error": "missing 'tool' parameter"}),
     };
+    // #3411 Phase 0a: the CLI rides the existing MCP tool handler, but its
+    // transport is an explicitly fenced experimental surface.  Check the
+    // daemon-owned flag before role resolution or handler dispatch so the
+    // default-off path has no tool side effects.
+    if params.get("transport").and_then(Value::as_str) == Some("cli")
+        && !crate::runtime_config::get().experimental.tool_cli_enabled
+    {
+        return json!({
+            "ok": false,
+            "error": "tool CLI disabled: experimental.tool_cli_enabled is false"
+        });
+    }
     let args = params["arguments"].clone();
     let action = args
         .get("action")
@@ -299,7 +311,7 @@ fn handle_mcp_tool_counted(
                 timeout_response(tool, action.as_deref(), timeout, key)
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                json!({"ok": false, "error": format!("tool '{tool}' thread panicked")})
+                json!({"ok": false, "status": "handler_errored", "error": format!("tool '{tool}' thread panicked")})
             }
         },
         Err(e) => {
@@ -593,6 +605,30 @@ mod tests {
         assert!(
             resp["error"].as_str().unwrap_or("").contains("timed out"),
             "got {resp}"
+        );
+    }
+
+    /// A worker can enter the handler and then panic before sending a result.
+    /// The resulting disconnected envelope is therefore indeterminate, not a
+    /// refusal that invites the caller to assume the tool never ran.
+    #[test]
+    fn handler_panic_disconnect_is_indeterminate() {
+        let resp = handle_mcp_tool_inner(
+            "task",
+            json!({"action": "get", "id": "panic-probe"}),
+            "caller".to_string(),
+            Duration::from_secs(1),
+            Some("get".to_string()),
+            |_, _, _| -> Value { panic!("handler panic probe") },
+        );
+        assert_eq!(
+            crate::mcp_wire::classify_response(&resp),
+            crate::mcp_wire::ResponseClass::Indeterminate,
+            "a handler panic after worker entry must not classify as refused: {resp}"
+        );
+        assert_eq!(
+            resp["status"], "handler_errored",
+            "disconnected handler errors need an explicit indeterminate status: {resp}"
         );
     }
 

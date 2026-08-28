@@ -1,0 +1,50 @@
+{
+  "ok": {
+    "ok": true,
+    "result": {
+      "messages": []
+    }
+  },
+  "unknown_tool": {
+    "ok": true,
+    "result": {
+      "error": "unknown tool: definitely_missing_tool"
+    }
+  },
+  "fence_closed": {
+    "ok": false,
+    "error": "tool CLI disabled: experimental.tool_cli_enabled is false"
+  },
+  "accepted_in_progress": {
+    "ok": true,
+    "status": "accepted_in_progress",
+    "note": "side effect accepted and completing in the background"
+  },
+  "tool_list": {
+    "ok": true,
+    "result": {
+      "tools": [
+        {
+          "name": "send",
+          "description": "Send a message to an instance",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "instance": {"type": "string"},
+              "message": {"type": "string"}
+            },
+            "required": ["instance", "message"]
+          }
+        },
+        {
+          "name": "inbox",
+          "description": "Read pending messages",
+          "inputSchema": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ]
+    }
+  }
+}

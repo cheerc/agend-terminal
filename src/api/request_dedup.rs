@@ -664,6 +664,7 @@ pub fn method_wait_timeout(method: &str, params: &Value) -> Duration {
 pub(crate) fn in_progress_error() -> Value {
     json!({
         "ok": false,
+        "status": "in_progress",
         "error": "in_progress (duplicate request_id still executing on another session)"
     })
 }
@@ -671,6 +672,7 @@ pub(crate) fn in_progress_error() -> Value {
 pub(crate) fn oversized_error() -> Value {
     json!({
         "ok": false,
+        "status": "oversized",
         "error": "duplicate request_id; original response exceeded cache size cap"
     })
 }
@@ -678,6 +680,7 @@ pub(crate) fn oversized_error() -> Value {
 pub(crate) fn handler_errored(detail: &str) -> Value {
     json!({
         "ok": false,
+        "status": "handler_errored",
         "error": format!("duplicate request_id; original handler failed: {detail}")
     })
 }
@@ -705,6 +708,27 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn dedup_error_envelopes_are_indeterminate_on_wire() {
+        let cases = [
+            ("in_progress", in_progress_error()),
+            ("oversized", oversized_error()),
+            ("handler_errored", handler_errored("handler failed")),
+        ];
+        let mismatches = cases
+            .into_iter()
+            .filter_map(|(name, response)| {
+                let actual = crate::mcp_wire::classify_response(&response);
+                (actual != crate::mcp_wire::ResponseClass::Indeterminate)
+                    .then_some((name, actual, response))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            mismatches.is_empty(),
+            "dedup error envelopes must be indeterminate: {mismatches:?}"
+        );
+    }
 
     /// #868 — spin-wait helper used by the in-progress / over-cap
     /// coordination tests below. Replaces the old `thread::sleep(50ms)`
