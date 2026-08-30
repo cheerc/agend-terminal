@@ -1,0 +1,81 @@
+Which freeze graded these runs
+==============================
+
+The two run directories here were produced under the ORIGINAL commit A, whose
+grade.py digest was 1e58699b4cdf1333692b0f23515e73b4f89e3d49925ad3d52cbeef66ce082440.
+
+The #3412 primary review (t-20260828143201047260-31254-76) proved two fail-open
+paths in that grader: the mixing gate reported "0 of 45" for a control that
+contributed zero runs, and an unreadable `arm` blinded mixing detection outright.
+Answering the follow-up question about re-run scope surfaced a third: a matrix
+that lost a single confirmation pair recomputed its interval off-table at N=59
+and still read PASS, though SPEC.txt:167 pins the gate to a lookup AT N=60.
+
+A second independent review then found three more runs the grader counted that
+it should have refused: a model that was never resolved (or resolved off the
+frozen pin), a control run carrying an arm its scenario never declared, and two
+runs claiming one (scenario, pair, arm) cell, where the later one silently
+replaced the earlier.
+
+A third round of review found that every gate so far counted what was on disk
+without establishing that what was on disk IS the frozen experiment: SPEC-required
+metadata fields went unread, the model was compared metadata-to-metadata instead
+of against the stream's own init event, an unreadable scenario declaration meant
+"no constraint" (and a non-object one crashed the aggregate), nothing compared the
+runs to SPEC section 6's 210-cell plan, matrix.sh took its plan from the
+environment, and resume skipped any directory holding a metadata.json without
+reading it. The summary therefore gained a `plan_gate`, which means a new run's
+summary.json is not key-comparable to the two below.
+
+A fourth round asked for four more: multiplicity counted over ALL discovered runs
+with the observed count required to BE 210; one order_in_pair per cell agreed by
+plan, run and resume; invalid_reason and schema typed strictly (a number used to
+become the run's own reason, and True passed as schema 1); and a mandatory,
+complete manifest, with matrix.sh refusing to overwrite a run directory or a
+manifest it cannot account for.
+
+The order fix is the one worth reading twice, because it changes how the runs
+BELOW grade. matrix.sh planned "only" for the single-arm controls while run.sh
+recorded "first"/"second" by parity, so those two disagreed for all 90 control
+runs. SPEC.txt:65 types metadata order_in_pair ("first"|"second"), so the parity
+value is now what plan, manifest and run all carry. The consequence for the two
+runs below: all 210 of E2's runs are still valid and every measurement is
+unchanged (n=60, b=c=0, rate/critical/mixing still pass), but its MANIFEST still
+says "only" on those 90 rows, so the plan gate flags manifest_plan_mismatch and
+pilot_safety reads False. The old tree fails on exactly the disagreement this
+round removes, not on anything it measured.
+
+Fixing all of it changed frozen files, so grade.py is now
+93cbada8d63d2e3513be0e2b411878b4e12a0cc1dd2c7bce7a414c482c428642 and matrix.sh is
+084567c6b960d750466b84577e3c80d99fbc67f41418a036a13dc3625e513e22; this harness is a NEW commit A'.
+
+SPEC.txt section 6 is explicit about what that means: "No prompt/grader/table
+edits after commit A — if one is needed, the matrix restarts from zero under a
+new commit A'." These results therefore do NOT carry forward as results under the
+current freeze. They stand as the record of what was run under the old one.
+
+Measured, not assumed: re-grading the surviving E2 raw tree reproduces every
+MEASUREMENT runs/E2-20260828T090026Z/summary.json already had — 210 valid runs,
+N=60, b=c=0, and the rate, critical and mixing gates all still passing. What it no
+longer reproduces is the overall verdict: the `plan_gate` added later flags
+manifest_plan_mismatch on that tree, because its manifest still says
+order_in_pair "only" on the 90 control rows. Correcting ONLY those 90 fields in a
+copy — no run, no stream, no measurement touched — puts every gate back to green.
+report.py is deliberately unchanged, so the two reports below still re-render byte
+for byte from the summaries they were made from; the plan gate lives in
+summary.json only, and putting it in the renderer would break exactly that
+property. So the fixes are measurement-invariant on the data that still exists — evidence about what a re-run
+would be expected to show, not a substitute for the re-run SPEC section 6
+requires. E1 (20260828T063955Z) cannot be re-graded at all: its raw run tree was
+in a worktree that has since been released.
+
+SPEC section 6 now also bounds what a restart authorizes: EXACTLY ONE fresh
+210-run matrix, only after the new A' carries dual independent VERIFIED reviews,
+and those verdicts cover that one matrix rather than licensing retries until one
+passes. That clause is itself frozen, so moving it forces another A'.
+
+Phase 1 remains excluded either way (SPEC.txt:169).
+
+#3412 r2/r3: the frozen execution budget (--max-turns 15, --timeout 900s) is now graded identity, so the
+committed runs above — recorded under max_turns 40 and carrying no timeout_secs — are INVALID under the current
+freeze rather than merely superseded by it; a fresh matrix under a new commit A' is required for any pilot claim.
