@@ -450,6 +450,7 @@ fn spawn_single_instance_impl_inner(
                 if run_inline {
                     inject_body();
                 } else {
+                    // fire-and-forget: waits 3s, then one injection attempt; process exit reaps it.
                     std::thread::Builder::new()
                         .name("task_inject".into())
                         .spawn(move || {
