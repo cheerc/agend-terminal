@@ -59,7 +59,6 @@ pub(crate) fn parse_binding_guarded(content: &str) -> Option<serde_json::Value> 
     }
     Some(v)
 }
-
 /// #1990: true if a binding file is present at a version this daemon understands
 /// OR a NEWER one. Distinct from [`read`], which returns `None` for a
 /// future-version binding (the correct fail-closed for daemon-side actors that
@@ -456,7 +455,8 @@ pub(crate) fn bind_full_with_provenance(
 
 mod review_lease;
 pub(crate) use review_lease::{
-    retarget_disposable_review_binding_for_receipt, try_augment_review_lease,
+    augment_binding_with_lease, retarget_disposable_review_binding_for_receipt,
+    try_augment_review_lease,
 };
 
 /// #2158 GR1: surface an OUT-OF-DISPATCH binding CREATE/CHANGE (no task_id) to the
