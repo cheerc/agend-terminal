@@ -2,7 +2,8 @@
 //! exact-head disarm, split out of `watch.rs` so
 //! that handler stays under the MCP-handler LOC ceiling. The exact-head key
 //! space is deliberately isolated here: it never falls back to the generic
-//! `repo:branch` watch, and its authority ladder is no weaker than the arm's.
+//! `repo:branch` watch. Full-disarm authority is no weaker than the arm's, while
+//! a receipt-backed assignee may only unsubscribe its own exact-head subscription.
 
 use serde_json::{json, Value};
 use std::path::Path;
@@ -29,17 +30,43 @@ pub(super) fn armed_exact_head_count(home: &Path, repo: &str, branch: &str) -> u
         .count() as u64
 }
 
+/// Resolve this caller's ci-handoff obligation for the watch's BRANCH.
+///
+/// The correlation is branch-wide (`repo@branch`) while an exact-head unwatch
+/// addresses one immutable SHA, so a successful exact-head unsubscribe or full
+/// disarm deliberately settles that caller's whole `repo@branch` obligation
+/// rather than a per-SHA slice. There is no finer-grained obligation to settle:
+/// the sole production writer keys the track on the same branch-wide
+/// `repo@branch` (`ci_watch::poller`, recorded for a `next_after_ci`
+/// continuation target and only once its inbox row exists), and a
+/// `notification_only` watch creates none of its own because it forbids
+/// `next_after_ci` at arm time.
+///
+/// Resolution matches on target AND correlation, so a co-subscriber's own
+/// obligation on the same branch is left intact. The operator (empty caller)
+/// owns no track and settles nothing — hence the early return.
+fn settle_caller_track(home: &Path, repo: &str, branch: &str, caller: &str) {
+    if caller.is_empty() {
+        return;
+    }
+    let correlation = format!("{repo}@{branch}");
+    crate::daemon::ci_handoff_track::resolve_for_target_correlation(home, caller, &correlation);
+}
+
 /// #3159: disarm ONE exact-head post-merge watch addressed by its immutable
 /// identity. Split from [`handle_unwatch_ci`] so the exact-head key space can
 /// never fall back to the generic `repo:branch` watch: a malformed, unknown, or
 /// identity-mismatched SHA is an ERROR, never a silent generic unwatch (a typo
 /// must not drop the whole branch's watch).
 ///
-/// Authority is deliberately NO WEAKER than the arm that created the watch
-/// (`handle_watch_ci`'s protected-ref gate): operator (empty caller) passes;
-/// a `notification_only` watch requires the merge-receipt task assignee; a
-/// privileged watch requires orchestrator authority over EVERY persisted
-/// `next_after_ci` continuation target. Anything else is rejected — a weaker
+/// Full-disarm authority is deliberately NO WEAKER than the arm that created
+/// the watch (`handle_watch_ci`'s protected-ref gate): operator (empty caller)
+/// passes; a privileged watch requires orchestrator authority over EVERY
+/// persisted `next_after_ci` continuation target. A `notification_only` watch's
+/// merge-receipt `merge_authority` principal and the orchestrator of its task
+/// assignee also hold full-disarm authority. Its merge-receipt assignee is a
+/// narrower principal: it may unsubscribe only its own subscription, never
+/// full-disarm or remove co-subscribers. Anything else is rejected — a weaker
 /// gate would re-open the #2622/#1575 cross-agent class this handler was
 /// hardened against.
 pub(super) fn unwatch_exact_head(
@@ -123,6 +150,7 @@ pub(super) fn unwatch_exact_head(
             });
         };
         let _ = &receipt;
+        settle_caller_track(home, repo, branch, caller);
         let mut subscribers = crate::daemon::ci_watch::parse_subscribers(&watch);
         let was_subscribed = subscribers.iter().any(|s| s == caller);
         subscribers.retain(|s| s != caller);
@@ -179,6 +207,8 @@ pub(super) fn unwatch_exact_head(
             "exact_head_remaining": armed_exact_head_count(home, repo, branch),
         });
     }
+
+    settle_caller_track(home, repo, branch, caller);
 
     // Authorized: disarm the addressed watch. Tombstone (not delete) for the
     // same #1991 reason the generic path does — a deleted file invites re-arm.
@@ -248,14 +278,7 @@ pub(crate) fn handle_unwatch_ci(home: &Path, args: &Value, instance_name: &str) 
     // (even if the watch file is already absent below) since the intent is to drop
     // the obligation. Precise (caller + exact correlation) so a co-subscriber's
     // track is left intact.
-    if !caller.is_empty() {
-        let correlation = format!("{repo}@{branch}");
-        crate::daemon::ci_handoff_track::resolve_for_target_correlation(
-            home,
-            &caller,
-            &correlation,
-        );
-    }
+    settle_caller_track(home, repo, branch, &caller);
     let filename = crate::daemon::ci_watch::watch_filename(repo, branch);
     let path = crate::daemon::ci_watch::ci_watches_dir(home).join(&filename);
     // H5: flock the per-watch read→atomic_write RMW (see handle_watch_ci).
