@@ -55,6 +55,13 @@ pub(super) struct PullListServer {
     /// #3320: times the INJECTED would-block was produced and retried. Proves
     /// the arm under test was actually taken rather than missed.
     pub(super) injected_would_block_hits: Arc<AtomicU32>,
+    /// #3320: times the REAL write loop waited out a would-block. The read side
+    /// counts an INJECTED one; this counts the kernel's — and ONLY a would-block,
+    /// never an `Interrupted`, because buffer pressure is the thing it claims.
+    /// That is what makes the large-response regression honest: a host whose
+    /// socket buffers swallow the whole body never enters that arm, and the test
+    /// must FAIL saying so rather than pass having exercised nothing.
+    pub(super) write_would_block_hits: Arc<AtomicU32>,
     pub(super) thread: Option<JoinHandle<()>>,
 }
 
@@ -94,6 +101,7 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
     let exited = Arc::new(AtomicBool::new(false));
     let accepted = Arc::new(AtomicU32::new(0));
     let injected_would_block_hits = Arc::new(AtomicU32::new(0));
+    let write_would_block_hits = Arc::new(AtomicU32::new(0));
     let body_for_thread = Arc::clone(&body);
     let requests_for_thread = Arc::clone(&requests);
     let stop_for_thread = Arc::clone(&stop);
@@ -107,6 +115,7 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
     let exited_for_thread = Arc::clone(&exited);
     let accepted_for_thread = Arc::clone(&accepted);
     let would_block_hits_for_thread = Arc::clone(&injected_would_block_hits);
+    let write_would_block_for_thread = Arc::clone(&write_would_block_hits);
     let thread = std::thread::spawn(move || {
         // #3320: `stop` is the ONLY termination condition. The wall clock that
         // used to bound this started at construction, so a caller whose setup
@@ -215,7 +224,50 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
                     let written = if inject_write_for_thread.load(Ordering::Acquire) {
                         Err(std::io::Error::other("#3320 injected write failure"))
                     } else {
-                        stream.write_all(response.as_bytes())
+                        // #3320: this socket is non-blocking, so a response
+                        // larger than the send buffer comes back as a PARTIAL
+                        // write plus `WouldBlock` — which `write_all` reports as
+                        // a failure, stranding the rest of the body. Resume from
+                        // the remaining bytes and wait the transient kinds out,
+                        // exactly as the read wait above does. `stop` stays the
+                        // ONLY bound, and every other error still ends the
+                        // exchange with its cause recorded.
+                        let bytes = response.as_bytes();
+                        let mut sent = 0;
+                        loop {
+                            if stop_for_thread.load(Ordering::Acquire) {
+                                break 'serving;
+                            }
+                            match stream.write(&bytes[sent..]) {
+                                Ok(0) => {
+                                    break Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+                                }
+                                Ok(n) => {
+                                    sent += n;
+                                    if sent == bytes.len() {
+                                        break Ok(());
+                                    }
+                                }
+                                Err(error)
+                                    if matches!(
+                                        error.kind(),
+                                        std::io::ErrorKind::WouldBlock
+                                            | std::io::ErrorKind::Interrupted
+                                    ) =>
+                                {
+                                    // Retry BOTH transient kinds, but count only a
+                                    // real would-block: the counter is what the
+                                    // regression trusts to prove the send buffer
+                                    // actually filled, and an EINTR proves nothing
+                                    // about buffer pressure.
+                                    if error.kind() == std::io::ErrorKind::WouldBlock {
+                                        write_would_block_for_thread.fetch_add(1, Ordering::AcqRel);
+                                    }
+                                    std::thread::sleep(StdDuration::from_millis(5));
+                                }
+                                Err(error) => break Err(error),
+                            }
+                        }
                     };
                     if let Err(error) = written {
                         record_thread_error(
@@ -261,6 +313,7 @@ pub(super) fn pull_list_server(body: String) -> PullListServer {
         exited,
         accepted,
         injected_would_block_hits,
+        write_would_block_hits,
         thread: Some(thread),
     }
 }
@@ -416,6 +469,92 @@ fn write_side_failure_is_reported_not_swallowed_3320() {
     );
 
     // And teardown must still be quiet.
+    drop(server);
+}
+
+/// #3320 RED-E: a response too large for the socket send buffer must be
+/// RESUMED, not abandoned.
+///
+/// The note on RED-C above deferred exactly this. The accepted socket is
+/// normalised to NON-BLOCKING, so a response bigger than the send buffer makes
+/// the write return `WouldBlock` after a PARTIAL write — and `write_all`
+/// reports that as a failure. The exchange then ends with a recorded cause and
+/// the client receives a truncated body: the same swallowed-write class this
+/// file already guards on the read side, arriving through the OS rather than
+/// through a seam.
+///
+/// Nothing is injected. The client sends its request and then STALLS before
+/// draining, so the send buffer genuinely fills and the write genuinely blocks.
+///
+/// NOT ON WINDOWS, and the reason is the fixture rather than the fix. Winsock
+/// does not surface a would-block here at any size we should pay for: this PR
+/// measured `windows-latest` absorbing a 4 MiB body (run 33307408956) and then a
+/// 64 MiB one (run 33308761360) without ever entering the retry arm, and
+/// `tui_bridge.rs` already records the same Winsock limit — a 900 KiB write to a
+/// non-reading peer completing there even with a 4 KiB send buffer — and ignores
+/// its two parked-write tests for it. The code under test is platform-independent
+/// and IS exercised here on Linux and macOS; what cannot be provoked on Windows
+/// is the kernel condition, not the behaviour. The non-vacuity guard below is
+/// what turned both of those runs into loud failures instead of silent passes.
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "#3320: Winsock never surfaces WouldBlock here — windows-latest \
+              absorbed 4 MiB (run 33307408956) and 64 MiB (run 33308761360) \
+              whole; see tui_bridge.rs for the same limit at 900 KiB. The resume \
+              loop is platform-independent and is covered on Linux and macOS."
+)]
+fn a_would_block_write_is_resumed_not_abandoned_3320() {
+    // Comfortably larger than the socket send buffer plus the client receive
+    // buffer on the platforms this runs on, so the block is a certainty rather
+    // than a race. See the `ignore` above for why Windows is not one of them.
+    let body = "x".repeat(4 * 1024 * 1024);
+    let server = pull_list_server(body.clone());
+
+    let addr = server.base_url.trim_start_matches("http://").to_string();
+    let mut stream = std::net::TcpStream::connect(&addr).expect("connect");
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .expect("request");
+    // Stall so the server reaches its write arm and fills the buffer before
+    // anything is drained.
+    std::thread::sleep(StdDuration::from_millis(250));
+    let mut out = String::new();
+    stream.read_to_string(&mut out).expect("response");
+
+    // SUBSTANTIVE PROPERTIES FIRST. A broken resume must report ITS OWN cause; if
+    // the non-vacuity guard ran first it would answer for that failure too, and
+    // send whoever broke the loop off to resize the fixture instead.
+    let cause = server
+        .thread_error
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert!(
+        cause.is_none(),
+        "#3320: a would-block on a large response is not a failure — it means \
+         the rest of the body still has to go out; got {cause:?}"
+    );
+    assert!(
+        out.ends_with(&body),
+        "#3320: the response was truncated — received {} bytes, the body alone \
+         is {}",
+        out.len(),
+        body.len()
+    );
+
+    // NON-VACUITY, LAST: everything above can hold while nothing was exercised —
+    // a host whose buffers absorb the whole response never enters the retry arm.
+    // Reaching here with a zero count means exactly that, and nothing else.
+    let blocked = server.write_would_block_hits.load(Ordering::Acquire);
+    assert!(
+        blocked > 0,
+        "#3320: the response arrived intact but the write never blocked, so this \
+         fixture no longer reaches the arm under test — raise the body size for \
+         this host (body {} bytes)",
+        body.len()
+    );
+
     drop(server);
 }
 
