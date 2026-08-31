@@ -91,6 +91,11 @@ pub(super) enum Overlay {
     ConfirmClose {
         target: CloseTarget,
     },
+    ConfirmDeleteInstance {
+        name: String,
+        input: String,
+        notice: Option<String>,
+    },
     TabList {
         selected: usize,
     },
@@ -438,6 +443,48 @@ pub(super) fn handle_key(
             _ => {
                 *overlay = Overlay::None;
             }
+        },
+        Overlay::ConfirmDeleteInstance {
+            name,
+            input,
+            notice,
+        } => match key.code {
+            KeyCode::Enter => {
+                if input == name {
+                    if crate::daemon::find_active_run_dir(ctx.home).is_none() {
+                        *notice = Some("delete refused: no active daemon".to_string());
+                    } else {
+                        match crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_runtime(
+                            ctx.home,
+                            name,
+                            None,
+                        ) {
+                            Ok(()) => {
+                                ctx.layout.remove_fleet_instance_views(name);
+                                *overlay = Overlay::None;
+                                outcome.needs_resize = true;
+                            }
+                            Err(error) => {
+                                *notice = Some(error);
+                            }
+                        }
+                    }
+                } else {
+                    *notice = Some(format!("type exact name to delete '{name}'"));
+                }
+            }
+            KeyCode::Esc => {
+                *overlay = Overlay::None;
+            }
+            KeyCode::Backspace => {
+                input.pop();
+                *notice = None;
+            }
+            KeyCode::Char(c) => {
+                input.push(c);
+                *notice = None;
+            }
+            _ => {}
         },
         Overlay::TabList { ref mut selected } => match key.code {
             KeyCode::Up | KeyCode::Char('k') if *selected > 0 => {
@@ -1169,6 +1216,183 @@ mod tests {
         }
         let handle = crate::agent::remove_and_unregister(&registry, &id).expect("cleanup handle");
         crate::daemon::terminate_agents_parallel(vec![("managed".to_string(), handle.child)]);
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn delete_instance_requires_exact_name_before_lifecycle() {
+        let home = dec_home("delete_exact_name");
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut layout = crate::layout::Layout::new();
+        layout.add_tab(crate::layout::Tab::new(
+            "managed".to_string(),
+            close_test_pane(
+                crate::types::InstanceId::default(),
+                "managed",
+                Some("managed"),
+            ),
+        ));
+        let mut name_counter = HashMap::new();
+        let mut reap_workers = Vec::new();
+        let mut overlay = Overlay::ConfirmDeleteInstance {
+            name: "managed".to_string(),
+            input: "manage".to_string(),
+            notice: None,
+        };
+        let task_rpc_tx = test_task_channel().0.clone();
+        let mut ctx = OverlayCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            fleet_path: &home,
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+            task_rpc_tx: &task_rpc_tx,
+            reap_workers: &mut reap_workers,
+        };
+
+        handle_key(&mut overlay, press(KeyCode::Enter), &mut ctx);
+        assert!(matches!(
+            overlay,
+            Overlay::ConfirmDeleteInstance {
+                name,
+                input,
+                notice: Some(notice),
+            } if name == "managed"
+                && input == "manage"
+                && notice.contains("type exact name")
+        ));
+        assert_eq!(layout.tabs.len(), 1, "mismatch must preserve all views");
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn delete_instance_without_active_daemon_is_fail_closed() {
+        let home = dec_home("delete_no_daemon");
+        let id = crate::types::InstanceId::new();
+        let fleet_path = crate::fleet::fleet_yaml_path(&home);
+        let fleet_bytes = format!(
+            "instances:\n  managed:\n    id: '{}'\n    backend: claude\n",
+            id
+        );
+        std::fs::write(&fleet_path, &fleet_bytes).expect("write fleet fixture");
+        let workspace = crate::paths::workspace_dir(&home).join("managed");
+        std::fs::create_dir_all(&workspace).expect("create workspace fixture");
+        std::fs::write(workspace.join("keep.txt"), b"keep").expect("write workspace fixture");
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut layout = crate::layout::Layout::new();
+        layout.add_tab(Tab::new(
+            "managed".to_string(),
+            close_test_pane(id, "managed", Some("managed")),
+        ));
+        let mut name_counter = HashMap::new();
+        let mut reap_workers = Vec::new();
+        let task_rpc_tx = test_task_channel().0.clone();
+        let mut overlay = Overlay::ConfirmDeleteInstance {
+            name: "managed".to_string(),
+            input: "managed".to_string(),
+            notice: None,
+        };
+        let mut ctx = OverlayCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            fleet_path: &home,
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+            task_rpc_tx: &task_rpc_tx,
+            reap_workers: &mut reap_workers,
+        };
+
+        handle_key(&mut overlay, press(KeyCode::Enter), &mut ctx);
+        assert!(matches!(
+            overlay,
+            Overlay::ConfirmDeleteInstance {
+                notice: Some(notice), ..
+            } if notice.contains("active daemon")
+        ));
+        assert_eq!(
+            std::fs::read(&fleet_path).expect("fleet remains"),
+            fleet_bytes.as_bytes()
+        );
+        assert!(workspace.join("keep.txt").exists(), "workspace remains");
+        assert_eq!(layout.tabs.len(), 1, "view remains");
+        assert!(
+            layout.tabs[0]
+                .root()
+                .first_pane()
+                .fleet_instance_name
+                .as_deref()
+                == Some("managed")
+        );
+
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn delete_instance_error_preserves_every_exact_name_view() {
+        let home = dec_home("delete_error_preserves_views");
+        let id = crate::types::InstanceId::new();
+        let run = home.join("run").join(std::process::id().to_string());
+        std::fs::create_dir_all(&run).expect("create active-run fixture");
+        crate::daemon::write_daemon_id(&run);
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut layout = crate::layout::Layout::new();
+        layout.add_tab(Tab::new(
+            "first".to_string(),
+            close_test_pane(id, "managed", Some("managed")),
+        ));
+        layout.add_tab(Tab::new(
+            "second".to_string(),
+            close_test_pane(id, "managed", Some("managed")),
+        ));
+        let mut name_counter = HashMap::new();
+        let mut reap_workers = Vec::new();
+        let task_rpc_tx = test_task_channel().0.clone();
+        let mut overlay = Overlay::ConfirmDeleteInstance {
+            name: "managed".to_string(),
+            input: "managed".to_string(),
+            notice: None,
+        };
+        let mut ctx = OverlayCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            fleet_path: &home,
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+            task_rpc_tx: &task_rpc_tx,
+            reap_workers: &mut reap_workers,
+        };
+
+        handle_key(&mut overlay, press(KeyCode::Enter), &mut ctx);
+        assert!(matches!(
+            overlay,
+            Overlay::ConfirmDeleteInstance {
+                notice: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(layout.tabs.len(), 2, "deletion error preserves every tab");
+        assert_eq!(
+            layout
+                .tabs
+                .iter()
+                .flat_map(|tab| {
+                    tab.root()
+                        .pane_ids()
+                        .into_iter()
+                        .filter_map(|id| tab.root().find_pane(id))
+                })
+                .filter_map(|pane| pane.fleet_instance_name.as_deref())
+                .filter(|name| *name == "managed")
+                .count(),
+            2
+        );
+
         std::fs::remove_dir_all(home).ok();
     }
 

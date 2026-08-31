@@ -50,7 +50,7 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
         }
         Action::NewTab => {
             out.new_overlay = Some(Overlay::NewTabMenu {
-                items: super::build_menu_items(ctx.fleet_path, ctx.registry),
+                items: super::build_menu_items(ctx.fleet_path, ctx.registry, ctx.layout),
                 selected: 0,
             });
         }
@@ -130,14 +130,14 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
         }
         Action::SplitVertical => {
             out.new_overlay = Some(Overlay::SplitMenu {
-                items: super::build_menu_items(ctx.fleet_path, ctx.registry),
+                items: super::build_menu_items(ctx.fleet_path, ctx.registry, ctx.layout),
                 selected: 0,
                 dir: SplitDir::Vertical,
             });
         }
         Action::SplitHorizontal => {
             out.new_overlay = Some(Overlay::SplitMenu {
-                items: super::build_menu_items(ctx.fleet_path, ctx.registry),
+                items: super::build_menu_items(ctx.fleet_path, ctx.registry, ctx.layout),
                 selected: 0,
                 dir: SplitDir::Horizontal,
             });
@@ -165,6 +165,20 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
             out.new_overlay = Some(Overlay::ConfirmClose {
                 target: CloseTarget::Tab,
             });
+        }
+        Action::DeleteInstance => {
+            if let Some(name) = ctx
+                .layout
+                .active_tab()
+                .and_then(|tab| tab.focused_pane())
+                .and_then(|pane| pane.fleet_instance_name.clone())
+            {
+                out.new_overlay = Some(Overlay::ConfirmDeleteInstance {
+                    name,
+                    input: String::new(),
+                    notice: None,
+                });
+            }
         }
         Action::FocusUp => {
             if let Some(tab) = ctx.layout.active_tab_mut() {
@@ -720,6 +734,55 @@ mod tests {
         assert!(
             !focused_last_input_some(&ctx),
             "#2435: a failed clipboard capture injects nothing"
+        );
+    }
+
+    #[test]
+    fn delete_instance_targets_only_focused_managed_pane() {
+        let registry: AgentRegistry = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = std::env::temp_dir();
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut layout = Layout::new();
+        let mut managed = test_pane(1, "display-label");
+        managed.fleet_instance_name = Some("managed".to_string());
+        layout.add_tab(Tab::new("managed".to_string(), managed));
+        let mut last_tab = 0;
+        let mut names = HashMap::new();
+        let mut ctx = make_ctx(
+            &mut layout,
+            &registry,
+            &home,
+            &mut last_tab,
+            &tx,
+            &mut names,
+        );
+
+        let result = dispatch(Action::DeleteInstance, &mut ctx);
+        assert!(matches!(
+            result.new_overlay,
+            Some(Overlay::ConfirmDeleteInstance {
+                name,
+                input,
+                notice: None,
+            }) if name == "managed" && input.is_empty()
+        ));
+
+        let mut local_layout = Layout::new();
+        local_layout.add_tab(Tab::new("shell".to_string(), test_pane(2, "shell")));
+        let mut local_last_tab = 0;
+        let mut local_names = HashMap::new();
+        let mut local_ctx = make_ctx(
+            &mut local_layout,
+            &registry,
+            &home,
+            &mut local_last_tab,
+            &tx,
+            &mut local_names,
+        );
+        let local_result = dispatch(Action::DeleteInstance, &mut local_ctx);
+        assert!(
+            local_result.new_overlay.is_none(),
+            "unmanaged shell must fail closed without a delete overlay"
         );
     }
 }

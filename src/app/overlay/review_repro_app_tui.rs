@@ -13,8 +13,9 @@
 //!
 //! The behavioral tests in `overlay.rs` drive the real close entry point with a
 //! registry-backed PTY and fleet fixture. These source invariants additionally
-//! keep destructive lifecycle APIs out of the overlay module and require the
-//! unmanaged path to use the pane's authoritative `instance_id`.
+//! keep destructive lifecycle APIs out of the TUI handler except for the
+//! bounded ConfirmDeleteInstance arm and require the unmanaged path to use the
+//! pane's authoritative `instance_id`.
 
 #[test]
 fn confirmclose_kills_nonfleet_pane_agent_app_tui() {
@@ -59,17 +60,34 @@ fn confirmclose_never_full_deletes_fleet_instance_app_tui() {
     let production = src
         .split("#[cfg(test)]\nmod tests")
         .next()
-        .expect("overlay production section");
+        .expect("overlay.rs must have a production section");
 
-    let start = src
+    let start = production
         .find("Overlay::ConfirmClose { target } => match key.code {")
         .expect("ConfirmClose handler arm must exist in overlay.rs");
-    let rel_end = src[start..]
+    let delete_start = start
+        + production[start..]
+            .find("Overlay::ConfirmDeleteInstance {")
+            .expect("ConfirmDeleteInstance handler arm must follow ConfirmClose");
+    let rel_delete_end = production[delete_start..]
         .find("Overlay::TabList { ref mut selected } => match key.code {")
-        .expect("TabList arm must follow ConfirmClose and bound its block");
-    let block = &src[start..start + rel_end];
+        .expect("TabList arm must follow ConfirmDeleteInstance and bound its block");
+    let delete_end = delete_start + rel_delete_end;
+    let confirm_close_block = &production[start..delete_start];
+    let delete_block = &production[delete_start..delete_end];
 
-    assert!(block.contains("fleet_instance_name"), "slice sanity");
+    assert!(
+        delete_start > start,
+        "delete handler must be a separate arm after ConfirmClose"
+    );
+    assert!(
+        confirm_close_block.contains("fleet_instance_name"),
+        "slice sanity"
+    );
+
+    let mut outside_delete = String::with_capacity(production.len() - delete_block.len());
+    outside_delete.push_str(&production[..delete_start]);
+    outside_delete.push_str(&production[delete_end..]);
     for forbidden in [
         "full_delete_instance",
         "instance_state::lifecycle",
@@ -79,12 +97,37 @@ fn confirmclose_never_full_deletes_fleet_instance_app_tui() {
         "kill_agent(",
     ] {
         assert!(
-            !production.contains(forbidden),
-            "destructive lifecycle bug: app/overlay.rs must not reference \
-             `{forbidden}` anywhere. A helper outside the ConfirmClose block \
-             could otherwise hide destructive fleet deletion behind one-hop \
-             indirection. Permanent deletion belongs only to the explicit \
-             delete_instance control surface."
+            !outside_delete.contains(forbidden),
+            "destructive lifecycle bug: the TUI handler must not reference \
+             unused `{forbidden}` outside the bounded ConfirmDeleteInstance \
+             control surface."
         );
     }
+
+    let required_lifecycle_call =
+        "crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_runtime(";
+    assert_eq!(
+        delete_block.matches(required_lifecycle_call).count(),
+        1,
+        "the bounded delete arm must call the canonical lifecycle helper"
+    );
+    let delete_without_required_call = delete_block.replace(required_lifecycle_call, "");
+    for forbidden in [
+        "full_delete_instance",
+        "instance_state::lifecycle",
+        "reconcile_after_close",
+        "remove_instance",
+        "delete_transaction",
+        "kill_agent(",
+    ] {
+        assert!(
+            !delete_without_required_call.contains(forbidden),
+            "destructive lifecycle bug: the bounded delete arm must not use \
+             unused `{forbidden}` in addition to the canonical lifecycle call."
+        );
+    }
+    assert!(
+        delete_block.matches("instance_state::lifecycle::").count() == 1,
+        "the bounded delete arm may reference only its required lifecycle path"
+    );
 }

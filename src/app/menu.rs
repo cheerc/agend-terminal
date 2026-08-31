@@ -8,14 +8,18 @@ use crate::agent::{self, AgentRegistry};
 use crate::backend::Backend;
 use crate::layout::{Layout, Pane};
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 const FUGU_BACKEND_MENU_LABEL: &str = "[backend] Codex(Sakana)";
 
 /// Build menu items for new-tab selection.
 /// Fleet instances already running in the registry are excluded.
-pub(super) fn build_menu_items(fleet_path: &Path, registry: &AgentRegistry) -> Vec<MenuItem> {
+pub(super) fn build_menu_items(
+    fleet_path: &Path,
+    registry: &AgentRegistry,
+    layout: &Layout,
+) -> Vec<MenuItem> {
     let mut items = Vec::new();
 
     // Collect already-running agent names
@@ -23,6 +27,7 @@ pub(super) fn build_menu_items(fleet_path: &Path, registry: &AgentRegistry) -> V
         let reg = agent::lock_registry(registry);
         reg.values().map(|h| h.name.to_string()).collect()
     };
+    let attached = attached_fleet_names(layout);
 
     if let Ok(fleet) = crate::fleet::FleetConfig::load(fleet_path) {
         let mut names = fleet.instance_names();
@@ -32,7 +37,7 @@ pub(super) fn build_menu_items(fleet_path: &Path, registry: &AgentRegistry) -> V
             let already_open = running
                 .iter()
                 .any(|r| r == &name || r.starts_with(&format!("{name}-")));
-            if already_open {
+            if already_open || attached.contains(&name) {
                 continue;
             }
             let label = if let Some(resolved) = fleet.resolve_instance(&name) {
@@ -73,6 +78,22 @@ pub(super) fn build_menu_items(fleet_path: &Path, registry: &AgentRegistry) -> V
     });
 
     items
+}
+
+/// Collect exact fleet instance names attached to panes across every tab.
+/// Local shells have no fleet name and therefore never suppress a menu entry.
+pub(super) fn attached_fleet_names(layout: &Layout) -> HashSet<String> {
+    layout
+        .tabs
+        .iter()
+        .flat_map(|tab| {
+            tab.root()
+                .pane_ids()
+                .into_iter()
+                .filter_map(|id| tab.root().find_pane(id))
+                .filter_map(|pane| pane.fleet_instance_name.clone())
+        })
+        .collect()
 }
 
 /// Create a pane from a menu item selection (shared by NewTab and Split handlers).
@@ -232,9 +253,116 @@ pub(super) fn pane_from_menu_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::Tab;
 
     #[test]
     fn fugu_menu_label_is_backend_style() {
         assert_eq!(FUGU_BACKEND_MENU_LABEL, "[backend] Codex(Sakana)");
+    }
+
+    #[test]
+    fn attached_fleet_names_scan_every_tab_and_ignore_local_shells() {
+        let mut layout = Layout::new();
+        let local = Pane {
+            agent_name: "shell".into(),
+            instance_id: crate::types::InstanceId::default(),
+            vterm: crate::vterm::VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id: 1,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            pending_decision_count: 0,
+            selection: None,
+            source: crate::layout::PaneSource::Local,
+            offthread: None,
+            _fwd_cancel: None,
+        };
+        layout.add_tab(Tab::new("local".into(), local));
+        let attached = Pane {
+            agent_name: "label".into(),
+            instance_id: crate::types::InstanceId::default(),
+            vterm: crate::vterm::VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id: 2,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: Some("attached".into()),
+            last_input_at: None,
+            pending_notification_count: 0,
+            pending_decision_count: 0,
+            selection: None,
+            source: crate::layout::PaneSource::Local,
+            offthread: None,
+            _fwd_cancel: None,
+        };
+        layout.add_tab(Tab::new("attached".into(), attached));
+
+        let names = attached_fleet_names(&layout);
+        assert!(names.contains("attached"));
+        assert!(!names.contains("shell"));
+    }
+
+    #[test]
+    fn build_menu_items_filters_attached_fleet_in_non_active_tab() {
+        let home = std::env::temp_dir().join(format!("agend-menu-filter-{}", std::process::id()));
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("create menu fixture home");
+        let fleet_path = home.join("fleet.yaml");
+        std::fs::write(
+            &fleet_path,
+            "instances:\n  attached:\n    backend: claude\n  available:\n    backend: claude\n",
+        )
+        .expect("write fleet fixture");
+
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("local".into(), menu_test_pane(1, None)));
+        layout.add_tab(Tab::new(
+            "attached".into(),
+            menu_test_pane(2, Some("attached")),
+        ));
+        layout.active = 0;
+        let registry: AgentRegistry = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+
+        let items = build_menu_items(&fleet_path, &registry, &layout);
+        assert!(!items.iter().any(|item| {
+            matches!(&item.kind, MenuItemKind::FleetInstance(name) if name == "attached")
+        }));
+        assert!(items.iter().any(|item| {
+            matches!(&item.kind, MenuItemKind::FleetInstance(name) if name == "available")
+        }));
+
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    fn menu_test_pane(id: usize, fleet_instance_name: Option<&str>) -> Pane {
+        Pane {
+            agent_name: "menu-test".into(),
+            instance_id: crate::types::InstanceId::default(),
+            vterm: crate::vterm::VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: fleet_instance_name.map(str::to_string),
+            last_input_at: None,
+            pending_notification_count: 0,
+            pending_decision_count: 0,
+            selection: None,
+            source: crate::layout::PaneSource::Local,
+            offthread: None,
+            _fwd_cancel: None,
+        }
     }
 }
