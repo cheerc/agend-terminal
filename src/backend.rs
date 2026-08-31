@@ -445,12 +445,15 @@ impl Backend {
                 // destructive blast). Same shape as Agy #995/#997 dismiss.
                 //
                 // `Yes, proceed` deliberately retained on old keystroke
-                // pending empirical verification at follow-up — modal +
-                // default-cursor for that prompt not yet captured.
+                // pending empirical verification — its default cursor is not captured.
                 dismiss_patterns: &[
                     DismissPattern {
                         label: r"(?m)^[^A-Za-z\n]*WARNING: Loading development channels",
                         sequence: b"\r",
+                    },
+                    DismissPattern {
+                        label: r"(?m)^[^A-Za-z\n]{0,8}❯ No, exit",
+                        sequence: b"\x1b[B\r",
                     },
                     DismissPattern {
                         label: r"(?m)^[^A-Za-z\n]{0,8}Yes, I trust",
