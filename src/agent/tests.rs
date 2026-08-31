@@ -2793,13 +2793,23 @@ fn broadcast_registry_releases_lock_before_inject_1146() {
 /// re-open the freeze class (registry held across inject), so this pins it gone.
 #[test]
 fn inject_handle_footgun_removed_uses_snapshots_f1() {
+    // The ban covers every agent-module source carrying this surface: 31e14e16
+    // extracted the readiness waiters into `bootstrap_wait.rs`, and a mod.rs-only
+    // scan is evaded by re-homing the banned fn there (measured). Explicit list —
+    // no directory walk; `inject_footgun_ban_covers_…` pins the list itself.
+    for (source, text) in [
+        ("mod.rs", include_str!("mod.rs")),
+        ("bootstrap_wait.rs", include_str!("bootstrap_wait.rs")),
+    ] {
+        assert!(
+            !text.contains("pub fn inject_to_agent("),
+            "#1530/F1: inject_to_agent(&AgentHandle) must stay removed — found in \
+             `{source}`. It lets a caller hold the registry across a blocking \
+             inject; use inject_with_target_gated (snapshot under lock → drop → \
+             inject)"
+        );
+    }
     let src = include_str!("mod.rs");
-    assert!(
-        !src.contains("pub fn inject_to_agent("),
-        "#1530/F1: inject_to_agent(&AgentHandle) must stay removed — it lets a caller \
-         hold the registry across a blocking inject; use inject_with_target_gated \
-         (snapshot under lock → drop → inject)"
-    );
     assert!(
         src.contains("pub(crate) fn inject_with_target_gated("),
         "#1530/F1: the snapshot inject API inject_with_target_gated must exist"
@@ -2808,6 +2818,34 @@ fn inject_handle_footgun_removed_uses_snapshots_f1() {
         src.contains("pub(crate) fn write_to_pty("),
         "#1530/F1: the snapshot write API write_to_pty must exist"
     );
+}
+
+/// t-…-75305-27 RED: the footgun ban above reads ONE file. `bootstrap_wait.rs`
+/// was extracted out of `mod.rs` carrying exactly this surface — the readiness
+/// waiters that hand back an `InjectTarget` — so `pub fn inject_to_agent(` can be
+/// re-homed into that sibling and the ban stays green while the footgun is back.
+/// Pin the COVERAGE, not just the absence: the ban must read every agent-module
+/// source that carries the surface. Explicit list, no directory walk.
+///
+/// Structural and deterministic: it reads the guard's own body, so it fails the
+/// moment the ban's file set stops naming a source the surface lives in.
+#[test]
+fn inject_footgun_ban_covers_the_extracted_bootstrap_wait_sibling_f1() {
+    let suite = include_str!("tests.rs").replace('\r', "");
+    let start = suite
+        .find("fn inject_handle_footgun_removed_uses_snapshots_f1()")
+        .expect("the #1530/F1 footgun guard must exist");
+    let rest = &suite[start..];
+    let end = rest.find("\n}\n").expect("guard body is brace-terminated");
+    let guard_body = &rest[..end];
+    for source in ["mod.rs", "bootstrap_wait.rs"] {
+        assert!(
+            guard_body.contains(&format!("include_str!(\"{source}\")")),
+            "#1530/F1 coverage: the footgun ban must scan `{source}` — a source \
+             carrying the inject-target surface that is not scanned is a free \
+             re-home for the banned `pub fn inject_to_agent(`"
+        );
+    }
 }
 
 /// #1146 reviewer fix: inject_with_target must skip if the agent
@@ -4706,6 +4744,69 @@ fn wait_for_idle_inject_target_already_registered_absence_aborts_without_wall_cl
         Some(IdleInjectWaitTerminal::DisappearedAfterSeen)
     );
     assert_eq!(logical_now.get(), Duration::ZERO);
+}
+
+/// #3462-v3 RED-A: shutdown is observed ONLY at this waiter's loop top. Once the
+/// readiness break happens the waiter still sleeps the 500ms settle, then
+/// snapshots and returns a live `InjectTarget` — so a shutdown that lands during
+/// the settle still hands the caller a target and the caller writes into an agent
+/// the daemon is tearing down.
+///
+/// The settle must be fenced. This drives the production waiter with an injected
+/// clock (no wall-clock time passes) and flips the flag from inside the settle
+/// sleep; the result must be the `Shutdown` terminal, not a target.
+///
+/// The fence belongs HERE, not in `wait_for_respawn_inject_target`: this waiter
+/// has three callers (instructions bootstrap, self-kick bootstrap, crash-respawn
+/// notice) and all three inherit the window.
+#[test]
+fn wait_for_idle_inject_target_fences_shutdown_during_the_settle_delay() {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let id = crate::types::InstanceId::new();
+    registry.lock().insert(id, mk_handle_1441("boot", id));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let logical_now = Cell::new(Duration::ZERO);
+    let shutdown_for_sleep = Arc::clone(&shutdown);
+    let mut now = || logical_now.get();
+    let mut sleep = |interval: Duration| {
+        logical_now.set(logical_now.get() + interval);
+        // `StructuredTransport` + an already-registered handle is ready on the
+        // first iteration, so the settle is the ONLY sleep reached. Pinning the
+        // interval keeps this test honest if that ever stops being true.
+        assert_eq!(
+            interval,
+            Duration::from_millis(500),
+            "the settle delay must be the only sleep this policy reaches"
+        );
+        shutdown_for_sleep.store(true, Ordering::Relaxed);
+    };
+
+    let result = wait_for_bootstrap_inject_target_with_clock(
+        &registry,
+        id,
+        Duration::from_secs(10),
+        BootstrapWaitPolicy::StructuredTransport(BootstrapRegistrationState::AlreadyRegistered),
+        Some(&shutdown),
+        &mut now,
+        &mut sleep,
+    );
+
+    assert!(
+        result.target.is_none(),
+        "a shutdown observed during the settle must not yield an inject target"
+    );
+    assert_eq!(
+        result.terminal,
+        Some(IdleInjectWaitTerminal::Shutdown),
+        "the settle window must end in the Shutdown terminal, not a live target"
+    );
+    for handle in registry.lock().values() {
+        let _ = handle.child.lock().kill();
+    }
 }
 
 /// (1) Invariant: after a managed spawn, `registry key == handle.id ==

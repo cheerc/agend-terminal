@@ -188,9 +188,15 @@ pub(super) fn handle_crash_observation(
     let tx = ctx.crash_tx.clone();
     let shutdown_for_respawn = Arc::clone(&ctx.shutdown);
     let name_for_err = crashed_name.to_owned();
-    // fire-and-forget: respawn worker is short-lived (sleep delay then
-    // spawn_agent + restore health + start TUI server). Observes
-    // shutdown flag immediately after backoff to abort cleanly.
+    // fire-and-forget: respawn worker runs the whole respawn (backoff, spawn_agent,
+    // restore health, start the TUI server, then wait for prompt readiness before
+    // the notice). Bounded: the readiness wait ends at `ready_timeout_secs + 15`,
+    // and the backoff SAMPLES the shutdown flag on a bounded 100ms slice instead
+    // of sleeping through the whole delay, so the thread always ends on its own.
+    // Nothing joins it — shutdown never waits on this thread, so that sampling is
+    // about not acting on a stale flag (#3462-v3/F2), not about shutdown latency.
+    // Bounded sampling, not edge latching: see `wait_out_backoff_or_shutdown` for
+    // the minimum-window assumption it rests on.
     if let Err(e) = std::thread::Builder::new()
         .name(format!("{crashed_name}_respawn"))
         .spawn(move || {
@@ -360,8 +366,55 @@ fn fresh_respawn_args(
 fn respawn_notice(reason: &str) -> String {
     format!(
         "[system] Agent restarted due to {reason}. This is a new session: rebuild anything \
-         in flight from the authoritative sources rather than recalling it.\r"
+         in flight from the authoritative sources rather than recalling it."
     )
+}
+
+/// #3462-v3/F2: wait out the crash-respawn backoff by SAMPLING `shutdown` on a
+/// bounded 100ms slice, returning true on the first slice that sees it true.
+///
+/// This is bounded sampling, NOT edge latching: a true→false window that opens
+/// and closes entirely inside one slice is missed by construction, and no polling
+/// wait can promise otherwise. What it does buy is the difference that matters
+/// here — a bare `sleep(delay)` samples once, after up to `BACKOFF_MAX` (300s), so
+/// it misses every window narrower than the whole backoff.
+///
+/// Why sampling is sufficient at this width. `ctx.shutdown` is reset to false
+/// in-process: `daemon/mod.rs:226` (self-respawn abort) and `daemon/mod.rs:989`
+/// (recover-as-primary, which then re-spawns the fleet and keeps serving). On the
+/// recover-as-primary path the flag stays true across
+/// `std::thread::sleep(self_respawn_settle())` before the reset —
+/// `self_respawn_settle()` is 1s by default (`daemon/mod.rs:245-249`), i.e. at
+/// least ten slices. The assumption this wait rests on is therefore explicit: the
+/// production shutdown window is >= one slice. It holds by construction on that
+/// path; `AGEND_SELF_RESPAWN_SETTLE_SECS` is a test-only override that could
+/// shrink it, and the abort path's width is not independently measured here.
+///
+/// Deliberately not a channel or `Condvar`: the worker is handed an `AtomicBool`,
+/// and plumbing a stop channel down to it is the refactor this correction
+/// excludes.
+fn wait_out_backoff_or_shutdown(delay: std::time::Duration, shutdown: &AtomicBool) -> bool {
+    wait_out_backoff_or_shutdown_with_sleep(delay, shutdown, &mut std::thread::sleep)
+}
+
+/// Injected-sleep seam so the bounded sampling above is provable without
+/// wall-clock time; production passes `std::thread::sleep`.
+fn wait_out_backoff_or_shutdown_with_sleep<S: FnMut(std::time::Duration)>(
+    delay: std::time::Duration,
+    shutdown: &AtomicBool,
+    sleep: &mut S,
+) -> bool {
+    const SLICE: std::time::Duration = std::time::Duration::from_millis(100);
+    let mut waited = std::time::Duration::ZERO;
+    while waited < delay {
+        if shutdown.load(Ordering::Relaxed) {
+            return true;
+        }
+        let step = SLICE.min(delay - waited);
+        sleep(step);
+        waited += step;
+    }
+    shutdown.load(Ordering::Relaxed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -386,12 +439,10 @@ fn respawn_agent_worker(
     #[cfg(not(test))]
     let _test_done: Option<()> = None;
     #[cfg(test)]
-    if test_done.is_none() {
-        std::thread::sleep(delay);
-    }
+    let shutdown_seen = test_done.is_none() && wait_out_backoff_or_shutdown(delay, shutdown);
     #[cfg(not(test))]
-    std::thread::sleep(delay);
-    if shutdown.load(Ordering::Relaxed) {
+    let shutdown_seen = wait_out_backoff_or_shutdown(delay, shutdown);
+    if shutdown_seen || shutdown.load(Ordering::Relaxed) {
         if let Some(token) = claim {
             agent::crash_disposition::owner_ledger().discard(token.key());
         }
@@ -589,26 +640,19 @@ fn respawn_agent_worker(
                     core.health.respawn_ok(is_alive);
                 }
             }
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            {
-                // #1530/F1: snapshot the writer + crash reason under the
-                // registry lock, then RELEASE it before the blocking PTY write.
-                let snap = {
-                    let r = reg.lock();
-                    respawned_id.and_then(|id| r.get(&id)).map(|handle| {
-                        let reason = handle.core.lock().health.crash_reason().to_string();
-                        (agent::InjectTarget::from_handle(handle), reason)
-                    })
-                };
-                if let Some((tgt, reason)) = snap {
-                    let msg = respawn_notice(&reason);
-                    let _ = agent::write_to_pty(&tgt.pty_writer, msg.as_bytes());
-                }
-            }
             let rdir = run_dir(home);
             let n = config.name.clone();
             let n_err = n.clone();
             let reg2 = Arc::clone(reg);
+            // Publish the per-agent TUI socket BEFORE the readiness wait below:
+            // this is the only publisher of `run/<pid>/<name>.port` on the respawn
+            // path, and until it runs that file still names the dead pre-crash
+            // listener, so nothing can attach. Gating it on readiness would leave a
+            // respawn that never reaches Idle unattachable for the whole wait budget
+            // — the moment an operator most needs the pane. `spawn_one` publishes in
+            // the same order. Nothing couples the two: the notice below writes
+            // through the registry handle's PTY, not this socket.
+            //
             // fire-and-forget: respawn-time TUI server exits when the agent
             // is removed from the registry (socket-file removal in
             // delete_transaction).
@@ -617,6 +661,72 @@ fn respawn_agent_worker(
                 .spawn(move || serve_agent_tui(&n, &rdir, &reg2))
             {
                 tracing::warn!(agent = %n_err, error = %e, "failed to spawn TUI server");
+            }
+            {
+                // #3462-v2: wait for the respawned prompt to actually accept input
+                // instead of guessing with a fixed sleep. The handle is already
+                // registered, so this reuses the existing bootstrap readiness
+                // waiter, bounded by this backend's own ready timeout plus the
+                // same bootstrap margin the spawn path uses. Every terminal
+                // outcome — timeout, disappearance, shutdown — yields None and is
+                // already logged there, so we simply never inject: no draft is
+                // written and no typed-inject contamination can latch.
+                let ready_timeout = std::time::Duration::from_secs(
+                    config
+                        .backend
+                        .map(|b| b.preset().ready_timeout_secs)
+                        .unwrap_or(30)
+                        .saturating_add(15),
+                );
+                let ready = respawned_id.and_then(|id| {
+                    agent::wait_for_respawn_inject_target(
+                        reg,
+                        id,
+                        &config.name,
+                        home,
+                        ready_timeout,
+                        Some(shutdown),
+                    )
+                });
+                // The waiter snapshots the target under the registry lock and
+                // releases it before returning (#1530/F1), so the inject below
+                // never runs with the registry held.
+                // #3462-v3/F1: a target snapshotted before shutdown is not
+                // permission to write after it. The waiter now fences its own
+                // settle, but the span from its return to the inject below —
+                // core lock, crash-reason read, notice format — is ours.
+                if let Some(tgt) = ready {
+                    let reason = tgt.core.lock().health.crash_reason().to_string();
+                    let msg = respawn_notice(&reason);
+                    if shutdown.load(Ordering::Relaxed) {
+                        tracing::info!(
+                            agent = %config.name,
+                            "shutdown after the readiness wait — not injecting the respawn notice"
+                        );
+                    } else {
+                        // #3462: go through the respawned handle's own injector so
+                        // inject_prefix / typed readback + contamination fence /
+                        // deleted-generation check / post-submit observation all apply.
+                        // NOT because the submit byte differs — every shipped preset
+                        // submits `\r`, so the hardcoded byte was identical. What the
+                        // direct write skipped is the PACING: payload and submit went
+                        // out as one fused buffer, so a composer that had not finished
+                        // accepting the text never consumed the submit.
+                        if let Err(e) = agent::inject_with_target_gated(
+                            &tgt,
+                            &config.name,
+                            msg.as_bytes(),
+                            true,
+                            None,
+                        ) {
+                            tracing::warn!(
+                                agent = %config.name,
+                                error = %e,
+                                "#3462: crash-respawn notice injection failed"
+                            );
+                        }
+                    }
+                }
             }
         }
         Err(e) => {
@@ -884,8 +994,8 @@ mod tests {
             "#3415: the production slice must include the notice call at the real write site"
         );
         assert!(
-            production.contains("write_to_pty"),
-            "#3415: the production slice must include the real PTY write site"
+            production.contains("inject_with_target_gated"),
+            "#3415/#3462: the production slice must include the real notice send site"
         );
         assert!(
             offenders.is_empty(),
@@ -950,6 +1060,386 @@ mod tests {
         assert!(
             !should_fire_terminal_p0(false, SelfOrchStatus::Yes, true),
             "#1744-H4 once-off: an already-paged terminal self-orch must not re-page"
+        );
+    }
+
+    // ── #3462 backend-aware respawn-notice submit ──────────────────────────
+    //
+    // Appending a hardcoded `\r` and writing straight to the PTY bypasses
+    // everything the respawned handle knows about its backend: `inject_prefix`,
+    // `submit_key`, the typed readback/contamination fence, the deleted-generation
+    // check and post-submit observability. Codex 0.150.1 showed the whole notice
+    // sitting unsent in the composer under [DISCONNECTED] — payload landed,
+    // submit did not.
+
+    /// The notice is PAYLOAD ONLY. A submit byte baked into the text is the same
+    /// bug wearing a different hat: it submits with a key the handle never chose.
+    #[test]
+    fn respawn_notice_carries_no_hardcoded_submit_byte_3462() {
+        let notice = super::respawn_notice("a test reason");
+        assert!(
+            !notice.contains('\r') && !notice.contains('\n'),
+            "#3462: the notice must be payload text only, got {notice:?}"
+        );
+    }
+
+    struct CapturingWriter(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Submit proof with a NON-CR submit key: the bytes reaching the PTY must be
+    /// the notice followed by the HANDLE's key. A hardcoded `\r` in the payload
+    /// cannot masquerade as this, which is exactly the point.
+    #[test]
+    fn respawn_notice_submits_with_the_handles_submit_key_3462() {
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let writer: crate::agent::PtyWriter = std::sync::Arc::new(parking_lot::Mutex::new(
+            Box::new(CapturingWriter(std::sync::Arc::clone(&seen))),
+        ));
+        let core =
+            std::sync::Arc::new(crate::sync_audit::CoreMutex::new(crate::agent::AgentCore {
+                vterm: crate::vterm::VTerm::with_pty_writer(80, 24, std::sync::Arc::clone(&writer)),
+                subscribers: Vec::new(),
+                state: crate::state::StateTracker::new(None),
+                health: crate::health::HealthTracker::new(),
+                api_activity: crate::agent::ApiActivity::default(),
+                observed_status: None,
+            }));
+        let target = crate::agent::InjectTarget {
+            instance_id: crate::types::InstanceId::default(),
+            name: "respawn-submit-test".to_string(),
+            generation: crate::agent::crash_disposition::SpawnGeneration::default(),
+            pty_writer: std::sync::Arc::clone(&writer),
+            inject_prefix: String::new(),
+            // Deliberately NOT "\r" — a CR baked into the payload cannot pass this.
+            submit_key: "\u{4}".to_string(),
+            typed_inject: false,
+            typed_inject_contaminated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
+            deleted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            core,
+        };
+
+        let notice = super::respawn_notice("a test reason");
+        crate::agent::inject_with_target_gated(
+            &target,
+            "respawn-submit-test",
+            notice.as_bytes(),
+            true,
+            None,
+        )
+        .expect("#3462: the respawn notice must inject cleanly");
+
+        let written = String::from_utf8_lossy(&seen.lock()).to_string();
+        assert!(
+            written.contains("a test reason"),
+            "#3462: the notice payload must reach the PTY: {written:?}"
+        );
+        assert!(
+            written.ends_with('\u{4}'),
+            "#3462: submit must be the HANDLE's submit_key, not a hardcoded CR: {written:?}"
+        );
+        assert!(
+            !written.contains('\r'),
+            "#3462: no hardcoded CR may reach the PTY: {written:?}"
+        );
+    }
+
+    /// #3462-v2: a fixed 2s sleep is not readiness. It races a slow backend —
+    /// the notice lands in a composer that is not accepting input yet — and it
+    /// wastes 2s on a fast one. The respawned handle is already registered, so
+    /// the existing raw-prompt Idle/bootstrap waiter is the right authority,
+    /// bounded by the backend preset ready timeout.
+    #[test]
+    fn respawn_notice_waits_for_prompt_readiness_not_a_fixed_sleep_3462() {
+        let production = production_source(include_str!("crash_respawn.rs"));
+        assert!(
+            !production.contains("from_secs(2)"),
+            "#3462-v2: the fixed 2s pre-injection sleep must be gone"
+        );
+        assert!(
+            production.contains("wait_for_respawn_inject_target"),
+            "#3462-v2: the notice must wait on real prompt readiness before injecting"
+        );
+    }
+
+    /// #3462-v2: the first cut justified the fix with a FALSE mechanism — that
+    /// the backend does not submit on CR. Every shipped preset submits `\r`
+    /// (`backend.rs` pins `submit_key == "\r"` for all of them), so the
+    /// hardcoded byte and the handle's key were identical. The real value is
+    /// paced payload, a SEPARATE submit write, and the readback/fences/
+    /// observation the direct write skipped. A comment that misstates the cause
+    /// teaches the next reader the wrong lesson.
+    #[test]
+    fn respawn_notice_comment_states_the_real_mechanism_3462() {
+        let production = production_source(include_str!("crash_respawn.rs")).to_lowercase();
+        assert!(
+            !production.contains("does not submit on cr"),
+            "#3462-v2: the CR causal claim is false — every preset submits CR"
+        );
+    }
+
+    /// R1 of the c7accc1a review: publishing the respawned agent's TUI socket must
+    /// NOT sit behind the readiness wait. `serve_agent_tui` is the only publisher of
+    /// `run/<pid>/<name>.port` on the respawn path, so while the wait runs the port
+    /// file still names the dead pre-crash listener and nothing can attach — for the
+    /// whole `ready_timeout + 15s` budget in exactly the case that matters, a
+    /// respawned prompt that never reaches Idle. `spawn_one` already publishes first
+    /// and leaves readiness waiting off the critical path.
+    ///
+    /// Scoped to `respawn_agent_worker`'s body, like the #3414 guard: a file-level
+    /// scan is vacuous here because `serve_agent_tui` also appears in this module's
+    /// `use super::{...}` import, which precedes everything.
+    #[test]
+    fn respawn_publishes_tui_socket_before_the_readiness_wait_3462() {
+        let source = include_str!("crash_respawn.rs");
+        let start = source
+            .find("fn respawn_agent_worker(")
+            .expect("respawn worker present");
+        let rest = &source[start..];
+        let cfg_test = ["\n#[cfg(", "test)]"].concat();
+        let end = ["\nfn ", "\nmod ", &cfg_test]
+            .iter()
+            .filter_map(|marker| rest[1..].find(*marker).map(|offset| offset + 1))
+            .min()
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        let publish = body
+            .find("serve_agent_tui(")
+            .expect("the respawn worker must start the per-agent TUI server");
+        let wait = body
+            .find("wait_for_respawn_inject_target(")
+            .expect("the respawn worker must wait for readiness before injecting");
+        assert!(
+            publish < wait,
+            "#3462-v2 R1: the TUI socket must be published BEFORE the readiness wait — \
+             otherwise a respawn that never reaches Idle stays unattachable for the \
+             whole ready_timeout + 15s budget"
+        );
+        // Naming `serve_agent_tui` earlier is not publication: binding the closure
+        // above the wait and calling `.spawn` below it would satisfy the assertion
+        // above while the socket still appears only after readiness. Pin the spawn
+        // CALL. The worker body has exactly one thread spawn — the TUI server's —
+        // so the count keeps this unambiguous instead of pinning the wrong one.
+        assert_eq!(
+            body.matches(".spawn(").count(),
+            1,
+            "the respawn worker must contain exactly one thread spawn (the TUI server); \
+             a second one makes the ordering assertion below ambiguous"
+        );
+        let spawn_call = body.find(".spawn(").expect("counted exactly one above");
+        assert!(
+            spawn_call < wait,
+            "#3462-v2 R1: the .spawn() that starts the TUI server must itself run before \
+             the readiness wait, not merely be mentioned before it"
+        );
+    }
+
+    /// Body of `respawn_agent_worker`, scoped exactly like the #3414 and R1
+    /// guards above. A file-level scan is vacuous for these: the module imports
+    /// and this test module already mention every symbol they look for.
+    fn respawn_worker_body(source: &str) -> &str {
+        let start = source
+            .find("fn respawn_agent_worker(")
+            .expect("respawn worker present");
+        let rest = &source[start..];
+        let cfg_test = ["\n#[cfg(", "test)]"].concat();
+        let end = ["\nfn ", "\nmod ", &cfg_test]
+            .iter()
+            .filter_map(|marker| rest[1..].find(*marker).map(|offset| offset + 1))
+            .min()
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// #3462-v3 RED-B: the waiter returning `Some(target)` is not authority to
+    /// write. Between that return and `inject_with_target_gated` the worker locks
+    /// the core, reads the crash reason and formats the notice, and never looks at
+    /// `shutdown` again — so a shutdown landing in that span still puts the notice
+    /// into the PTY of an agent the daemon is tearing down.
+    ///
+    /// That span has no runtime seam: nothing can observe the instant between the
+    /// waiter's return and the inject without adding one, and this correction is
+    /// explicitly refactor-free. So it is pinned structurally, in the same
+    /// body-scoped style as the R1 ordering guard, and
+    /// `red_b_guard_kills_missing_fence_mutation_3462` proves the scan is not
+    /// vacuous.
+    #[test]
+    fn respawn_notice_is_fenced_by_a_final_shutdown_check_3462() {
+        let body = respawn_worker_body(include_str!("crash_respawn.rs"));
+        let wait = body
+            .find("wait_for_respawn_inject_target(")
+            .expect("the respawn worker must wait for readiness");
+        let inject = body
+            .find("inject_with_target_gated(")
+            .expect("the respawn worker must inject through the gated injector");
+        assert!(wait < inject, "the readiness wait must precede the inject");
+        let final_fence = body[..inject]
+            .rfind("shutdown.load(")
+            .expect("a final shutdown fence must precede the inject");
+        let reason_read = body[..inject]
+            .rfind("tgt.core.lock()")
+            .expect("the crash reason must be read before the inject");
+        let notice_format = body[..inject]
+            .rfind("respawn_notice(")
+            .expect("the respawn notice must be formatted before the inject");
+        assert!(
+            wait < final_fence && reason_read < final_fence && notice_format < final_fence,
+            "#3462-v3 F1/B: a final shutdown check must stand between the readiness \
+             work (including crash-reason read and notice formatting) and the gated \
+             inject — a target snapshotted before shutdown is not permission to write \
+             after it"
+        );
+    }
+
+    /// Non-vacuity control for the guard above: run the SAME scan against a body
+    /// with no fence and require it to find nothing. Without this, a scan that
+    /// could never fail would read as proof.
+    #[test]
+    fn red_b_guard_kills_missing_fence_mutation_3462() {
+        let mutated = r#"
+fn respawn_agent_worker(shutdown: &AtomicBool) {
+    let ready = wait_for_respawn_inject_target(reg, id, name, home, t, Some(shutdown));
+    if let Some(tgt) = ready {
+        let msg = respawn_notice("reason");
+        let _ = inject_with_target_gated(&tgt, name, msg.as_bytes(), true, None);
+    }
+}
+"#;
+        let body = respawn_worker_body(mutated);
+        let wait = body
+            .find("wait_for_respawn_inject_target(")
+            .expect("mutant keeps the wait call");
+        let inject = body
+            .find("inject_with_target_gated(")
+            .expect("mutant keeps the inject call");
+        assert!(
+            !body[wait..inject].contains("shutdown.load("),
+            "the between-calls scan must find NO fence in an unfenced body; if it \
+             does, the guard above proves nothing"
+        );
+    }
+
+    /// #3462-v3 RED-C: the backoff is a bare `std::thread::sleep(delay)` with
+    /// `shutdown` read only AFTER it.
+    ///
+    /// `ctx.shutdown` is not a monotonic death latch. `daemon/mod.rs` stores
+    /// `false` back into it on the self-respawn abort path and on the
+    /// recover-as-primary path, and the latter then re-spawns the fleet and keeps
+    /// serving. A worker already asleep for the whole backoff — up to `BACKOFF_MAX`
+    /// (300s), 80s within one default retry budget — sleeps through that entire
+    /// true-window and wakes to a flag that has been reset, so it proceeds to spawn
+    /// a replacement for an agent the daemon has already re-created.
+    ///
+    /// Sampling after a blocking wait cannot see an edge that opened and closed
+    /// during it. The wait itself has to observe it, which is why a truthful
+    /// comment is not an equivalent fix here.
+    #[test]
+    fn respawn_backoff_observes_shutdown_instead_of_sampling_after_it_3462() {
+        let body = respawn_worker_body(include_str!("crash_respawn.rs"));
+        assert!(
+            !body.contains("std::thread::sleep(delay)"),
+            "#3462-v3 F2: the bare uninterruptible backoff sleep must be gone — it \
+             cannot observe a shutdown edge that closes before it wakes"
+        );
+        assert!(
+            body.contains("wait_out_backoff_or_shutdown("),
+            "#3462-v3 F2: the backoff must run through a wait that observes the \
+             shutdown flag while it waits"
+        );
+    }
+
+    /// #3462-v3 RED-C, behavioural half: the wait must see a shutdown window
+    /// WIDER THAN ONE SLICE, which is exactly what `sleep(delay)` + one `load`
+    /// cannot do.
+    ///
+    /// Scope of the claim, stated so it is not read as more: this proves bounded
+    /// sampling, not edge latching. A window that opens and closes inside a single
+    /// slice is missed by construction and this test does not pretend otherwise.
+    ///
+    /// The injected sleep models the real shape: the flag goes up when the wait
+    /// starts and comes back down only for a caller that slept longer than the
+    /// window. The 1s threshold below is not arbitrary — it is
+    /// `self_respawn_settle()`'s default (`daemon/mod.rs:245-249`), the sleep the
+    /// recover-as-primary path holds shutdown true across before storing `false`.
+    /// So the modelled window is the narrowest one this code actually faces.
+    ///
+    /// Non-vacuity was verified by mutation, not assumed: degrading the helper to
+    /// `sleep(delay); load()` makes this test fail. An earlier fixture survived
+    /// that mutation and was replaced.
+    #[test]
+    fn backoff_wait_sees_a_shutdown_window_wider_than_one_slice_3462() {
+        use std::cell::Cell;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let shutdown = AtomicBool::new(false);
+        let slices = Cell::new(0u32);
+        let mut sleep = |step: std::time::Duration| {
+            slices.set(slices.get() + 1);
+            shutdown.store(true, Ordering::Relaxed);
+            if step >= std::time::Duration::from_secs(1) {
+                // The caller chose to sleep longer than the window is open, so it
+                // is asleep for the whole of it and wakes to the reset value.
+                shutdown.store(false, Ordering::Relaxed);
+            }
+        };
+
+        let observed = super::wait_out_backoff_or_shutdown_with_sleep(
+            std::time::Duration::from_secs(300),
+            &shutdown,
+            &mut sleep,
+        );
+
+        assert!(
+            observed,
+            "#3462-v3 F2: a shutdown window at least one slice wide must be sampled \
+             during the backoff — reading the flag afterwards reads the reset"
+        );
+        assert_eq!(
+            slices.get(),
+            1,
+            "the wait must return on the first slice that sees it, not after the \
+             full 300s backoff"
+        );
+    }
+
+    /// The spawn-site rationale asserts that "both the backoff and that wait
+    /// observe the shutdown flag". While the backoff is a bare sleep that sentence
+    /// is simply false. This stack has already been rejected once over a false
+    /// causal claim in a comment; a second one in the same file would be the same
+    /// defect twice.
+    #[test]
+    fn respawn_spawn_rationale_does_not_overclaim_the_backoff_3462() {
+        let production = production_source(include_str!("crash_respawn.rs"));
+        assert!(
+            !production.contains("both the backoff and that wait observe"),
+            "#3462-v3: the spawn rationale must describe what the backoff actually \
+             does, not claim an observation it did not perform"
+        );
+    }
+
+    /// Structural: the notice must leave through the backend-aware injector,
+    /// never a direct PTY write. A future edit reinstating `write_to_pty` here
+    /// silently reinstates the whole bypass.
+    #[test]
+    fn respawn_notice_uses_backend_aware_injection_not_direct_pty_write_3462() {
+        let production = production_source(include_str!("crash_respawn.rs"));
+        assert!(
+            production.contains("inject_with_target_gated"),
+            "#3462: the notice must be sent through the backend-aware injector"
+        );
+        assert!(
+            !production.contains("write_to_pty"),
+            "#3462: the respawn notice must not be written directly to the PTY"
         );
     }
 }
