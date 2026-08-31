@@ -49,6 +49,7 @@ pub(crate) enum DispositionOutcome {
 /// `agent` is used by the `Release` arm; `candidate` by the `Archive` arm;
 /// `delete` by the `Delete` arm — each arm reads only what it needs, so a caller
 /// that never reaches an arm passes an inert value (`""` / `None` / `|| Ok(())`).
+#[allow(dead_code)] // Compatibility wrapper for direct unit/test callers.
 pub(crate) fn dispose(
     home: &Path,
     disposition: Disposition,
@@ -56,24 +57,96 @@ pub(crate) fn dispose(
     candidate: Option<&GcCandidate>,
     delete: impl FnOnce() -> Result<(), String>,
 ) -> DispositionOutcome {
+    if matches!(disposition, Disposition::Keep) {
+        return DispositionOutcome::Kept;
+    }
+    if matches!(disposition, Disposition::Archive) && candidate.is_none() {
+        tracing::error!(
+            agent,
+            "janitor::dispose: Archive disposition without a GcCandidate — \
+             keeping (fail-closed); this is a caller bug"
+        );
+        return DispositionOutcome::Kept;
+    }
+    let permit_agent = candidate.map(|c| c.agent.as_str()).unwrap_or(agent);
+    let permit = match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        home,
+        permit_agent,
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+    ) {
+        Ok(permit) => permit,
+        Err(error) => {
+            return match disposition {
+                Disposition::Release => DispositionOutcome::Released(ReleaseOutcome {
+                    error: Some(format!("release refused: {error}")),
+                    ..ReleaseOutcome::default()
+                }),
+                Disposition::Delete => {
+                    DispositionOutcome::Deleted(Err(format!("delete refused: {error}")))
+                }
+                Disposition::Archive => DispositionOutcome::Archived(
+                    crate::daemon::retention::worktrees::RemovalOutcome::Skipped {
+                        reason: format!("archive refused: {error}"),
+                    },
+                ),
+                Disposition::Keep => unreachable!("Keep returned before permit acquisition"),
+            };
+        }
+    };
+    dispose_with_permit(home, disposition, agent, candidate, delete, &permit)
+}
+
+/// Execute a disposition while the caller holds the per-agent lifecycle
+/// permit. This is the shared route for cleanup actors that must keep the
+/// authority through every preflight and mutation.
+pub(crate) fn dispose_with_permit(
+    home: &Path,
+    disposition: Disposition,
+    agent: &str,
+    candidate: Option<&GcCandidate>,
+    delete: impl FnOnce() -> Result<(), String>,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+) -> DispositionOutcome {
     match disposition {
         Disposition::Keep => DispositionOutcome::Kept,
         // Binding present + terminal → the full managed release (WIP-preserve →
         // remove → unbind → branch cleanup; fail-closed on unpreservable WIP,
         // #2672). Shared verbatim.
         Disposition::Release => {
-            DispositionOutcome::Released(crate::worktree_pool::release_full(home, agent, false))
+            if !permit.authorizes(home, agent) {
+                return DispositionOutcome::Released(ReleaseOutcome {
+                    error: Some("release refused: invalid lifecycle permit".to_string()),
+                    ..ReleaseOutcome::default()
+                });
+            }
+            DispositionOutcome::Released(crate::worktree_pool::release_full_with_permit(
+                home, agent, false, permit,
+            ))
         }
         // No binding, confirmed-clean terminal → the caller's dir-remover. The
         // wrapper choice stays with the caller (D5-Q3 ruling B).
-        Disposition::Delete => DispositionOutcome::Deleted(delete()),
+        Disposition::Delete => {
+            if !permit.authorizes(home, agent) {
+                return DispositionOutcome::Deleted(Err(
+                    "delete refused: invalid lifecycle permit".to_string(),
+                ));
+            }
+            DispositionOutcome::Deleted(delete())
+        }
         // Reclaim-worthy but untrustworthy git state → atomic `.trash` archive.
         // Shared verbatim. Only the GC tier produces `Archive`, and it always
         // carries its candidate; a missing candidate is a caller bug → fail toward
         // NOT destroying (keep + LOUD), never archive a phantom.
         Disposition::Archive => match candidate {
+            Some(c) if !permit.authorizes(home, &c.agent) => DispositionOutcome::Archived(
+                crate::daemon::retention::worktrees::RemovalOutcome::Skipped {
+                    reason: "archive refused: invalid lifecycle permit".to_string(),
+                },
+            ),
             Some(c) => DispositionOutcome::Archived(
-                crate::daemon::retention::worktrees::maybe_remove_candidate(home, c),
+                crate::daemon::retention::worktrees::maybe_remove_candidate_with_permit(
+                    home, c, permit,
+                ),
             ),
             None => {
                 tracing::error!(
@@ -112,6 +185,10 @@ mod tests {
     // signals)" is locked by the GC/sweep/auto caller pins staying green through
     // the D5 refactor; these lock the switch's internal routing directly. The
     // Keep/Delete/Archive-None arms exercised here perform no I/O, so `home` is inert.
+    // The Delete arm acquires the per-agent lifecycle permit, whose identity is
+    // `(home, agent)`. `inert_home()` is shared, so every Delete-arm test here
+    // MUST pass a distinct agent name or the two would contend under the default
+    // thread-parallel harness and one would fail closed on the other's permit.
     fn inert_home() -> std::path::PathBuf {
         std::path::PathBuf::from("/nonexistent-d5-janitor-test")
     }
@@ -119,10 +196,16 @@ mod tests {
     #[test]
     fn dispose_delete_runs_only_the_caller_remover() {
         let called = Cell::new(false);
-        let out = dispose(&inert_home(), Disposition::Delete, "", None, || {
-            called.set(true);
-            Ok(())
-        });
+        let out = dispose(
+            &inert_home(),
+            Disposition::Delete,
+            "janitor-delete-runs-remover",
+            None,
+            || {
+                called.set(true);
+                Ok(())
+            },
+        );
         assert!(called.get(), "Delete must invoke the caller's remover");
         assert!(matches!(out, DispositionOutcome::Deleted(Ok(()))));
     }
@@ -130,9 +213,13 @@ mod tests {
     #[test]
     fn dispose_delete_forwards_remover_error_verbatim() {
         // GC's #2550 archive-fallthrough keys on this exact reason string.
-        let out = dispose(&inert_home(), Disposition::Delete, "", None, || {
-            Err("git worktree remove failed: boom".to_string())
-        });
+        let out = dispose(
+            &inert_home(),
+            Disposition::Delete,
+            "janitor-delete-forwards-err",
+            None,
+            || Err("git worktree remove failed: boom".to_string()),
+        );
         match out {
             DispositionOutcome::Deleted(Err(reason)) => {
                 assert_eq!(reason, "git worktree remove failed: boom");
@@ -170,5 +257,33 @@ mod tests {
             matches!(out, DispositionOutcome::Kept),
             "Archive without a candidate → fail-closed Keep"
         );
+    }
+
+    #[test]
+    fn dispose_delete_refuses_when_lifecycle_permit_is_already_held() {
+        let home =
+            std::env::temp_dir().join(format!("agend-janitor-permit-{}", std::process::id()));
+        let permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+            &home,
+            "janitor-agent",
+            crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+        )
+        .expect("test permit");
+        let called = Cell::new(false);
+        let out = dispose(&home, Disposition::Delete, "janitor-agent", None, || {
+            called.set(true);
+            Ok(())
+        });
+        assert!(
+            !called.get(),
+            "a contended lifecycle transaction must not delete"
+        );
+        match out {
+            DispositionOutcome::Deleted(Err(reason)) => {
+                assert!(reason.contains("lifecycle transaction already in flight"));
+            }
+            _ => panic!("contended janitor delete must fail closed"),
+        }
+        drop(permit);
     }
 }
