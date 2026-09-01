@@ -230,4 +230,120 @@ mod tests {
             "no sleep when shutdown already set — observed {elapsed:?}"
         );
     }
+
+    #[test]
+    fn maintenance_tick_driver_delays_first_tick() {
+        let (driver, tick_rx) = MaintenanceTickDriver::spawn(
+            "test_maintenance_tick_delayed",
+            Duration::from_millis(40),
+        );
+
+        assert_eq!(
+            tick_rx.recv_timeout(Duration::from_millis(5)),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout),
+            "the first maintenance tick must wait for the configured interval"
+        );
+        assert_eq!(
+            tick_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(()),
+            "the delayed maintenance tick must eventually arrive"
+        );
+        drop(driver);
+    }
+
+    #[test]
+    fn maintenance_tick_driver_coalesces_full_queue_without_blocking() {
+        let (driver, tick_rx) = MaintenanceTickDriver::spawn(
+            "test_maintenance_tick_coalesce",
+            Duration::from_millis(2),
+        );
+        tick_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first maintenance tick");
+        // Model a slow handler by leaving the bounded receiver untouched while
+        // several producer intervals elapse.
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(
+            tick_rx.try_iter().count() <= 1,
+            "a full bounded queue must coalesce ticks instead of growing"
+        );
+
+        // If the producer were blocked in send, dropping it could not join
+        // promptly while the receiver remains full.
+        let started = Instant::now();
+        drop(driver);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a full tick queue must not prevent prompt stop/join"
+        );
+    }
+
+    #[test]
+    fn maintenance_tick_driver_exits_when_tick_receiver_disconnects() {
+        let (driver, tick_rx) = MaintenanceTickDriver::spawn(
+            "test_maintenance_tick_disconnect",
+            Duration::from_millis(2),
+        );
+        drop(tick_rx);
+
+        for _ in 0..50 {
+            if driver
+                .handle
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            driver
+                .handle
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished),
+            "a disconnected tick receiver must stop the producer"
+        );
+        drop(driver);
+    }
+
+    #[test]
+    fn maintenance_tick_driver_drop_stops_and_joins_promptly() {
+        let (driver, tick_rx) = MaintenanceTickDriver::spawn(
+            "test_maintenance_tick_stop",
+            Duration::from_secs(30),
+        );
+        let started = Instant::now();
+
+        drop(driver);
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "drop must wake recv_timeout and join promptly"
+        );
+        assert_eq!(
+            tick_rx.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected),
+            "the joined producer must close its tick sender"
+        );
+    }
+
+    #[test]
+    fn maintenance_tick_driver_emits_no_tick_after_drop() {
+        let (driver, tick_rx) = MaintenanceTickDriver::spawn(
+            "test_maintenance_tick_no_post_drop",
+            Duration::from_millis(2),
+        );
+        tick_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first maintenance tick");
+        while tick_rx.try_recv().is_ok() {}
+
+        drop(driver);
+
+        assert_eq!(
+            tick_rx.recv_timeout(Duration::from_millis(50)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected),
+            "driver drop must not leave a producer that emits post-drop ticks"
+        );
+    }
 }
