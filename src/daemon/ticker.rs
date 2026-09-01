@@ -143,8 +143,8 @@ impl MaintenanceTickDriver {
     pub(crate) fn spawn(name: &'static str, interval: Duration) -> (Self, Receiver<()>) {
         let (tick_tx, tick_rx) = crossbeam_channel::bounded(1);
         let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
-        // The handle is retained in `Self`; its Drop implementation signals
-        // the worker before joining it, so this is not a detached thread.
+        // fire-and-forget: false — `Self` retains the handle, and Drop signals
+        // the worker before joining it, so this thread cannot outlive the driver.
         let handle = thread::Builder::new()
             .name(name.into())
             .spawn(move || run_maintenance_tick_driver(tick_tx, stop_rx, interval))
