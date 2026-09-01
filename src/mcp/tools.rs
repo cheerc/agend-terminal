@@ -411,7 +411,7 @@ pub(crate) fn def_repo() -> Value {
             "expected_head": {"type": "string", "description": "#6: optional exact full-SHA precondition. When provided, the branch HEAD must equal this value; mismatch returns structured error with zero mutation. Omitted preserves current behavior."},
             "checkout_purpose": {"type": "string", "enum": ["disposable_review"], "description": "Architecture-14 item 10: typed daemon-provisioned disposable review checkout. Requires bind=true, task_id, expected_head, and a newly-created branch."},
             "task_id": {"type": "string", "description": "#2533: checkout bind:true — optional task board id this self-claim is attributable to. Recorded in binding.json; a task_id-carrying self-claim is treated as in-dispatch (no `binding_out_of_dispatch` operator warning). merge — optional explicit task-board id ('t-...') passed straight through to the post-merge receipt/watch so the actionable assignee is resolved from the task itself (zero binding scan); absent → legacy live-binding resolve. Absent → unattributed bind, existing warning behavior unchanged."},
-            "force": {"type": "boolean", "description": "#2539: merge — emergency bypass for the CI fail-closed gate and the base-staleness (BEHIND/DIRTY) refusal. Requires non-empty `force_reason`; the bypass is audit-logged to fleet_events.jsonl. release — required when `discard_nested_dirt=true` (confirms destructive intent)."},
+            "force": {"type": "boolean", "description": "#2539/#3454: merge — emergency bypass for THREE policy gates: the CI fail-closed gate, the base-staleness (BEHIND/DIRTY) refusal, AND the exact-head review threshold (#3454 made review a hard merge precondition; force is its sole audited bypass — forcing for any one reason drops all three). Exact head/base acquisition and the pre-merge identity recheck remain non-bypassable. Requires non-empty `force_reason`; the bypass is audit-logged to fleet_events.jsonl including the review evidence (review_class, verified counts, reviewer identities). release — required when `discard_nested_dirt=true` (confirms destructive intent)."},
             "force_reason": {"type": "string", "description": "#2539: merge — required non-empty justification when `force=true`, recorded in the fleet_events.jsonl audit entry."},
             "discard_nested_dirt": {"type": "boolean", "description": "release: authorize discarding unpreservable nested-submodule working-tree dirt. Requires `force=true` and a matching `expected_nested_dirt_digest` (confirmation round-trip). The digest is returned in the refusal response when nested dirt blocks a release."},
             "expected_nested_dirt_digest": {"type": "string", "description": "release: exact hex digest of the nested-dirt enumeration, as returned by a prior refusal's `nested_dirt_digest` field. Guards against TOCTOU: the daemon re-enumerates under locks and refuses if the digest changed."}
@@ -1513,6 +1513,41 @@ mod tests {
                 .as_str()
                 .is_some_and(|s| s.contains("discard")),
             "audit_reason description must reference discard use"
+        );
+    }
+
+    /// #3466: since #3454 made the exact-head review threshold a hard merge
+    /// precondition with `force=true` as its sole audited bypass, the
+    /// caller-facing `force` description must enumerate all THREE bypassed
+    /// policy gates and name the two identity gates that stay non-bypassable —
+    /// the live tool description is the first authority layer an agent reads.
+    #[test]
+    fn repo_force_description_enumerates_review_threshold_bypass_3466() {
+        let d = def_repo();
+        let desc = d["inputSchema"]["properties"]["force"]["description"]
+            .as_str()
+            .expect("repo force description");
+        // The three bypassed policy gates.
+        assert!(
+            desc.contains("CI fail-closed"),
+            "force description must name the CI fail-closed gate bypass"
+        );
+        assert!(
+            desc.contains("base-staleness (BEHIND/DIRTY)"),
+            "force description must name the base-staleness (BEHIND/DIRTY) bypass"
+        );
+        assert!(
+            desc.contains("exact-head review threshold"),
+            "force description must name the exact-head review-threshold bypass (#3454)"
+        );
+        // The two non-bypassable identity gates.
+        assert!(
+            desc.contains("head/base acquisition"),
+            "force description must say exact head/base acquisition is non-bypassable"
+        );
+        assert!(
+            desc.contains("pre-merge identity recheck"),
+            "force description must say the pre-merge identity recheck is non-bypassable"
         );
     }
 
