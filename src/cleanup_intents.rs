@@ -1,5 +1,10 @@
 use std::path::{Path, PathBuf};
 
+mod owner_attestation;
+#[cfg(test)]
+use owner_attestation::KEEP_TTL_DAYS;
+use owner_attestation::{retention_obligations, settle_by_owner_attestation};
+
 fn intents_dir(home: &Path) -> PathBuf {
     home.join("cleanup-intents")
 }
@@ -283,6 +288,13 @@ pub(crate) fn settle_by_scm_slug(
 /// original CI watch was removed before settlement succeeded.
 pub(crate) fn sweep_settle_merged(home: &Path) {
     let dir = intents_dir(home);
+    let now = chrono::Utc::now();
+    // Projecting the board clones every row, and a fleet board runs to
+    // thousands of them against hundreds of intents — so the obligations are
+    // read at most once per tick, and only if an intent actually reaches the
+    // seam where merge evidence is absent.
+    let obligations: std::cell::OnceCell<Vec<crate::task_events::TaskRecord>> =
+        std::cell::OnceCell::new();
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -310,6 +322,14 @@ pub(crate) fn sweep_settle_merged(home: &Path) {
         let observed_pr =
             crate::branch_sweep::merged_pr_number(repo_path, &default, &intent.branch);
         let Some(pr_num) = observed_pr else {
+            // No merge evidence exists for this branch — the seam where the
+            // merge ledger gives up. Ask the owner's recorded answer instead.
+            settle_by_owner_attestation(
+                home,
+                &intent,
+                now,
+                obligations.get_or_init(|| retention_obligations(home)),
+            );
             continue;
         };
         match settle_intent(home, &intent.repo, &intent.branch, true, Some(pr_num)) {
@@ -1778,6 +1798,572 @@ mod tests {
         assert!(
             source.contains("reconcile_merged_subject_tasks"),
             "worktree_cleanup.rs must replay missed merged-task auto-close"
+        );
+    }
+
+    // ── t-20260901084057482124-43938-5 B3/B4 (d-20260901132326253721-16):
+    //    the owner's answer as the SECOND settlement authority ───────────
+
+    fn obligation_id(tag: &str) -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        format!(
+            "t-retention-{}-{}-{}",
+            std::process::id(),
+            tag,
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn seed_obligation(
+        home: &Path,
+        repo: &str,
+        branch: &str,
+        head: &str,
+        owner: Option<&str>,
+    ) -> String {
+        use crate::task_events::{InstanceName, TaskEvent, TaskId};
+        let id = obligation_id("seed");
+        crate::task_events::append(
+            home,
+            &InstanceName::from("test"),
+            TaskEvent::Created {
+                task_id: TaskId(id.clone()),
+                title: format!("branch-retention: confirm '{branch}' is still needed"),
+                description: format!("repo: {repo}\nbranch: {branch}\nhead: {head}"),
+                priority: "normal".into(),
+                tags: vec![
+                    crate::worktree_pool::RETENTION_TAG.to_string(),
+                    crate::worktree_pool::retention_key(repo, branch, head),
+                ],
+                owner: owner.map(|o| InstanceName(o.to_string())),
+                due_at: Some((chrono::Utc::now() + chrono::Duration::days(14)).to_rfc3339()),
+                depends_on: Vec::new(),
+                parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
+                branch: None,
+                routed_to: None,
+                bind: None,
+                eta_secs: None,
+            },
+        )
+        .expect("seed obligation");
+        id
+    }
+
+    /// The exact shape `task action=done result=…` produces: an
+    /// `OperatorManual` done source carrying the owner's answer.
+    fn answer(home: &Path, task_id: &str, by: &str, result: &str) {
+        use crate::task_events::{DoneSource, InstanceName, TaskEvent, TaskId};
+        crate::task_events::append(
+            home,
+            &InstanceName::from(by),
+            TaskEvent::Done {
+                task_id: TaskId(task_id.to_string()),
+                by: InstanceName::from(by),
+                source: DoneSource::OperatorManual {
+                    authored_at: chrono::Utc::now().to_rfc3339(),
+                    result: Some(result.to_string()),
+                },
+            },
+        )
+        .expect("answer obligation");
+    }
+
+    fn obligation(home: &Path, task_id: &str) -> crate::task_events::TaskRecord {
+        let board = crate::task_events::board_root(home, crate::task_events::DEFAULT_PROJECT);
+        crate::task_events::projected_state_at(&board)
+            .expect("board state")
+            .tasks
+            .get(&crate::task_events::TaskId(task_id.to_string()))
+            .expect("obligation present")
+            .clone()
+    }
+
+    fn retention_row_count(home: &Path) -> usize {
+        let board = crate::task_events::board_root(home, crate::task_events::DEFAULT_PROJECT);
+        crate::task_events::projected_state_at(&board)
+            .expect("board state")
+            .tasks
+            .values()
+            .filter(|t| {
+                t.tags
+                    .iter()
+                    .any(|tag| tag == crate::worktree_pool::RETENTION_TAG)
+            })
+            .count()
+    }
+
+    fn intent_of(repo: &Path, branch: &str, head: &str, task_id: &str) -> CleanupIntent {
+        CleanupIntent {
+            repo: repo.display().to_string(),
+            branch: branch.to_string(),
+            expected_head: head.to_string(),
+            task_id: task_id.to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            scm_slug: None,
+            pr_number: None,
+        }
+    }
+
+    fn recovery_refs(repo: &Path, branch: &str) -> Vec<(String, String)> {
+        let safe: String = branch
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let pattern = format!("refs/agend/recovery/branch/{safe}");
+        crate::git_helpers::git_cmd(
+            repo,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                &pattern,
+            ],
+        )
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .map(|(r, o)| (r.to_string(), o.to_string()))
+        .collect()
+    }
+
+    /// The whole point: a branch no merge can ever settle is reaped once its
+    /// accountable owner says so — through the same expected-head CAS and
+    /// archive-before-delete the merge path uses.
+    #[test]
+    fn owner_attested_delete_reaps_the_branch_with_an_archive_and_a_head_cas() {
+        let home = tmp_dir("attest-delete");
+        let repo = tmp_repo("attest-delete-repo");
+        let branch = "feat/attested-delete";
+        let tip = make_branch(&repo, branch);
+        let rs = repo.display().to_string();
+        persist_intent(&home, &rs, branch, &tip, "t-origin", None, None).expect("persist");
+        let id = seed_obligation(&home, &rs, branch, &tip, Some("agent-owner"));
+        answer(
+            &home,
+            &id,
+            "agent-owner",
+            "delete: superseded, nothing to keep",
+        );
+
+        sweep_settle_merged(&home);
+
+        assert!(!branch_exists(&repo, branch), "branch must be reaped");
+        assert!(!has_intent(&home, &rs, branch), "intent must be settled");
+        let archived = recovery_refs(&repo, branch);
+        assert_eq!(
+            archived.len(),
+            1,
+            "exactly one recovery ref must survive the delete: {archived:?}"
+        );
+        assert_eq!(archived[0].1, tip, "recovery ref must hold the exact head");
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// `can_mutate_record` (tasks/acl.rs:112-139) returns true for ANY caller
+    /// when the owner is None — an unassigned obligation is answerable by
+    /// anybody, so it can never authorize a deletion.
+    #[test]
+    fn an_unassigned_obligation_cannot_authorize_a_deletion() {
+        let home = tmp_dir("attest-orphan");
+        let repo = tmp_repo("attest-orphan-repo");
+        let branch = "feat/attested-orphan";
+        let tip = make_branch(&repo, branch);
+        let rs = repo.display().to_string();
+        persist_intent(&home, &rs, branch, &tip, "t-origin", None, None).expect("persist");
+        let id = seed_obligation(&home, &rs, branch, &tip, None);
+        answer(&home, &id, "passer-by", "delete: not mine but sure");
+
+        sweep_settle_merged(&home);
+
+        assert!(
+            branch_exists(&repo, branch),
+            "unowned answer must not delete"
+        );
+        assert!(has_intent(&home, &rs, branch));
+        assert!(recovery_refs(&repo, branch).is_empty(), "no archive either");
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn a_keep_answer_never_authorizes_a_deletion() {
+        let home = tmp_dir("attest-keep");
+        let repo = tmp_repo("attest-keep-repo");
+        let branch = "feat/attested-keep";
+        let tip = make_branch(&repo, branch);
+        let rs = repo.display().to_string();
+        persist_intent(&home, &rs, branch, &tip, "t-origin", None, None).expect("persist");
+        let id = seed_obligation(&home, &rs, branch, &tip, Some("agent-owner"));
+        answer(&home, &id, "agent-owner", "keep: still under review");
+
+        sweep_settle_merged(&home);
+
+        assert!(branch_exists(&repo, branch));
+        assert!(has_intent(&home, &rs, branch));
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// A `delete:` the owner has not yet COMMITTED to — the obligation is still
+    /// open — is not an answer.
+    #[test]
+    fn a_delete_on_a_non_terminal_obligation_authorizes_nothing() {
+        let home = tmp_dir("attest-open");
+        let repo = tmp_repo("attest-open-repo");
+        let branch = "feat/attested-open";
+        let tip = make_branch(&repo, branch);
+        let rs = repo.display().to_string();
+        persist_intent(&home, &rs, branch, &tip, "t-origin", None, None).expect("persist");
+        let id = seed_obligation(&home, &rs, branch, &tip, Some("agent-owner"));
+        crate::task_events::append(
+            &home,
+            &crate::task_events::InstanceName::from("agent-owner"),
+            crate::task_events::TaskEvent::ResultSet {
+                task_id: crate::task_events::TaskId(id.clone()),
+                by: crate::task_events::InstanceName::from("agent-owner"),
+                result: "delete: drafting my answer".into(),
+            },
+        )
+        .expect("result set");
+
+        sweep_settle_merged(&home);
+
+        assert_eq!(
+            obligation(&home, &id).status,
+            crate::task_events::TaskStatus::Open
+        );
+        assert!(branch_exists(&repo, branch));
+        assert!(has_intent(&home, &rs, branch));
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// The key binds the answer to the EXACT head it was given about. An
+    /// obligation raised at an older head cannot authorize deleting newer work.
+    #[test]
+    fn an_answer_about_a_different_head_cannot_authorize_this_deletion() {
+        let home = tmp_dir("attest-otherhead");
+        let repo = tmp_repo("attest-otherhead-repo");
+        let branch = "feat/attested-otherhead";
+        let tip = make_branch(&repo, branch);
+        let rs = repo.display().to_string();
+        persist_intent(&home, &rs, branch, &tip, "t-origin", None, None).expect("persist");
+        let stale_head = "0000000000000000000000000000000000000000";
+        let id = seed_obligation(&home, &rs, branch, stale_head, Some("agent-owner"));
+        answer(&home, &id, "agent-owner", "delete: done with the old head");
+
+        sweep_settle_merged(&home);
+
+        assert!(branch_exists(&repo, branch));
+        assert!(has_intent(&home, &rs, branch));
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Work landed after the owner answered: the CAS must refuse.
+    #[test]
+    fn head_drift_after_the_answer_preserves_the_branch() {
+        let home = tmp_dir("attest-drift");
+        let repo = tmp_repo("attest-drift-repo");
+        let branch = "feat/attested-drift";
+        let answered_head = make_branch(&repo, branch);
+        let rs = repo.display().to_string();
+        persist_intent(&home, &rs, branch, &answered_head, "t-origin", None, None)
+            .expect("persist");
+        let id = seed_obligation(&home, &rs, branch, &answered_head, Some("agent-owner"));
+        answer(&home, &id, "agent-owner", "delete: finished with it");
+        // New work arrives on the branch after the answer.
+        git_in(&repo, &["checkout", branch]);
+        std::fs::write(repo.join("late.txt"), "late").ok();
+        git_in(&repo, &["add", "."]);
+        git_in(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "late work",
+            ],
+        );
+        git_in(&repo, &["checkout", "main"]);
+
+        sweep_settle_merged(&home);
+
+        assert!(
+            branch_exists(&repo, branch),
+            "drifted head must be preserved"
+        );
+        assert!(has_intent(&home, &rs, branch));
+        assert!(
+            recovery_refs(&repo, branch).is_empty(),
+            "a branch that is never deleted must never be archived either"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Prefix AND case are exact. An answer the contract does not define is not
+    /// an authorization to delete anything.
+    #[test]
+    fn a_malformed_answer_authorizes_nothing() {
+        let home = tmp_dir("attest-malformed");
+        let repo = tmp_repo("attest-malformed-repo");
+        let rs = repo.display().to_string();
+        let cases = [
+            ("feat/attested-capitalized", "Delete: obsolete"),
+            ("feat/attested-unknown-verb", "cleaned it up already"),
+        ];
+        for (branch, malformed) in cases {
+            let tip = make_branch(&repo, branch);
+            persist_intent(&home, &rs, branch, &tip, "t-origin", None, None).expect("persist");
+            let id = seed_obligation(&home, &rs, branch, &tip, Some("agent-owner"));
+            answer(&home, &id, "agent-owner", malformed);
+        }
+
+        sweep_settle_merged(&home);
+
+        for (branch, malformed) in cases {
+            assert!(
+                branch_exists(&repo, branch),
+                "'{malformed}' must authorize nothing"
+            );
+            assert!(has_intent(&home, &rs, branch));
+            assert!(recovery_refs(&repo, branch).is_empty());
+        }
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Two rows carrying one exact key cannot say which one the owner attested
+    /// to — ambiguity is never an answer.
+    #[test]
+    fn two_obligations_sharing_one_key_authorize_nothing() {
+        let home = tmp_dir("attest-ambiguous");
+        let repo = tmp_repo("attest-ambiguous-repo");
+        let branch = "feat/attested-ambiguous";
+        let tip = make_branch(&repo, branch);
+        let rs = repo.display().to_string();
+        persist_intent(&home, &rs, branch, &tip, "t-origin", None, None).expect("persist");
+        let first = seed_obligation(&home, &rs, branch, &tip, Some("agent-owner"));
+        let second = seed_obligation(&home, &rs, branch, &tip, Some("agent-owner"));
+        answer(&home, &first, "agent-owner", "delete: obsolete");
+        answer(&home, &second, "agent-owner", "delete: obsolete");
+
+        sweep_settle_merged(&home);
+
+        assert!(branch_exists(&repo, branch));
+        assert!(has_intent(&home, &rs, branch));
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Archive BEFORE delete: if the recovery ref cannot be written, nothing is
+    /// deleted. A ref already occupying the recovery namespace as a leaf makes
+    /// `update-ref` fail for real (D/F conflict) — no mocking involved.
+    #[test]
+    fn a_failed_archive_preserves_the_branch_the_intent_and_the_answer() {
+        let home = tmp_dir("attest-archivefail");
+        let repo = tmp_repo("attest-archivefail-repo");
+        let branch = "feat/attested-archivefail";
+        let tip = make_branch(&repo, branch);
+        let rs = repo.display().to_string();
+        persist_intent(&home, &rs, branch, &tip, "t-origin", None, None).expect("persist");
+        let safe: String = branch
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        // Occupy the directory the recovery ref needs with a ref of its own.
+        git_in(
+            &repo,
+            &[
+                "update-ref",
+                &format!("refs/agend/recovery/branch/{safe}"),
+                &tip,
+            ],
+        );
+        let id = seed_obligation(&home, &rs, branch, &tip, Some("agent-owner"));
+        answer(&home, &id, "agent-owner", "delete: obsolete");
+
+        sweep_settle_merged(&home);
+
+        assert!(
+            branch_exists(&repo, branch),
+            "an unarchivable branch must never be deleted"
+        );
+        assert!(has_intent(&home, &rs, branch));
+        assert_eq!(
+            obligation(&home, &id).status,
+            crate::task_events::TaskStatus::Done,
+            "the answer itself must be preserved for the retry"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// A branch some worktree still holds is never deleted out from under it.
+    #[test]
+    fn a_branch_still_checked_out_is_never_deleted() {
+        let home = tmp_dir("attest-checkedout");
+        let repo = tmp_repo("attest-checkedout-repo");
+        let branch = "feat/attested-checkedout";
+        let tip = make_branch(&repo, branch);
+        let rs = repo.display().to_string();
+        git_in(&repo, &["checkout", branch]);
+        persist_intent(&home, &rs, branch, &tip, "t-origin", None, None).expect("persist");
+        let id = seed_obligation(&home, &rs, branch, &tip, Some("agent-owner"));
+        answer(&home, &id, "agent-owner", "delete: obsolete");
+
+        sweep_settle_merged(&home);
+
+        assert!(branch_exists(&repo, branch));
+        assert!(has_intent(&home, &rs, branch));
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// B4: keep is renewable but never permanent. At expiry the SAME row is
+    /// reopened — no second obligation — and its due date is already past, so
+    /// it surfaces overdue.
+    #[test]
+    fn an_expired_keep_reopens_the_same_obligation_overdue() {
+        let home = tmp_dir("attest-ttl");
+        let repo = tmp_repo("attest-ttl-repo");
+        let branch = "feat/attested-ttl";
+        let tip = make_branch(&repo, branch);
+        let rs = repo.display().to_string();
+        persist_intent(&home, &rs, branch, &tip, "t-origin", None, None).expect("persist");
+        let id = seed_obligation(&home, &rs, branch, &tip, Some("agent-owner"));
+        answer(&home, &id, "agent-owner", "keep: still needed");
+        let intent = intent_of(&repo, branch, &tip, "t-origin");
+
+        let expired = chrono::Utc::now() + chrono::Duration::days(KEEP_TTL_DAYS + 1);
+        settle_by_owner_attestation(&home, &intent, expired, &retention_obligations(&home));
+
+        let reopened = obligation(&home, &id);
+        assert_eq!(reopened.status, crate::task_events::TaskStatus::Open);
+        assert_eq!(
+            reopened.owner.as_ref().map(|o| o.0.as_str()),
+            Some("agent-owner"),
+            "reopen must keep the same accountable owner"
+        );
+        assert_eq!(retention_row_count(&home), 1, "no duplicate obligation");
+        let due = reopened.due_at.as_deref().expect("due_at");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(due).expect("rfc3339") < expired,
+            "an expired keep must surface overdue, due_at was {due}"
+        );
+        assert!(branch_exists(&repo, branch), "expiry asks, never deletes");
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn a_keep_inside_its_ttl_is_left_alone() {
+        let home = tmp_dir("attest-ttl-inside");
+        let repo = tmp_repo("attest-ttl-inside-repo");
+        let branch = "feat/attested-ttl-inside";
+        let tip = make_branch(&repo, branch);
+        let rs = repo.display().to_string();
+        persist_intent(&home, &rs, branch, &tip, "t-origin", None, None).expect("persist");
+        let id = seed_obligation(&home, &rs, branch, &tip, Some("agent-owner"));
+        answer(&home, &id, "agent-owner", "keep: still needed");
+        let intent = intent_of(&repo, branch, &tip, "t-origin");
+
+        let inside = chrono::Utc::now() + chrono::Duration::days(KEEP_TTL_DAYS - 1);
+        settle_by_owner_attestation(&home, &intent, inside, &retention_obligations(&home));
+
+        assert_eq!(
+            obligation(&home, &id).status,
+            crate::task_events::TaskStatus::Done,
+            "the TTL has not expired yet"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// A renewed keep starts a NEW term — the TTL runs from the latest answer,
+    /// not the first one.
+    #[test]
+    fn a_renewed_keep_restarts_the_ttl_from_the_new_answer() {
+        let home = tmp_dir("attest-ttl-renew");
+        let repo = tmp_repo("attest-ttl-renew-repo");
+        let branch = "feat/attested-ttl-renew";
+        let tip = make_branch(&repo, branch);
+        let rs = repo.display().to_string();
+        persist_intent(&home, &rs, branch, &tip, "t-origin", None, None).expect("persist");
+        let id = seed_obligation(&home, &rs, branch, &tip, Some("agent-owner"));
+        answer(&home, &id, "agent-owner", "keep: still needed");
+        let intent = intent_of(&repo, branch, &tip, "t-origin");
+
+        let expired = chrono::Utc::now() + chrono::Duration::days(KEEP_TTL_DAYS + 1);
+        settle_by_owner_attestation(&home, &intent, expired, &retention_obligations(&home));
+        assert_eq!(
+            obligation(&home, &id).status,
+            crate::task_events::TaskStatus::Open
+        );
+        // The owner renews: a fresh terminal answer, so a fresh term.
+        answer(&home, &id, "agent-owner", "keep: still needed, renewed");
+
+        // Ask again at EXACTLY the first term's deadline — past for the
+        // original answer, still inside the term the renewal bought. Event
+        // timestamps are strictly monotonic (catalog::next_commit_timestamp),
+        // so the two deadlines can never coincide.
+        let answered_at: Vec<chrono::DateTime<chrono::Utc>> = obligation(&home, &id)
+            .history
+            .iter()
+            .filter(|entry| entry.kind == "done")
+            .map(|entry| {
+                chrono::DateTime::parse_from_rfc3339(&entry.timestamp)
+                    .expect("rfc3339")
+                    .with_timezone(&chrono::Utc)
+            })
+            .collect();
+        assert_eq!(answered_at.len(), 2, "original answer plus its renewal");
+        let old_deadline = answered_at[0] + chrono::Duration::days(KEEP_TTL_DAYS);
+        assert!(old_deadline < answered_at[1] + chrono::Duration::days(KEEP_TTL_DAYS));
+
+        settle_by_owner_attestation(&home, &intent, old_deadline, &retention_obligations(&home));
+
+        assert_eq!(
+            obligation(&home, &id).status,
+            crate::task_events::TaskStatus::Done,
+            "the renewed term must not expire at the old deadline"
+        );
+        assert_eq!(retention_row_count(&home), 1);
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn owner_attested_settlement_is_wired_into_the_sweep() {
+        let source = include_str!("cleanup_intents.rs");
+        let seam = source
+            .split("pub(crate) fn sweep_settle_merged")
+            .nth(1)
+            .expect("sweep_settle_merged present");
+        assert!(
+            seam.contains("settle_by_owner_attestation"),
+            "the owner-attested authority must run at the seam where merge \
+             evidence is absent — if this fails, the second authority was unwired"
         );
     }
 }
