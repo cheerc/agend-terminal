@@ -14,6 +14,10 @@ use std::path::{Path, PathBuf};
 const TAIL_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 const DISCOVER_RECENT: std::time::Duration = std::time::Duration::from_secs(26 * 3600);
 const FREE_USAGE_MARKER: &str = "subscription:free-usage-exhausted";
+/// The auth-class HTTP statuses Grok embeds verbatim in a `retry_state` failure
+/// text (`API error (status 401 Unauthorized): ...`). 402 (billing) and 429
+/// (throttle / free-usage quota) are deliberately NOT auth failures.
+const AUTH_STATUS_MARKERS: [&str; 2] = ["(status 401", "(status 403"];
 
 #[derive(Debug, Deserialize)]
 struct SessionRecord {
@@ -36,6 +40,8 @@ struct SessionUpdate {
     #[serde(rename = "type")]
     update_type: Option<String>,
     reason: Option<String>,
+    /// Carried instead of `reason` by a `type:"failed"` retry state.
+    message: Option<String>,
     is_rate_limited: Option<bool>,
     stop_reason: Option<String>,
 }
@@ -48,25 +54,40 @@ fn parse_record(line: &str) -> Option<SessionRecord> {
 /// normal turn completion, malformed JSON, and every unrelated update are ignored.
 pub(crate) fn record_to_evidence(line: &str, now_ms: u64) -> Option<Evidence> {
     let record = parse_record(line)?;
-    let update = record.params.update;
-    let is_quota_wall = matches!(
+    if !matches!(
         record.method.as_str(),
         "session/update" | "_x.ai/session/update"
-    ) && update.session_update == "retry_state"
-        && update.update_type.as_deref() == Some("exhausted")
+    ) {
+        return None;
+    }
+    let update = record.params.update;
+    if update.session_update != "retry_state" {
+        return None;
+    }
+    let is_quota_wall = update.update_type.as_deref() == Some("exhausted")
         && update.is_rate_limited == Some(true)
         && update
             .reason
             .as_deref()
             .is_some_and(|reason| reason.contains(FREE_USAGE_MARKER));
-    if !is_quota_wall {
+    // A rejected credential is reported through the same retry channel, in
+    // `reason` while Grok still retries and in `message` once it gives up.
+    let is_auth_failure = [update.reason.as_deref(), update.message.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|text| AUTH_STATUS_MARKERS.iter().any(|m| text.contains(m)));
+    let kind = if is_quota_wall {
+        EvidenceKind::UsageLimit
+    } else if is_auth_failure {
+        EvidenceKind::AuthError
+    } else {
         return None;
-    }
+    };
     let at_ms = record
         .timestamp
         .map(|seconds| seconds.saturating_mul(1_000))
         .unwrap_or(now_ms);
-    Some(Evidence::stream(EvidenceKind::UsageLimit, at_ms))
+    Some(Evidence::stream(kind, at_ms))
 }
 
 /// Map genuine later model progress so a durable quota wall can release after a
@@ -274,6 +295,17 @@ mod tests {
     const REAL_LINES: &str =
         include_str!("../../../tests/fixtures/grok-s1-usage-limit-updates.jsonl");
 
+    /// Line 3 is BYTE-IDENTICAL to a real captured Grok record (402 Payment
+    /// Required). Lines 1-2 are SYNTHESIZED from the two captured retry envelopes:
+    /// line 1 mirrors the 429 `retrying`/`reason` shape, while line 2 mirrors line
+    /// 3's `failed`/`message` shape. No auth-class record exists in any local
+    /// capture (43 `updates.jsonl` plus `~/.grok/logs/unified.jsonl` scanned, zero hits),
+    /// because Grok probes the credential at startup and refuses to create a
+    /// session at all when it is unusable — so only a MID-SESSION 401/403 can ever
+    /// reach this file.
+    const AUTH_LINES: &str =
+        include_str!("../../../tests/fixtures/grok-s1-auth-error-updates.jsonl");
+
     #[test]
     fn preserved_real_grok_lines_classify_only_exhausted_quota() {
         let lines: Vec<&str> = REAL_LINES.lines().collect();
@@ -295,6 +327,72 @@ mod tests {
             })
         ));
         assert!(record_to_progress(lines[2], 0).is_none());
+    }
+
+    #[test]
+    fn mid_session_auth_status_maps_to_auth_error_but_billing_does_not() {
+        let lines: Vec<&str> = AUTH_LINES.lines().collect();
+        assert_eq!(lines.len(), 3);
+        for line in &lines[..2] {
+            let ev = record_to_evidence(line, 1_783_735_760_000).unwrap();
+            assert_eq!(ev.kind, EvidenceKind::AuthError);
+            assert_eq!(ev.authority, Authority::Stream);
+        }
+        // The record timestamp, not the tail clock, stamps the evidence.
+        assert_eq!(
+            record_to_evidence(lines[0], 1_783_735_760_000)
+                .unwrap()
+                .at_ms,
+            1_783_735_748_000
+        );
+        // The real 402 billing wall is a payment problem, NOT a credential one.
+        assert!(record_to_evidence(lines[2], 0).is_none());
+        // Neither are the real 429 throttle / quota lines.
+        for line in REAL_LINES.lines() {
+            assert_ne!(
+                record_to_evidence(line, 0).map(|ev| ev.kind),
+                Some(EvidenceKind::AuthError)
+            );
+        }
+        // An auth failure is not progress and must never clear a wall.
+        assert!(record_to_progress(lines[1], 0).is_none());
+    }
+
+    #[test]
+    fn auth_error_is_operated_and_lasts_until_later_progress() {
+        let mut runtime = AgentRuntime::default();
+        runtime.ingest(&Evidence::stream(EvidenceKind::AuthError, 2_000));
+        let live = Liveness {
+            api_in_flight: false,
+            productive_silent_ms: 0,
+            child_alive: true,
+        };
+        let blocked = runtime.observe(ScreenSignal::Idle, &live, 2_100);
+        assert_eq!(blocked.state, ObservedState::AuthError);
+        assert_eq!(
+            super::super::gate::gated_override(crate::state::AgentState::Idle, &blocked),
+            Some(crate::state::AgentState::AuthError),
+            "idle Grok chrome must not hide a rejected credential"
+        );
+
+        runtime.ingest(&Evidence::stream(EvidenceKind::TurnStarted, 1_900));
+        assert_eq!(
+            runtime.observe(ScreenSignal::Idle, &live, 2_200).state,
+            ObservedState::AuthError,
+            "older progress cannot clear a newer credential failure"
+        );
+        runtime.ingest(&Evidence::stream(EvidenceKind::TurnStarted, 2_300));
+        assert_ne!(
+            runtime.observe(ScreenSignal::Idle, &live, 2_400).state,
+            ObservedState::AuthError,
+            "genuine later progress clears the credential failure"
+        );
+        runtime.ingest(&Evidence::stream(EvidenceKind::AuthError, 2_100));
+        assert_ne!(
+            runtime.observe(ScreenSignal::Idle, &live, 2_500).state,
+            ObservedState::AuthError,
+            "replayed older auth evidence cannot resurrect a recovered failure"
+        );
     }
 
     #[test]

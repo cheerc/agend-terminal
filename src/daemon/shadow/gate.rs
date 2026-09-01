@@ -83,6 +83,7 @@ fn observed_to_agent_state(state: ObservedState) -> Option<AgentState> {
         ObservedState::WaitingForUser => AgentState::AwaitingOperator,
         ObservedState::RateLimited => AgentState::RateLimit,
         ObservedState::UsageLimit => AgentState::UsageLimit,
+        ObservedState::AuthError => AgentState::AuthError,
         ObservedState::Idle => return None,
     })
 }
