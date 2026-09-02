@@ -11,6 +11,10 @@ use legacy_release::{
     require_clean_legacy_target,
 };
 
+mod branch_cleanup;
+use branch_cleanup::resolve_branch_cleanup;
+pub(crate) use branch_cleanup::{retention_key, RETENTION_TAG};
+
 pub(crate) struct NestedDirtDiscard<'a> {
     pub expected_digest: &'a str,
     pub audit_reason: &'a str,
@@ -379,6 +383,7 @@ fn cleanup_merged_branch(
     // a dry-run release must be observation-only. The non-dry-run path keeps the
     // fresh fetch so `is_merged` / `squash` below are accurate; the dry-run
     // preview falls back to the existing local refs (best-effort "would delete").
+    let mut fetched = false;
     if !dry_run {
         let remote = crate::git_helpers::primary_remote(source_repo);
         // #2004: fail-direction is safe (stale remote refs → `is_merged`/`squash`
@@ -402,19 +407,44 @@ fn cleanup_merged_branch(
                     "fetch --prune could not run during merged-branch cleanup — merge/gone checks run on possibly-stale local refs (branch kept = safe direction)"
                 );
             }
-            Ok(_) => {}
+            Ok(_) => fetched = true,
         }
     }
 
     let default = crate::git_helpers::default_branch(source_repo);
+    // t-…-43938-5 (d-20260901132326253721-16): the fetch above refreshes
+    // `refs/remotes/<remote>/*` and NEVER `refs/heads/<default>`, so judging
+    // ancestry against the LOCAL default asks a stale question — every daemon
+    // worktree is provisioned at the CURRENT protected head, at or ahead of that
+    // lagging ref, so a branch whose work is already in the fetched default was
+    // reported "not merged" and kept forever. Judge against the ref the fetch
+    // just refreshed. A repo with no remote-tracking default keeps the local ref
+    // (there it IS the authority, and a remote-less repo must stay reapable); a
+    // repo that HAS one but could not refresh it judges nothing, so `is_merged`
+    // stays false and the branch is preserved fail-closed.
+    let remote_default = format!(
+        "refs/remotes/{}/{default}",
+        crate::git_helpers::primary_remote(source_repo)
+    );
+    let has_remote_default = crate::git_helpers::git_ok(
+        source_repo,
+        &["rev-parse", "--verify", "--quiet", &remote_default],
+    );
+    let merge_target = match (has_remote_default, fetched || dry_run) {
+        (true, true) => Some(remote_default.as_str()),
+        (true, false) => None,
+        (false, _) => Some(default.as_str()),
+    };
     // W6: converged onto git_helpers::git_ok — byte-identical to the prior
     // git_bypass(...).map(|o| o.status.success()).unwrap_or(false) idiom this
     // absorbs (worktree_cleanup.rs's is_branch_merged already used it; this
     // was the one remaining manual call site).
-    let is_merged = crate::git_helpers::git_ok(
-        source_repo,
-        &["merge-base", "--is-ancestor", branch, &default],
-    );
+    let is_merged = merge_target.is_some_and(|target| {
+        crate::git_helpers::git_ok(
+            source_repo,
+            &["merge-base", "--is-ancestor", branch, target],
+        )
+    });
 
     // #P3 (branch-residue): an authoritative PR-merge (a merged PR whose head
     // SHA == this branch tip, or the tip is an ancestor of it) is MONOTONIC
@@ -671,202 +701,6 @@ fn task_active_for_branch(home: &Path, task_id: &str, branch: &str) -> Option<bo
         Err(crate::tasks::TaskRouteError::NotFound) => Some(false),
         Err(crate::tasks::TaskRouteError::Unreadable { .. })
         | Err(crate::tasks::TaskRouteError::Ambiguous { .. }) => None,
-    }
-}
-
-fn disposable_review_provisioned_head(
-    binding: &serde_json::Value,
-) -> Result<Option<&str>, &'static str> {
-    let has_disposable_field = binding.get("checkout_purpose").is_some()
-        || binding.get("provenance").is_some()
-        || binding.get("provisioned_head").is_some();
-    if !has_disposable_field {
-        return Ok(None);
-    }
-    if binding.get("checkout_purpose").and_then(|v| v.as_str()) != Some("disposable_review")
-        || binding.get("provenance").and_then(|v| v.as_str()) != Some("DaemonProvisionedReview")
-    {
-        return Err("invalid disposable review provenance");
-    }
-    let head = binding
-        .get("provisioned_head")
-        .and_then(|v| v.as_str())
-        .filter(|head| {
-            (head.len() == 40 || head.len() == 64) && head.chars().all(|c| c.is_ascii_hexdigit())
-        })
-        .ok_or("missing or invalid disposable review provisioned_head")?;
-    Ok(Some(head))
-}
-
-fn disposable_review_task_terminal(home: &Path, task_id: &str) -> Option<bool> {
-    if task_id.is_empty() {
-        return None;
-    }
-    match crate::tasks::load_routed(home, task_id) {
-        Ok(routed) => Some(
-            routed.task.status.is_terminal()
-                || routed.task.status == crate::task_events::TaskStatus::Verified,
-        ),
-        Err(crate::tasks::TaskRouteError::NotFound)
-        | Err(crate::tasks::TaskRouteError::Unreadable { .. })
-        | Err(crate::tasks::TaskRouteError::Ambiguous { .. }) => None,
-    }
-}
-
-fn resolve_branch_cleanup(
-    home: &Path,
-    binding: &serde_json::Value,
-    managed_verified: bool,
-    worktree_absent: bool,
-    dry_run: bool,
-    was_dirty: bool,
-    out: &mut ReleaseOutcome,
-) {
-    let branch = binding["branch"].as_str().unwrap_or("");
-    let sr_str = binding["source_repo"].as_str().unwrap_or("");
-    let task_id = binding["task_id"].as_str().unwrap_or("");
-    let disposable_head = match disposable_review_provisioned_head(binding) {
-        Ok(head) => head,
-        Err(reason) => {
-            out.branch_cleanup_skipped_reason = Some(format!(
-                "disposable review provenance {reason} — preserved (fail-closed)"
-            ));
-            return;
-        }
-    };
-    if !managed_verified && !worktree_absent {
-        out.branch_cleanup_skipped_reason =
-            Some("cannot verify .agend-managed marker — skipping branch cleanup".to_string());
-    } else if !branch.is_empty() && !sr_str.is_empty() {
-        // Authority-proven review lease: lease_kind + review_assignment_id + expected_head
-        // all present → eligible for immediate delete with expected-head CAS. A
-        // daemon-provisioned disposable review uses the same strict lifecycle
-        // classifier, but its provenance is independent of assignment_authority.
-        // Dirty work → never auto-delete regardless of provenance.
-        let authority_proven_head = if was_dirty {
-            None
-        } else {
-            binding
-                .get("lease_kind")
-                .and_then(|v| v.as_str())
-                .filter(|&k| k == "review")
-                .and(
-                    binding
-                        .get("review_assignment_id")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty()),
-                )
-                .and(
-                    binding
-                        .get("expected_head")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty()),
-                )
-        };
-        let review_head = disposable_head.or(authority_proven_head);
-        if was_dirty
-            && (disposable_head.is_some()
-                || binding
-                    .get("lease_kind")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|k| k == "review"))
-        {
-            out.branch_cleanup_skipped_reason = Some(format!(
-                "authority-proven review lease on '{branch}' had dirty work — branch preserved"
-            ));
-            return;
-        }
-        if let Some(expected) = review_head {
-            let default = crate::git_helpers::default_branch(Path::new(sr_str));
-            let task_active = if disposable_head.is_some() {
-                disposable_review_task_terminal(home, task_id).map(|terminal| !terminal)
-            } else {
-                task_active_for_branch(home, task_id, branch)
-            };
-            let open_pr =
-                match crate::branch_sweep::open_pr_status(Path::new(sr_str), &default, branch) {
-                    crate::branch_sweep::OpenPrStatus::Open => Some(true),
-                    crate::branch_sweep::OpenPrStatus::NotOpen => Some(false),
-                    crate::branch_sweep::OpenPrStatus::Unknown => None,
-                };
-            let unique_unpreserved_work =
-                crate::git_helpers::git_cmd(Path::new(sr_str), &["rev-parse", branch])
-                    .ok()
-                    .map(|tip| tip.trim() != expected);
-            let active_holder = crate::worktree_cleanup::branch_has_other_active_binding(
-                home,
-                Path::new(sr_str),
-                branch,
-                binding["worktree"].as_str(),
-            );
-            let lifecycle = crate::worktree::disposition::branch_lifecycle_disposition(
-                &crate::worktree::disposition::BranchLifecycleInput {
-                    provenance: crate::worktree::disposition::BranchProvenance::ManagedReview,
-                    terminal: true,
-                    active_holder,
-                    task_active,
-                    open_pr,
-                    unique_unpreserved_work,
-                },
-            );
-            if !matches!(
-                lifecycle,
-                crate::worktree::disposition::BranchLifecycleDisposition::Delete
-            ) {
-                // #3090: a LIVE task is a temporary blocker — this is managed
-                // review residue that becomes reapable the moment the task goes
-                // terminal, and the release attempt is the only automatic one,
-                // firing at the one moment the evidence cannot yet be terminal.
-                // Record the intent so the existing terminal-review reconcile
-                // sweep gets that second chance. Every other blocker still
-                // preserves with no intent, exactly as before.
-                if task_active == Some(true) && !dry_run {
-                    out.intent_persist_error = crate::cleanup_intents::persist_release_intent(
-                        home, sr_str, branch, task_id,
-                    );
-                }
-                out.branch_cleanup_skipped_reason = Some(format!(
-                    "authority-proven review branch '{branch}' lifecycle evidence is not terminal — preserved (fail-closed)"
-                ));
-                return;
-            }
-            if !dry_run {
-                if let Err(error) = crate::branch_sweep::prepare_branch_recovery(
-                    Some(home),
-                    Path::new(sr_str),
-                    branch,
-                    expected,
-                    "authority-proven review release",
-                ) {
-                    out.branch_cleanup_skipped_reason = Some(error);
-                    return;
-                }
-            }
-        }
-        let (deleted, skip_reason) = cleanup_merged_branch(
-            Path::new(sr_str),
-            branch,
-            dry_run,
-            // A daemon-provisioned disposable review has the same strict
-            // expected-head CAS as an assignment-authority review lease. Once
-            // its lifecycle gates pass, pass that provenance head through to
-            // the deletion primitive so the branch is reaped without a PR
-            // merge signal (review scaffolding is intentionally unmerged).
-            review_head,
-        );
-        out.branch_deleted = deleted;
-        out.branch_cleanup_skipped_reason = skip_reason.clone();
-        // Cleanup intent: clean feature branch released pre-merge → persist
-        // intent so it can be settled on pr-merged event or periodic sweep.
-        // Dirty branches get no intent (preserved permanently).
-        if !deleted && !was_dirty && !dry_run {
-            out.intent_persist_error =
-                crate::cleanup_intents::persist_release_intent(home, sr_str, branch, task_id);
-        }
-    } else if branch.is_empty() {
-        out.branch_cleanup_skipped_reason = Some("no branch in binding".to_string());
-    } else {
-        out.branch_cleanup_skipped_reason = Some("no source_repo in binding".to_string());
     }
 }
 
