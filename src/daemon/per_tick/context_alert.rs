@@ -174,7 +174,11 @@ impl PerTickHandler for ContextAlertHandler {
         // Phase 1 (cheap, locks only): snapshot each agent's resolved context
         // — statusline pattern only (#1945-disable: no transcript estimate;
         // an unreadable pane is unknown and never alerts).
-        let mut resolved: Vec<(String, f32, &'static str)> = Vec::new();
+        // t-…-82348-36: the tuple carries the reading's MEANING
+        // (`context_meaning`) so the message can name the figure instead of
+        // letting the reader assume "remaining session budget". No gating —
+        // every backend that produces a reading still alerts.
+        let mut resolved: Vec<(String, f32, &'static str, Option<&'static str>)> = Vec::new();
         // #latch-prune (cleanup-on-delete, #1923 G5 class): capture ALL live
         // agent names — not just those with a context reading — so the per-agent
         // `states` latch can drop deleted agents below. Without it a same-name
@@ -184,8 +188,14 @@ impl PerTickHandler for ContextAlertHandler {
             let mut live = std::collections::HashSet::new();
             for handle in reg.values() {
                 live.insert(handle.name.as_str().to_string());
-                if let Some((pct, source)) = handle.core.lock().state.resolved_context() {
-                    resolved.push((handle.name.as_str().to_string(), pct, source));
+                let core = handle.core.lock();
+                if let Some((pct, source)) = core.state.resolved_context() {
+                    resolved.push((
+                        handle.name.as_str().to_string(),
+                        pct,
+                        source,
+                        core.state.context_meaning(),
+                    ));
                 }
             }
             live
@@ -203,7 +213,7 @@ impl PerTickHandler for ContextAlertHandler {
         let fleet = crate::fleet::FleetConfig::load_arc(&crate::fleet::fleet_yaml_path(ctx.home))
             .unwrap_or_else(|_| Arc::new(crate::fleet::FleetConfig::default()));
         let mut states = self.states.lock();
-        for (name, pct, source) in resolved {
+        for (name, pct, source, meaning) in resolved {
             let threshold =
                 resolve_instance_thresholds(&name, global, &fleet, &self.invalid_override_warnings)
                     .alert;
@@ -221,13 +231,33 @@ impl PerTickHandler for ContextAlertHandler {
             if recipient == name {
                 continue;
             }
-            let text = format!(
-                "[context_alert] agent '{name}' context usage at {pct:.1}% \
-                 (source: {source}, threshold {threshold:.1}%). Handling is NOT \
-                 automated — at a natural boundary consider a handoff + \
-                 restart_instance to free the context. Re-alerts every 30min \
-                 while it stays high."
-            );
+            // t-…-82348-36: Claude's figure is context-WINDOW fill of an
+            // auto-compacted window (2026-09-02: a pane read 95.0%,
+            // auto-compaction fired, it then read 7.0%) — say so, and say what
+            // the fleet policy wants done, because two orchestrators read the
+            // old "context usage" wording as remaining session budget and
+            // nearly restarted healthy agents. Every other backend's text is
+            // unchanged.
+            let reading = crate::daemon::per_tick::context_reading_phrase(meaning, pct);
+            let text = if meaning == Some("window_fill") {
+                format!(
+                    "[context_alert] agent '{name}' {reading} \
+                     (source: {source}, threshold {threshold:.1}%; statusline; \
+                     auto-compact fires near 95%; this is NOT session budget). \
+                     Fleet policy: at the next natural boundary write \
+                     SESSION-HANDOFF.md and fresh-restart (restart_instance \
+                     mode=fresh) rather than let compaction happen. Re-alerts \
+                     every 30min while it stays high."
+                )
+            } else {
+                format!(
+                    "[context_alert] agent '{name}' {reading} \
+                     (source: {source}, threshold {threshold:.1}%). Handling is NOT \
+                     automated — at a natural boundary consider a handoff + \
+                     restart_instance to free the context. Re-alerts every 30min \
+                     while it stays high."
+                )
+            };
             if let Err(e) = crate::inbox::notify_system(
                 ctx.home,
                 &recipient,
@@ -509,6 +539,221 @@ mod tests {
         );
 
         // Restore env + clean up.
+        if let Some(val) = old_pct {
+            std::env::set_var("AGEND_CONTEXT_ALERT_PCT", val);
+        } else {
+            std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+        }
+        std::fs::write(home.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
+        crate::runtime_config::reload(&home);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// t-…-82348-36 RED: the REAL captured Claude statusline (pane_snapshot of
+    /// claude-aef7c0, 2026-09-02 — rendered by the operator's ccstatusline
+    /// `context-percentage` widget) parses cleanly at 95.0% and MUST alert:
+    /// under the fleet policy ("fresh-restart at a natural boundary INSTEAD of
+    /// letting auto-compaction happen") this reading is exactly the trigger the
+    /// policy needs. The bug is the WORDING — the figure is context-WINDOW fill
+    /// of an auto-compacted window (proven 2026-09-02: a live pane read 95.0%,
+    /// auto-compaction fired, it then read 7.0%), NOT remaining session budget,
+    /// and two orchestrators misread it as budget and nearly restarted healthy
+    /// agents. The alert text must name what the number is and what to do.
+    #[test]
+    #[serial(runtime_config)]
+    fn claude_statusline_reading_alerts_with_window_fill_semantics() {
+        use parking_lot::Mutex as PLMutex;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let home =
+            std::env::temp_dir().join(format!("agend-ctxalert-claude-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
+        crate::runtime_config::reload(&home); // defaults: alert threshold 80
+        let old_pct = std::env::var("AGEND_CONTEXT_ALERT_PCT").ok();
+        std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+
+        // Fleet with a team so the alert routes to the orchestrator's inbox
+        // (same drain pattern as the #2781 text-reading test below).
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  lead:\n    backend: claude\n  cl:\n    backend: claude\n\
+             teams:\n  test:\n    members: [lead, cl]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+
+        const CAPTURED_FRAME: &str = "\
+  Model: Fable 5.1 | Ctx Used: 95.0% | ⎇ main | (+0,-0)\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 2 agents";
+        let (handle, _reader) = crate::daemon::per_tick::mock_live_agent_with_frame(
+            "cl",
+            &crate::backend::Backend::ClaudeCode,
+            CAPTURED_FRAME,
+        );
+        // Parse pin: the scrape itself is CORRECT — nothing about this fix
+        // touches the number, only the words wrapped around it.
+        assert_eq!(
+            handle.core.lock().state.resolved_context(),
+            Some((95.0, "pattern")),
+            "the captured frame must parse — the reading stays visible in LIST"
+        );
+        let registry: crate::agent::AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        registry.lock().insert(handle.id, handle);
+        let externals: crate::agent::ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs: Arc<PLMutex<HashMap<String, crate::daemon::AgentConfig>>> =
+            Arc::new(PLMutex::new(HashMap::new()));
+        let h = ContextAlertHandler::new(1);
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        h.run(&ctx);
+        assert_eq!(
+            h.is_armed("cl"),
+            Some(false),
+            "a Claude window-fill reading at 95% MUST fire context_alert — it is the \
+             fleet policy's fresh-restart trigger (fired = latch disarmed)"
+        );
+
+        let msgs = crate::inbox::drain(&home, "lead");
+        let alert_msg = msgs
+            .iter()
+            .find(|m| m.text.contains("[context_alert]"))
+            .expect("the alert must reach the orchestrator inbox");
+        assert!(
+            alert_msg.text.contains("context-WINDOW fill at 95.0%"),
+            "t-…-82348-36: the alert must NAME the figure as context-window fill, not \
+             'context usage' (which two orchestrators read as session budget): {}",
+            alert_msg.text
+        );
+        assert!(
+            alert_msg.text.contains("NOT session budget"),
+            "t-…-82348-36: the alert must say the figure is NOT session budget: {}",
+            alert_msg.text
+        );
+        assert!(
+            alert_msg.text.contains("fresh-restart"),
+            "t-…-82348-36: the alert must state the fleet policy action (fresh-restart at \
+             the next natural boundary, rather than let compaction happen): {}",
+            alert_msg.text
+        );
+
+        if let Some(val) = old_pct {
+            std::env::set_var("AGEND_CONTEXT_ALERT_PCT", val);
+        } else {
+            std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+        }
+        std::fs::write(home.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
+        crate::runtime_config::reload(&home);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// t-…-82348-36 negative control: a backend whose statusline figure IS
+    /// attributable (kiro's ◔ gauge) still alerts at a genuine 82% — the
+    /// fail-safe must not blind real readings.
+    #[test]
+    #[serial(runtime_config)]
+    fn kiro_statusline_reading_still_alerts() {
+        use parking_lot::Mutex as PLMutex;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let home = std::env::temp_dir().join(format!("agend-ctxalert-kiro-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        crate::runtime_config::reload(&home);
+
+        let (handle, _reader) = crate::daemon::per_tick::mock_live_agent_with_frame(
+            "k",
+            &crate::backend::Backend::KiroCli,
+            "  Kiro · auto · ◔ 82%",
+        );
+        assert_eq!(
+            handle.core.lock().state.resolved_context(),
+            Some((82.0, "pattern"))
+        );
+        let registry: crate::agent::AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        registry.lock().insert(handle.id, handle);
+        let externals: crate::agent::ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs: Arc<PLMutex<HashMap<String, crate::daemon::AgentConfig>>> =
+            Arc::new(PLMutex::new(HashMap::new()));
+        let h = ContextAlertHandler::new(1);
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        h.run(&ctx);
+        assert_eq!(
+            h.is_armed("k"),
+            Some(false),
+            "a genuine attributable 82% must still alert (fired = latch disarmed)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// t-…-82348-36 wording pin for every NON-Claude backend: the re-scope
+    /// renames only the Claude reading. Kiro's alert text must stay
+    /// byte-compatible with base — "context usage at 82.0%", no "WINDOW".
+    #[test]
+    #[serial(runtime_config)]
+    fn non_claude_alert_wording_unchanged() {
+        use parking_lot::Mutex as PLMutex;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let home =
+            std::env::temp_dir().join(format!("agend-ctxalert-kirotext-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
+        crate::runtime_config::reload(&home);
+        let old_pct = std::env::var("AGEND_CONTEXT_ALERT_PCT").ok();
+        std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  lead:\n    backend: claude\n  k:\n    backend: kiro\n\
+             teams:\n  test:\n    members: [lead, k]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+
+        let (handle, _reader) = crate::daemon::per_tick::mock_live_agent_with_frame(
+            "k",
+            &crate::backend::Backend::KiroCli,
+            "  Kiro · auto · ◔ 82%",
+        );
+        let registry: crate::agent::AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        registry.lock().insert(handle.id, handle);
+        let externals: crate::agent::ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs: Arc<PLMutex<HashMap<String, crate::daemon::AgentConfig>>> =
+            Arc::new(PLMutex::new(HashMap::new()));
+        let h = ContextAlertHandler::new(1);
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        h.run(&ctx);
+
+        let msgs = crate::inbox::drain(&home, "lead");
+        let alert_msg = msgs
+            .iter()
+            .find(|m| m.text.contains("[context_alert]"))
+            .expect("kiro's alert must reach the orchestrator inbox");
+        assert!(
+            alert_msg.text.contains("context usage at 82.0%"),
+            "non-Claude alert wording must stay as base: {}",
+            alert_msg.text
+        );
+        assert!(
+            !alert_msg.text.contains("WINDOW"),
+            "the window-fill wording is Claude-only: {}",
+            alert_msg.text
+        );
+
         if let Some(val) = old_pct {
             std::env::set_var("AGEND_CONTEXT_ALERT_PCT", val);
         } else {

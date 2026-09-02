@@ -634,6 +634,22 @@ pub(crate) fn mock_live_agent_no_context(
     (handle, reader)
 }
 
+/// t-…-82348-36: the ONE place that turns a scraped context reading into the
+/// words the daemon says about it. Claude's statusline figure
+/// (`context_meaning == Some("window_fill")`) is the fill of an auto-compacted
+/// CONTEXT WINDOW — it cycles during normal work and is NOT remaining session
+/// budget (2026-09-02: a live pane read 95.0%, auto-compaction fired, it then
+/// read 7.0%) — so it is named as such wherever it is quoted; two orchestrators
+/// read the old "context usage" wording as budget and nearly restarted healthy
+/// agents. Every other backend keeps the base phrase byte-identical.
+pub(crate) fn context_reading_phrase(meaning: Option<&str>, pct: f32) -> String {
+    if meaning == Some("window_fill") {
+        format!("context-WINDOW fill at {pct:.1}%")
+    } else {
+        format!("context usage at {pct:.1}%")
+    }
+}
+
 /// Test-only: build a LIVE `AgentHandle` (real openpty, child `cat`) whose
 /// `StateTracker` has a REAL, fresh Claude context-percent reading (fed via
 /// a synthetic statusline frame, same shape as `state::tests::CLAUDE_STATUSLINE_FRAME`)
@@ -643,11 +659,32 @@ pub(crate) fn mock_live_agent_no_context(
 /// existing call sites across `per_tick`'s test suites — #2549 W5). Used by
 /// the `ContextAlertHandler`/`ContextHandoffHandler` merge's cross-
 /// independence pin, which needs a live agent whose threshold-crossing
-/// decision actually fires.
+/// decision actually fires. Delegates to [`mock_live_agent_with_frame`] with
+/// the Claude statusline frame it has always fed (t-…-82348-36).
 #[cfg(test)]
 pub(crate) fn mock_live_agent_with_context(
     name: &str,
     pct: f32,
+) -> (crate::agent::AgentHandle, Box<dyn std::io::Read + Send>) {
+    mock_live_agent_with_frame(
+        name,
+        &crate::backend::Backend::ClaudeCode,
+        &format!(
+            "  Model: Fable 5 | Ctx Used: {pct:.1}% | ⎇ b | (+0,-0)\n  ⏵⏵ bypass permissions on (shift+tab to cycle)"
+        ),
+    )
+}
+
+/// Test-only generalization (t-…-82348-36): a LIVE handle whose tracker was
+/// fed an arbitrary rendered `frame` under an explicit `backend` — lets a
+/// test pin per-backend context semantics (e.g. the REAL captured Claude
+/// statusline, whose figure is context-WINDOW fill rather than remaining
+/// session budget, and whose alert/handoff wording must say so).
+#[cfg(test)]
+pub(crate) fn mock_live_agent_with_frame(
+    name: &str,
+    backend: &crate::backend::Backend,
+    frame: &str,
 ) -> (crate::agent::AgentHandle, Box<dyn std::io::Read + Send>) {
     use std::sync::Arc;
     let pty_system = portable_pty::native_pty_system();
@@ -672,10 +709,8 @@ pub(crate) fn mock_live_agent_with_context(
     let reader = pair.master.try_clone_reader().expect("clone reader");
     let writer = pair.master.take_writer().expect("take writer");
     let pty_writer: crate::agent::PtyWriter = Arc::new(parking_lot::Mutex::new(writer));
-    let mut state = crate::state::StateTracker::new(Some(&crate::backend::Backend::ClaudeCode));
-    state.feed(&format!(
-        "  Model: Fable 5 | Ctx Used: {pct:.1}% | ⎇ b | (+0,-0)\n  ⏵⏵ bypass permissions on (shift+tab to cycle)"
-    ));
+    let mut state = crate::state::StateTracker::new(Some(backend));
+    state.feed(frame);
     let core = Arc::new(crate::sync_audit::CoreMutex::new(crate::agent::AgentCore {
         vterm: crate::vterm::VTerm::with_pty_writer(80, 10, Arc::clone(&pty_writer)),
         subscribers: Vec::new(),
@@ -714,6 +749,21 @@ mod tests {
     use super::*;
     use parking_lot::Mutex as PLMutex;
     use std::sync::Arc;
+
+    /// t-…-82348-36: the shared phrase names Claude's window fill for what it
+    /// is, and leaves every other backend's wording byte-identical to base.
+    #[test]
+    fn context_reading_phrase_names_window_fill_only_for_claude() {
+        assert_eq!(
+            context_reading_phrase(Some("window_fill"), 95.0),
+            "context-WINDOW fill at 95.0%"
+        );
+        assert_eq!(
+            context_reading_phrase(Some("context_gauge"), 82.0),
+            "context usage at 82.0%"
+        );
+        assert_eq!(context_reading_phrase(None, 61.0), "context usage at 61.0%");
+    }
 
     /// #t-watchdog-boot-suppress: the boot-grace predicate is active for a
     /// just-built handler and expires past the window; the window itself is a
