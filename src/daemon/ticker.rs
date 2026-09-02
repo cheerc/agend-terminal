@@ -334,6 +334,9 @@ mod tests {
             tick_rx.try_iter().count() <= 1,
             "a full bounded queue must coalesce ticks instead of growing"
         );
+        tick_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("producer must continue after coalescing a full queue");
 
         // If the producer were blocked in send, dropping it could not join
         // promptly while the receiver remains full.
