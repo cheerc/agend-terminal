@@ -1,6 +1,6 @@
 [English](MCP-TOOLS.md)
 
-# AgEnD MCP Tools Reference — 工具參考（32 個工具）
+# AgEnD MCP Tools Reference — 工具參考（33 個工具）
 
 Daemon registry 與即時 `tools/list` schema 才是權威來源。依 instance role 不同，實際顯示的工具可能是這 32 個已註冊工具的子集。
 
@@ -102,6 +102,51 @@ Drain 或管理 caller 的 durable inbox。
 - `message_id` 會依原始 inbox message 的 channel 路由，傳送成功後 settle 該列。
 - 可選 `task_id` 與 `correlation_id` 保留 reply-to correlation。
 - `default_action` 應搭配 `timeout_secs`，以記錄有 timeout default 的 decision。
+
+### `operator_page`
+
+在**不需要任何 inbound channel binding** 的情況下，把訊息推到 **operator 的 Telegram**——用於 operator 明確要求「離開或睡覺時有 milestone 要通知我」的場合。這補的是 harness 的缺口：`PushNotification` 的行動推播只有在 Remote Control 連線時才會送達，而 `reply` 需要一則 inbound 訊息才有回覆對象，operator 直接在 TUI 打字則不會產生 binding。
+
+- 必填：`message`。純文字，超過 1000 字元會截斷，並一律加上呼叫者的 instance 名稱前綴。在截斷與加前綴之前，內容會先被正規化成**一行**：所有 **Cc** control character（LF、CR、TAB、VT、FF、NEL 以及其餘 C0/C1）、所有 Unicode **White_Space** 字元（NBSP `U+00A0`、`U+1680`、`U+2000`–`U+200A`、`U+202F`、`U+205F`、`U+3000`，以及兩個強制換行 `U+2028`／`U+2029`）、所有 general category **Cf** 的 format 字元（ZWSP `U+200B`、ZWNJ／ZWJ、LRM／RLM／LRE／RLE／PDF／LRO／RLO 這組 bidi 控制、`U+2066`–`U+2069` isolate、`U+FEFF`），以及所有帶 Unicode **`Default_Ignorable_Code_Point`** 屬性的字元（CGJ `U+034F`、variation selector `U+FE00`–`U+FE0F` 與 `U+180B`–`U+180F`、Hangul filler），一律換成**一個**空白，連續空白再收斂成一個。整個 **Mn** 類別是刻意**不**清掉的——越南文、希伯來文、天城文就是靠 combining mark 拼寫的——所以只取 Mn 之中 default-ignorable 的那一部分；付出的代價只有一項且如實寫在這裡：emoji 後面的 `U+FE0F` 會被清掉，該 emoji 可能改以文字外觀（text presentation）呈現。
+
+  正規化之後若內容仍帶有 daemon 的發件標記 `[operator-page from `——比對**不分大小寫**，所以 `[Operator-Page From ops]` 同樣算——這則 page 會被**拒絕**，代碼 `marker_in_body`。這道檢查緊接在 enabled 開關之後、排在其餘所有 gate 之前：在 authority、可送達性與任何額度扣減之前，所以偽造的內容永遠不會花掉呼叫者的額度；同時以 `warn!` 記下呼叫者名稱，讓 operator 看得到有人試過。它刻意排在開關後面：paging 關閉時整個工具是惰性的，只回 `operator_page_disabled`，所以沒被打開的功能不會變成 agent 拿來灌 daemon log 的管道。先前的版本是把字面標記改寫成 `[quoted: operator-page from ` 後照樣送出；那等於**在沒有任何提示的情況下竄改 operator 看到的文字**（回應裡沒有旗標、log 裡沒有紀錄），而且大小寫變體與 NBSP／ZWSP／RLO 這類拼法根本繞得過去，所以整個作法撤掉。正常的 page 幾乎不可能含有這個標記，拒絕的代價是零，換來的是「攻擊嘗試變成看得見的事件」。
+
+  以下把「擋得住什麼、擋不住什麼」講到精確，因為這段的前一個版本宣稱得比程式碼實際做到的多：
+
+  - **擋得住。** 所有強制換行，以及所有不能原樣留下的字元：control character（**Cc**）、Unicode **`White_Space`**（含 NBSP）、format 字元（**Cf**，例如 ZWSP 與 bidi override），以及 **`Default_Ignorable_Code_Point`** 這一組（CGJ `U+034F`、variation selector）。所以標記無法成為一行的開頭，也無法用「不可見的 format 字元」或「同形空白」拼出來。
+  - **擋不住，而且直說。** 用**同形字（homoglyph）**拼出來的標記——`[оperator-page from ops]`，其中的 `о` 是西里爾字母 `U+043E` 而非拉丁 `o`——**偵測不到，而且會照樣送出**。它每個字元都會顯示出來，所以「是否可見」這個判準根本看不到它；這裡也沒有做 confusable 正規化。
+  - **殘餘風險為什麼有界**——這是緩解，不是修好，就照它的份量講：內容被壓成**一行**，而 daemon 自己的前綴永遠在最前面，所以同形字偽造的標記只可能出現在**行中，且排在真正的 `[operator-page from <caller>]` 前綴之後**。它無法開一個新行，也無法取代真正的發件者。
+
+  原本那條誠實的界線仍然成立：client 對長訊息 soft-wrap 時仍可能讓某個視覺行從內容中段開始，而內容本來就可以寫出其他「看起來像發件者」的文字。以上任何一項都沒有讓 page 變成無法被冒充。
+- **僅限 orchestrator，且綁定到「活的」instance。** 呼叫所帶的 `instance` 會先拿去 daemon 的 live registry 解析：沒有對應到任何執行中 instance（或對應到兩個）的名字以 `unknown_caller` 拒絕；同時屬於兩個 team 的呼叫者以 `ambiguous_team` 拒絕（而不是拿 map 順序亂猜）；不是所屬 team 現任 orchestrator 的以 `not_orchestrator` 拒絕並告知該找誰轉送。沒有 daemon runtime 的 standalone bridge 呼叫無從解析，以 `no_live_identity` 拒絕。
+
+  誰都別騙自己：所有 agent 與 daemon 共用**同一個 OS 使用者**，所以拿 orchestrator 活著的名字來呼叫的座位**依設計會被放行**。這道 gate 擋的是「指向不存在之物的名字」，擋不住「說謎的座位」。真正限住損害的是下面這些——而且只有「不放在 agent 寫得了的檔案裡」的控制才算數：預設關閉、只有 operator 能開的開關、單一專用 topic（仍在 allowlist 群組內），以及每一則 page 都掛著呼叫者名字、直接送到 operator 眼前。每小時 3 則的上限刻意**不**列在這裡：它限住的是意外與失控，不是有敵意的座位（見下面的額度那一條）。
+- **預設關閉，且開關只有 operator 能動。** 開關位於 daemon 的 runtime config；`config` MCP tool 只能讀、不能寫（`set` 於 #2548 移到 CLI）。operator 以下列指令開啟：
+
+  ```
+  agend-terminal admin config-set operator_page.enabled true
+  ```
+
+  目的地 topic 則以 `agend-terminal admin config-set operator_page.topic_name <NAME>` 設定（預設 `operator-notifications`）。`fleet.yaml` 裡的 `channel.operator_page` 區塊已完全不再讀取：fleet.yaml 是 agent 寫得了的檔案，把總開關放在那裡等於讓被管的人自己控開關。Telegram 本身仍需要 `fleet.yaml` 的 `channel.user_allowlist`——沒有它 outbound 一律 fail-closed。
+- **必須是 Telegram。** 這個工具存在的目的是送到 operator 的**手機**：已授權的 Discord channel 不算數；無法送達 telegram 的呼叫以 `not_delivered` 拒絕，且**不消耗**額度。
+- **每位 orchestrator 每滾動小時上限 3 則。** 超出的直接**丟棄**、不排隊；拒絕回應帶有 `retry_after_secs`，呼叫者應改把 milestone 寫進 `SESSION-HANDOFF.md`。計數器以 daemon 記憶體（加鎖）為權威，快照寫到 `$AGEND_HOME/operator_page_rate.json`，以保證**誠實的**重啟不會退款。至於有敵意的改寫在重啟之後還能做什麼，下面會完整講明。
+
+  **快照由 operator 種下，daemon 不會自己造。** `agend-terminal admin config-set operator_page.enabled true` 會在快照不存在時放一個空的（已存在則完全不動，所以重跑這道指令不會退還已用掉的額度）。daemon 拒絕自己補檔：啟動時快照**不存在**的處理方式與「壞掉」完全相同——拒絕。這堵住的正是一個繞道：先刪掉檔案再逼 daemon 重啟，舊設計會以空額度重新初始化，等於把「每小時 3 則」變成「每次重啟 3 則」。
+
+  所有不可信狀態一律以 `budget_unavailable` 拒絕（與 `rate_limited` 明確區分），並附上 `cause` 指出是哪一種：`snapshot_absent`、`snapshot_corrupt`、`snapshot_missing`（daemon 執行中被刪）、`snapshot_unusable`、`snapshot_unwritable`。**每一種的解法都是請 operator 重跑那道 enable 指令**來重新種下快照；快照壞掉的情況要先修好或刪掉。
+
+  **執行這道解法之前，先知道它的代價。** 對 `snapshot_absent` 與 `snapshot_corrupt` 來說，daemon 已經不再持有這個 home 的已用次數——它跟著快照一起被毀掉了——所以重新種下的是一份空的計數器，等於**重新開始一個滾動小時**：當前這個小時裡已經用掉的 page 會被遺忘，呼叫者拿回完整額度。拒絕訊息的 hint 會在 operator 動手之前把這件事講明，種快照本身也會以 `warn!` 記下快照路徑。至於 `snapshot_missing` 與 `snapshot_unwritable`，記憶體裡仍有真實的已用次數，重新種下時會把它寫回去，小時不會被重置；這兩種的 hint 不會帶這段警告。這段話**不是**在宣稱快照防得了竄改——見下一段。真正看得出被動過的只有「不存在、壞掉、被截斷、讀不到」這四種形狀，而這道 operator 解法是給這四種與意外用的。
+
+  **這個持久化計數器擋得住什麼、擋不住什麼。** 這一段的前一個版本宣稱得太多，PRIMARY reviewer 用一個能跑的重現把它推翻了，所以現在改成「竄改形狀 × 行程生命週期」的矩陣來講，而不是喊口號。
+
+  - **擋得住。** daemon **執行中**時每一種形狀都是關著的：計數器在記憶體裡、加了鎖，而且 claim 路徑根本不會去讀檔案取數字，所以檔案裡寫什麼都不影響。**誠實的**重啟會保留已用掉的滾動小時。重啟之後，快照若**不存在、壞掉、被截斷或讀不到**，一律 **fail closed**——以 `budget_unavailable` 加上 `cause` 拒絕（與一般的 `rate_limited` 明確可分），並連同快照路徑寫進 log。快照**寫不進去**時同樣拒絕，並把該次 claim 回滾，而不是放一則沒被計數的 page 出去。這是針對**意外、笨拙的重置與 crash** 的縱深防禦。
+  - **擋不住，直說。** 重啟之後，只要快照**解析得過**，daemon 就會信它，不管內容是什麼。已經用掉 orchestrator 三則額度的 agent，可以把檔案覆寫成合法的 `{}`——或只刪掉某一位 orchestrator 的戳記、或把一份較舊的誠實快照放回去——然後在下一次 daemon 重啟後繼續發 page。這**確實**會把視窗重置。而且在共用同一個 UID、檔案又是 agent 寫得了的前提下，這既**擋不住也偵測不到**：daemon 開機時讀得到、用來驗 MAC 的任何金鑰，agent 一樣讀得到，也就能自己對 `{}` 算出合法的 MAC——偵測失效的理由和防護失效的理由完全一樣。見 [architecture.md §1.2](architecture.zh-TW.md#12-共用-uid-信任模型)。
+  - **「每次重啟都 fail closed」這個選項評估過，被否決了。** 每次 daemon 啟動都不還原剩餘額度，確實能讓「竄改只會導致拒絕」變成字面上為真。但這個部署的 event log 顯示 2026-08-24 到 2026-09-02 之間有 40 次 `daemon_start`——大約每 5.5 小時一次——那等於**有大約 18% 的時間 operator 根本收不到 page**，而這個功能存在的理由就是在他睡覺時把他叫醒。它同時把「攻擊者多拿三則 page」換成「攻擊者**或任何一次 crash** 就能讓 operator 的手機安靜一小時」；對一個**告警**功能來說，被壓下去比送太多更糟。
+  - **所以**，這個持久化的「每小時 3 則」上限**不是**獨立的 same-UID 損害邊界，也不准被說成是。它限住的是意外與非敵意的重置。真正對抗敵意座位的控制，列在上面「僅限 orchestrator」那一條裡。
+
+  「計數器必須撐過 daemon 重啟，否則重啟本身就是繞道」這條耐久性要求仍然成立：誠實的重啟會保留已用掉的小時。出處要講清楚，因為弄錯這一點害我們多繞了四輪：那句話是**orchestrator 在實作任務描述裡的擴充**，不是 operator 的原話。operator 的決定 `d-20260902104216571473-11` 只定下每小時 3 則的上限、DROP 語意與結構化拒絕，通篇沒有任何關於重啟的字眼。被撤回的是更強的那句：「有敵意的 agent 沒辦法自己把額度補滿」。
+- **路由。** 訊息送到專用的 forum topic（預設 `operator-notifications`），首次使用時自動建立並註冊，讓所有 page 集中在一個 operator 可以靜音的地方。若該 topic 無法建立，則退回發送者自己的 topic——兩者都在同一個 allowlist 群組內。
+- **operator 的 Away/Sleep 模式不會抑制 page。** 這是刻意的：這個功能存在的原因，正是 operator 在睡覺而且要求 milestone 要叫醒他。控制 page 的是 `enabled` 開關（總開關）與每小時上限，而不是 mode；一般 daemon 通知仍照舊受 mode 管制。
 
 ### `download_attachment`
 
@@ -228,7 +273,7 @@ Drain 或管理 caller 的 durable inbox。
 讀取 runtime configuration。動作：`get`、`list`；MCP 不支援寫入。
 
 - `get` 需要 `key`。
-- 目前的 keys：`dev_idle_threshold_secs`、`fleet_idle_threshold_secs`、`fleet_idle_ack_ttl_secs`、`hang_auto_recovery_enabled`、`usage_limit_propagation_enabled`、`idle_watchdog_enabled`、`show_pane_state`、`copy_on_select`、`dim_unfocused_panes`、`observed_badge`、`context_alert_pct`、`context_handoff_pct`、`context_handoff_escalate_pct`、`experimental.tool_cli_enabled`。
+- 目前的 keys：`dev_idle_threshold_secs`、`fleet_idle_threshold_secs`、`fleet_idle_ack_ttl_secs`、`hang_auto_recovery_enabled`、`usage_limit_propagation_enabled`、`idle_watchdog_enabled`、`show_pane_state`、`copy_on_select`、`dim_unfocused_panes`、`observed_badge`、`context_alert_pct`、`context_handoff_pct`、`context_handoff_escalate_pct`、`experimental.tool_cli_enabled`、`operator_page.enabled`、`operator_page.topic_name`。
 - 以 `agend-terminal admin config-set <KEY> <VALUE>` 修改值。
 
 ### `restart_daemon`

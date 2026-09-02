@@ -34,6 +34,7 @@ pub mod dedup;
 #[cfg(feature = "discord")]
 pub mod discord;
 pub mod event;
+pub(crate) mod operator_page;
 /// #1642: shared sync→async bridge (`block_on_value`) used by both telegram and
 /// discord — deduped from per-channel copies.
 pub(crate) mod shared_async;
@@ -206,6 +207,19 @@ pub fn notify_all_escalation_channels(
         let _ = gated_notify(ch.as_ref(), instance, severity, message, silent);
     }
     channels.len()
+}
+
+/// Test-only lock for the process-global channel registry.
+///
+/// #3480: `channels_registry()` is process-global, so any two tests that
+/// register or reset channels race unless they agree on one mutex. The M6
+/// fan-out tests had a private guard; sharing it here lets suites in other
+/// modules (`channel::operator_page`) exclude against them instead of
+/// intermittently finding an empty registry.
+#[cfg(test)]
+pub(crate) fn channel_registry_test_guard() -> parking_lot::MutexGuard<'static, ()> {
+    static GUARD: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    GUARD.lock()
 }
 
 /// Sprint 55 P0-A — test-only: clear all registered channels.
@@ -1124,8 +1138,7 @@ MONKEY=banana";
     /// Serialize the process-global channel registry across the registry-touching
     /// tests in this module (mirrors `daemon::router` / `mcp::handlers::channel`).
     fn m6_registry_guard() -> parking_lot::MutexGuard<'static, ()> {
-        static G: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-        G.lock()
+        super::channel_registry_test_guard()
     }
 
     /// Recording channel with a configurable `kind()` (the registry is keyed by

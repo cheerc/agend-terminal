@@ -81,6 +81,18 @@ pub struct RuntimeConfig {
     /// runtime-config.json and can be enabled only by the operator CLI.
     #[serde(default)]
     pub experimental: ExperimentalConfig,
+    /// #3480: the operator-page master switch and the topic pages are routed to.
+    ///
+    /// Nested for the same reason as [`experimental`](Self::experimental): the
+    /// stanza is explicit in `runtime-config.json` and its only mutation surface
+    /// is the operator CLI (`agend-terminal admin config-set
+    /// operator_page.enabled true`) — the `config` MCP tool's `set` action was
+    /// retired in #2548, so agents can READ this and not write it. It lived in
+    /// `fleet.yaml` until the #3480 security review: agents can write fleet.yaml,
+    /// so a master switch there is one its own subjects can flip. Additive field
+    /// with serde defaults — no `schema_version` bump (`docs/COMPATIBILITY.md`).
+    #[serde(default)]
+    pub operator_page: OperatorPageRuntime,
     /// #1990: on-disk schema version. `#[serde(default)]` → an older config
     /// written before this field reads back as 0 (≤ CURRENT, loads normally);
     /// a value > CURRENT means a newer daemon wrote it and is fail-closed in
@@ -98,6 +110,35 @@ pub struct RuntimeConfig {
     /// Higher context-window percent at which the handoff watchdog escalates to the operator.
     #[serde(default = "default_context_handoff_escalate")]
     pub context_handoff_escalate_pct: f32,
+}
+
+/// #3480: daemon-private configuration for the orchestrator-only operator page.
+///
+/// Default-off is the operator's decision, not a conservative guess: with the
+/// stanza absent the tool refuses every call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorPageRuntime {
+    /// Master switch. `false` (the default) makes the tool refuse with a
+    /// structured `operator_page_disabled` and send nothing.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Forum topic pages are routed to, so they collect in one place the operator
+    /// can mute. Created and registered on first use.
+    #[serde(default = "default_operator_page_topic")]
+    pub topic_name: String,
+}
+
+impl Default for OperatorPageRuntime {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            topic_name: default_operator_page_topic(),
+        }
+    }
+}
+
+fn default_operator_page_topic() -> String {
+    "operator-notifications".to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -164,6 +205,7 @@ impl Default for RuntimeConfig {
             dim_unfocused_panes: true,
             observed_badge: true,
             experimental: ExperimentalConfig::default(),
+            operator_page: OperatorPageRuntime::default(),
             context_alert_pct: default_context_alert(),
             context_handoff_pct: default_context_handoff(),
             context_handoff_escalate_pct: default_context_handoff_escalate(),
@@ -394,6 +436,15 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
         .ok()
         .and_then(|d| serde_json::from_str::<RuntimeConfig>(&d).ok())
         .unwrap_or_else(get);
+    // #3480: turning operator paging ON is the operator-gated act that SEEDS the
+    // rate snapshot. Recorded here, acted on only after the config write succeeds.
+    let mut seed_operator_page_budget = false;
+    // …and whether paging was ALREADY on tells the seeder whether this is a
+    // first-ever seed or a RE-seed of a snapshot that has since gone missing. Only
+    // the latter can start a new rolling hour, and only the latter is warned about.
+    // Read from the on-disk config above, not from the process global, so a daemon
+    // that has not reloaded cannot make a re-seed look like a first one.
+    let operator_page_was_enabled = config.operator_page.enabled;
     match key {
         "dev_idle_threshold_secs" => {
             config.dev_idle_threshold_secs = value
@@ -471,6 +522,28 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
                 _ => return Err(format!("invalid boolean: {value} (use true/false)")),
             };
         }
+        "operator_page.enabled" => {
+            config.operator_page.enabled = match value {
+                "true" | "1" => true,
+                "false" | "0" => false,
+                _ => return Err(format!("invalid boolean: {value} (use true/false)")),
+            };
+            // #3480: `channel::operator_page::budget` refuses to invent a snapshot
+            // at initialisation — an absent one DENIES — because starting empty let
+            // an agent refill the hour by deleting the file and forcing a restart.
+            // This command is the only operator-gated write of the switch, so it is
+            // where the snapshot gets laid down. Seeding never clobbers an existing
+            // snapshot, so re-running this to recover does not refund spent pages.
+            // What this does and does NOT cover — a valid rewrite plus a restart
+            // still resets the window — is the tamper matrix in that module.
+            seed_operator_page_budget = config.operator_page.enabled;
+        }
+        "operator_page.topic_name" => {
+            if value.trim().is_empty() {
+                return Err("operator_page.topic_name must not be empty".to_string());
+            }
+            config.operator_page.topic_name = value.to_string();
+        }
         "context_alert_pct" => {
             config.context_alert_pct = value
                 .parse()
@@ -519,6 +592,20 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
     // which would silently flip watchdog / recovery gates.
     crate::store::atomic_write(&path, json.as_bytes()).map_err(|e| e.to_string())?;
     *global().write() = config.clone();
+    if seed_operator_page_budget {
+        // Deliberately NOT fatal to the switch write, and deliberately not silent:
+        // the switch is on but the budget stays poisoned, so paging denies with
+        // `budget_unavailable` until the snapshot can be written. Failing closed is
+        // the right direction; hiding it is not.
+        if let Err(error) =
+            crate::channel::operator_page::budget::seed_snapshot(home, operator_page_was_enabled)
+        {
+            tracing::error!(
+                %error,
+                "#3480: operator_page.enabled was set but the rate snapshot could not be seeded — paging will refuse with budget_unavailable until it can be"
+            );
+        }
+    }
     Ok(serde_json::to_string(&config).unwrap_or_default())
 }
 
@@ -537,6 +624,8 @@ pub fn get_key(key: &str) -> Result<String, String> {
         "dim_unfocused_panes" => Ok(config.dim_unfocused_panes.to_string()),
         "observed_badge" => Ok(config.observed_badge.to_string()),
         "experimental.tool_cli_enabled" => Ok(config.experimental.tool_cli_enabled.to_string()),
+        "operator_page.enabled" => Ok(config.operator_page.enabled.to_string()),
+        "operator_page.topic_name" => Ok(config.operator_page.topic_name.clone()),
         "context_alert_pct" => Ok(config.context_alert_pct.to_string()),
         "context_handoff_pct" => Ok(config.context_handoff_pct.to_string()),
         "context_handoff_escalate_pct" => Ok(config.context_handoff_escalate_pct.to_string()),
@@ -562,8 +651,18 @@ pub fn keys() -> Vec<String> {
         // #1990: `schema_version` is on-disk metadata, not an operator-settable
         // key — keep it out of the `config` MCP tool's key list (set/get_key
         // reject it, so it must not appear as settable).
-        .filter(|k| k != "schema_version" && k != "experimental")
-        .chain(std::iter::once("experimental.tool_cli_enabled".to_string()))
+        // Nested stanzas are reported by their leaf keys, which is what `set` and
+        // `get_key` match on; the bare object name is not settable.
+        .filter(|k| k != "schema_version" && k != "experimental" && k != "operator_page")
+        .chain(
+            [
+                "experimental.tool_cli_enabled",
+                "operator_page.enabled",
+                "operator_page.topic_name",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
         .collect()
 }
 
@@ -797,6 +896,42 @@ mod tests {
                 "keys() reported a non-gettable key: {k}"
             );
         }
+    }
+
+    /// #3480: the operator-page switch is default-OFF, is settable ONLY through
+    /// the operator CLI's `set` (the `config` MCP tool cannot mutate), and
+    /// round-trips through `keys()`/`get_key` like every other settable key.
+    #[test]
+    #[serial(runtime_config)]
+    fn operator_page_switch_is_default_off_and_operator_settable() {
+        let dir =
+            std::env::temp_dir().join(format!("agend-test-oppage-switch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        std::fs::remove_file(dir.join("runtime-config.json")).ok();
+        assert!(
+            !RuntimeConfig::default().operator_page.enabled,
+            "operator paging must be OFF unless the operator turns it on"
+        );
+        assert_eq!(
+            RuntimeConfig::default().operator_page.topic_name,
+            "operator-notifications"
+        );
+
+        set(&dir, "operator_page.enabled", "true").unwrap();
+        reload(&dir);
+        assert_eq!(get_key("operator_page.enabled").unwrap(), "true");
+        assert!(get().operator_page.enabled);
+        assert!(keys().iter().any(|k| k == "operator_page.enabled"));
+        assert!(keys().iter().any(|k| k == "operator_page.topic_name"));
+        assert!(
+            set(&dir, "operator_page.topic_name", "  ").is_err(),
+            "an empty topic name would route pages nowhere"
+        );
+
+        // Leave the process-global switch OFF for whatever runs next.
+        set(&dir, "operator_page.enabled", "false").unwrap();
+        reload(&dir);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// #1990 additive: a pre-#1990 config written WITHOUT a `schema_version`

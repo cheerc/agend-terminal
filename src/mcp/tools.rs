@@ -36,6 +36,13 @@ pub(crate) fn def_reply() -> Value {
         }, "required": []}})
 }
 
+pub(crate) fn def_operator_page() -> Value {
+    json!({"name": "operator_page", "description": "#3480: page the OPERATOR on their Telegram, independent of any inbound channel binding — for milestones the operator explicitly asked to be told about while away or asleep. Orchestrator-only: only the current orchestrator of your team may call it; every other agent must ask its own orchestrator. Off by default and enabled only by the operator (`agend-terminal admin config-set operator_page.enabled true`), capped at 3 pages per orchestrator per rolling hour with the excess DROPPED, never queued — a refusal carries `retry_after_secs` so you can fall back to writing the milestone into SESSION-HANDOFF.md. Pages are NOT suppressed by operator Away/Sleep mode (that is the point); the switch is how the operator silences them. Plain text only, capped at 1000 characters, and always prefixed with your instance name.",
+        "inputSchema": {"type": "object", "properties": {
+            "message": {"type": "string", "description": "The page text. Plain text, no formatting passthrough; truncated at 1000 characters. Every control character (Cc), every Unicode White_Space character including NBSP, and every character with no visible rendering (category Cf such as ZWSP and the bidi overrides, plus the Default_Ignorable_Code_Point set such as CGJ U+034F and the variation selectors) is normalised to an ordinary space, so the page is one line. Your instance name is prefixed automatically inside the daemon's `[operator-page from …]` marker, so do not repeat it — and the body may NOT contain that marker itself: a body that still carries it after normalisation (in any case, or spelled with a look-alike space or an invisible character) is refused with `marker_in_body`, spends no rate slot, and is logged. A marker spelled with HOMOGLYPHS (Cyrillic о for Latin o) is NOT detected and IS delivered; because the body is one line and the daemon's prefix is always first, such a forgery can only appear mid-line after the genuine prefix."}
+        }, "required": ["message"]}})
+}
+
 pub(crate) fn def_download_attachment() -> Value {
     json!({"name": "download_attachment", "description": "Download a file attachment (telegram multimedia: images, audio, documents). Returns local path. Requires daemon API.",
         "inputSchema": {"type": "object", "properties": {"file_id": {"type": "string"}}, "required": ["file_id"]}})
@@ -848,7 +855,7 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            32,
+            33,
             "#1400: 34 + tokens (#1077 Phase 1) = 35; + mode (#1339 Operator Mode) = 36; \
              + ephemeral (#1967 Phase-1) = 37; - replace_instance (#2547, folded into \
              restart_instance mode=fresh) = 36; - set_display_name/set_description \
@@ -859,7 +866,8 @@ mod tests {
              into release_worktree(force:true)) = 27; + bind_topic (#991 Phase 2) = 28; \
              + instance (#2550 P1, folded read-only alias for list_instances/pane_snapshot) = 29; \
              + set_model (#2744 PR-A, typed fleet model intent) = 30; \
-             + revoke_review_assignment (#2782 slice 1) = 31; + usage_limit_takeover (Architecture-14 item 5 Slice 2A) = 32. \
+             + revoke_review_assignment (#2782 slice 1) = 31; + usage_limit_takeover (Architecture-14 item 5 Slice 2A) = 32; \
+             + operator_page (#3480 orchestrator-only operator page) = 33. \
              Current tools: {:?}",
             tools
                 .iter()
@@ -1407,6 +1415,10 @@ mod tests {
         const NON_COORDINATION: &[&str] = &[
             "set_model",
             "reply",
+            // #3480: addresses the OPERATOR, not the fleet. Its single field is
+            // opaque human-readable text, not a directive the daemon consumes —
+            // the same class as `reply`.
+            "operator_page",
             "download_attachment",
             "inbox",
             "list_instances",

@@ -110,6 +110,52 @@ pub fn team_orchestrator_for(home: &Path, member: &str) -> Option<String> {
         })
 }
 
+/// #3480: which team owns `member`, three ways.
+///
+/// [`team_orchestrator_for`] answers with whichever team a `.values().find(...)`
+/// scan reaches first, i.e. with HashMap iteration order when an instance is
+/// listed by more than one team. That is acceptable for the watchdog escalation
+/// it was written for and unacceptable for an authority decision, which must
+/// refuse rather than pick. Kept separate so the existing callers are untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwningTeam {
+    /// Exactly one team lists the member, with that team's declared
+    /// orchestrator (`None` when the team declares none).
+    Sole {
+        team: String,
+        orchestrator: Option<String>,
+    },
+    /// More than one team lists the member, so no single orchestrator exists.
+    /// Team names are sorted so the refusal is reproducible.
+    Ambiguous { teams: Vec<String> },
+    /// No team lists the member — including when fleet.yaml cannot be read.
+    None,
+}
+
+/// Resolve the team(s) that list `member`. Fails closed: an unreadable
+/// fleet.yaml is [`OwningTeam::None`], which grants nothing.
+pub fn owning_team_for(home: &Path, member: &str) -> OwningTeam {
+    let Ok(config) = FleetConfig::load(&fleet_yaml_path(home)) else {
+        return OwningTeam::None;
+    };
+    let mut owning: Vec<(&String, &TeamConfig)> = config
+        .teams
+        .iter()
+        .filter(|(_, team)| team.members.iter().any(|m| m == member))
+        .collect();
+    owning.sort_by(|left, right| left.0.cmp(right.0));
+    match owning.as_slice() {
+        [] => OwningTeam::None,
+        [(name, team)] => OwningTeam::Sole {
+            team: (*name).clone(),
+            orchestrator: team.orchestrator.clone(),
+        },
+        _ => OwningTeam::Ambiguous {
+            teams: owning.iter().map(|(name, _)| (*name).clone()).collect(),
+        },
+    }
+}
+
 /// #1989: the fleet.yaml schema version this daemon reads and writes. Bump
 /// ONLY on a breaking (non-additive) change — additive optional fields with
 /// serde defaults do NOT bump it (`docs/COMPATIBILITY.md`).

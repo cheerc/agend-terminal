@@ -347,12 +347,18 @@ pub(crate) fn tool_allowed_for_role_action(
     tool_allowed_for_role(role_kind, tool)
 }
 
-static ALL_TOOLS: [ToolEntry; 32] = [
+static ALL_TOOLS: [ToolEntry; 33] = [
     // ── Channel ──
     ToolEntry {
         name: "reply",
         definition: super::tools::def_reply,
         handler: super::handlers::dispatch::dispatch_reply,
+        class: ToolClass::SIDE_EFFECT,
+    },
+    ToolEntry {
+        name: "operator_page",
+        definition: super::tools::def_operator_page,
+        handler: super::handlers::dispatch::dispatch_operator_page,
         class: ToolClass::SIDE_EFFECT,
     },
     ToolEntry {
@@ -682,8 +688,8 @@ mod tests {
         let all_names: Vec<&str> = all().iter().map(|e| e.name).collect();
         assert_eq!(
             all_names.len(),
-            32,
-            "registry baseline is 32 tools (+ usage_limit_takeover Architecture-14 item 5 Slice 2A)"
+            33,
+            "registry baseline is 33 tools (+ usage_limit_takeover Architecture-14 item 5 Slice 2A, + operator_page #3480)"
         );
         for role in [
             None,
