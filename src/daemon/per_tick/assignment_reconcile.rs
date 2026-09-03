@@ -8,7 +8,7 @@
 //!     crash-gap and old-generation replays — I18/I19).
 //!   - **A2** row recovery: `durable_enqueue` any `Pending` record (idempotent).
 //!   - **A3/A4** nudge + repair: a record classifying `Unengaged` whose FIXED-
-//!     interval lease is due gets an append-only row repair (A4) and a best-effort
+//!     interval lease is due gets an append-only row repair (A4) and a queued
 //!     self-IPC WAKE pointer (A3), emitted OUTSIDE all flocks. `Satisfied` /
 //!     `EngagedUnsatisfied` is a TRUE stop — never nudged. Generic correlated
 //!     ACK state is not code-review evidence.
@@ -103,11 +103,39 @@ fn log_legacy_cutover_census(home: &Path) {
 }
 
 /// Reconcile every active branch, then fire the collected A3 WAKE pointers OUTSIDE
-/// all flocks (self-IPC nudge; best-effort). Production entry.
+/// all flocks through the delivery worker. Production entry.
+///
+/// #3504 fix: wakes for actionable-unread are now observable — a fenced or
+/// queue-full admission writes a durable `Failed` receipt (via
+/// `wake_review_assignment_result`) and the lease is shortened to 5s instead of
+/// silently advancing 60s with ledger empty.
 pub(crate) fn reconcile_all(home: &Path, now: &str) {
     let wakes = reconcile_all_collect_wakes(home, now);
-    for target in wakes.assignment_targets {
-        crate::inbox::notify::wake_review_assignment(home, &target);
+    for detail in &wakes.assignment_wake_details {
+        let result = crate::inbox::notify::wake_review_assignment_result_for_assignment(
+            home,
+            &detail.target,
+            &detail.repo,
+            &detail.branch,
+            detail.assignment_id,
+            now,
+        );
+        if matches!(
+            result,
+            Err(crate::daemon::delivery_worker::TransportEnqueueError::QueueFull { .. })
+                | Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced { .. })
+        ) {
+            // Admission failure is known synchronously; retain the row and let
+            // the bounded retry make the failure visible to the next tick.
+            let _ = store::set_short_retry_lease(
+                home,
+                &detail.repo,
+                &detail.branch,
+                &detail.target,
+                now,
+                detail.assignment_id,
+            );
+        }
     }
     for wake in wakes.continuations {
         if let Err(error) = crate::inbox::wake_persisted_pointer(
@@ -127,17 +155,30 @@ pub(crate) fn reconcile_all(home: &Path, now: &str) {
 }
 
 /// Deterministic tested core: reconcile every active branch and RETURN the set of
-/// targets to WAKE (A3), so the caller emits the self-IPC pointers lock-free. Takes
-/// `now` injected — no unmockable clock inside.
+/// targets to WAKE (A3), so the production caller emits the self-IPC pointers
+/// lock-free and owns their transport outcome. Takes `now` injected — no
+/// unmockable clock inside.
 #[cfg(test)]
 pub(crate) fn reconcile_all_collect(home: &Path, now: &str) -> Vec<String> {
-    reconcile_all_collect_wakes(home, now).assignment_targets
+    let wakes = reconcile_all_collect_wakes(home, now);
+    // This collector intentionally does not apply the wake outcome. The
+    // production entry point owns transport admission and lease advancement;
+    // tests that assert that contract must drive `reconcile_all` itself.
+    wakes.assignment_targets
 }
 
 #[derive(Default)]
 struct ReconcileWakes {
     assignment_targets: Vec<String>,
+    assignment_wake_details: Vec<AssignmentWakeInfo>,
     continuations: Vec<ContinuationWake>,
+}
+
+struct AssignmentWakeInfo {
+    target: String,
+    repo: String,
+    branch: String,
+    assignment_id: uuid::Uuid,
 }
 
 struct ContinuationWake {
@@ -210,6 +251,9 @@ fn reconcile_all_collect_wakes(home: &Path, now: &str) -> ReconcileWakes {
         wakes
             .assignment_targets
             .extend(branch_wakes.assignment_targets);
+        wakes
+            .assignment_wake_details
+            .extend(branch_wakes.assignment_wake_details);
         wakes.continuations.extend(branch_wakes.continuations);
     }
     wakes
@@ -306,10 +350,25 @@ fn reconcile_branch(
         // the FIXED-interval lease (returns false when not due) and advances it, so
         // two ticks in one interval fire at most once (I12). Wake fires on an
         // actionable-unread row (pure wake) or a missing/superseded row (repair).
+        //
+        // #3504: for actionable-unread `repair_row` no longer advances the lease
+        // before the wake outcome is known — the reconciler advances on success
+        // or sets a 5s short retry on fenced/queue-full (bounded). Missing/
+        // superseded repair already created a durable row and advanced 60s.
         if store::classify_assignment(&record, prstate) == store::AssignmentEvidence::Unengaged
             && store::repair_row(home, repo, branch, &record.target, now).unwrap_or(false)
         {
+            // Both healthy actionable rows and append-only repaired rows use
+            // the typed worker path. For a repaired row, `repair_row` has
+            // already set the normal lease; a worker failure still replaces
+            // it with the bounded short retry.
             wakes.assignment_targets.push(record.target.clone());
+            wakes.assignment_wake_details.push(AssignmentWakeInfo {
+                target: record.target.clone(),
+                repo: repo.to_string(),
+                branch: branch.to_string(),
+                assignment_id: record.assignment_id,
+            });
         }
     }
 
@@ -504,6 +563,18 @@ mod tests {
         s.pr_number = pr;
         s.merge_state = MergeState::NotReady;
         pr_state::save(home, &s).unwrap();
+    }
+
+    fn install_test_claude_locator(home: &Path, instance: &str) {
+        let mut locator = crate::transport::SessionLocator::claude(
+            "http://127.0.0.1:43123".to_string(),
+            "assignment-wake-test".to_string(),
+            "test-token".to_string(),
+        );
+        locator.managed = true;
+        locator.server_pid = Some(std::process::id());
+        locator.server_start_token = crate::process::process_start_token(std::process::id());
+        crate::transport::save_session_locator(home, instance, &locator).unwrap();
     }
 
     fn seed_open_task(home: &Path, task_id: &str) {
@@ -857,10 +928,12 @@ mod tests {
             vec!["reviewer".to_string()],
             "actionable-unread row triggers pure wake (no rotation)"
         );
-        // The lease still advanced (a full interval away) so the guard is bounded.
-        assert_ne!(
+        // The collector does not own transport admission, so it must not mutate
+        // the lease. The production `reconcile_all` advances it after the wake
+        // outcome is known.
+        assert_eq!(
             after.next_nudge_at, rec.next_nudge_at,
-            "next_nudge_at advanced past created_at even though no repair fired"
+            "collector must not advance the lease before transport admission"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -2212,10 +2285,242 @@ mod tests {
             .delivery_nonce;
         assert_eq!(nonce_0, nonce_1, "pure wake: nonce not rotated");
 
-        // Second tick within 60s → lease not due → no wake.
+        // The collector intentionally does not apply transport admission, so it
+        // has no lease outcome to apply; production `reconcile_all` owns that
+        // post-admission transition.
         let wakes = reconcile_all_collect(&home, "2026-07-13T00:00:30Z");
-        assert!(wakes.is_empty(), "second tick within lease ⇒ no wake");
+        assert_eq!(
+            wakes,
+            vec!["reviewer".to_string()],
+            "collector must not pretend the wake succeeded"
+        );
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3504 RED: a queued wake must not advance the lease before the delivery
+    /// worker reports the adapter outcome. A dead ChannelBridge/adapter failure
+    /// must produce the bounded retry lease from the real `reconcile_all` entry.
+    #[test]
+    fn adapter_failure_keeps_wake_visible_until_worker_records_failure() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let home = tmp_home("adapter-failure-wake");
+        let rec = mk("o/r", "feat/x", "reviewer", 7, "2026-07-13T00:00:00Z");
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  reviewer:\n    backend: claude\n    env:\n      AGEND_TRANSPORT_MODE: channel_bridge\n",
+        )
+        .unwrap();
+        install_test_claude_locator(&home, "reviewer");
+
+        let _full = crate::daemon::delivery_worker::test_support::force_full_guard();
+        crate::daemon::delivery_worker::test_support::set_force_full(false);
+        let _transport = crate::transport::test_support::delivery_hook_guard();
+        let entered = std::sync::Arc::new(AtomicBool::new(false));
+        let release = std::sync::Arc::new(AtomicBool::new(false));
+        let expected_home = home.clone();
+        let entered_hook = std::sync::Arc::clone(&entered);
+        let release_hook = std::sync::Arc::clone(&release);
+        crate::transport::test_support::set_delivery_hook(Some(std::sync::Arc::new(
+            move |called_home, _name, _body| {
+                if called_home != expected_home.as_path() {
+                    return None;
+                }
+                entered_hook.store(true, Ordering::SeqCst);
+                while !release_hook.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Some(Err(anyhow::anyhow!("dead ChannelBridge locator")))
+            },
+        )));
+
+        reconcile_all(&home, "2026-07-13T00:00:01Z");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !entered.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            entered.load(Ordering::SeqCst),
+            "wake must reach the delivery worker"
+        );
+
+        let before_outcome = store::get(&home, "o/r", "feat/x", "reviewer").unwrap();
+        assert_eq!(
+            before_outcome.next_nudge_at, rec.next_nudge_at,
+            "adapter outcome is not known while the worker is blocked"
+        );
+
+        release.store(true, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while crate::daemon::delivery_worker::test_support::transport_dispatch_count(
+            &home, "reviewer",
+        ) == 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let after_failure = store::get(&home, "o/r", "feat/x", "reviewer").unwrap();
+        assert_eq!(
+            after_failure.next_nudge_at, "2026-07-13T00:00:06+00:00",
+            "adapter failure must leave a bounded short retry lease"
+        );
+        let events = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap();
+        assert!(
+            events.contains("transport_delivery_failed"),
+            "adapter failure must leave a durable inspectable failure event"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn accepted_assignment_wake_advances_lease_after_worker_outcome() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let home = tmp_home("accepted-assignment-wake");
+        let rec = mk("o/r", "feat/x", "reviewer", 7, "2026-07-13T00:00:00Z");
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  reviewer:\n    backend: claude\n    env:\n      AGEND_TRANSPORT_MODE: channel_bridge\n",
+        )
+        .unwrap();
+        install_test_claude_locator(&home, "reviewer");
+
+        let _full = crate::daemon::delivery_worker::test_support::force_full_guard();
+        crate::daemon::delivery_worker::test_support::set_force_full(false);
+        let _transport = crate::transport::test_support::delivery_hook_guard();
+        let entered = std::sync::Arc::new(AtomicBool::new(false));
+        let release = std::sync::Arc::new(AtomicBool::new(false));
+        let expected_home = home.clone();
+        let entered_hook = std::sync::Arc::clone(&entered);
+        let release_hook = std::sync::Arc::clone(&release);
+        crate::transport::test_support::set_delivery_hook(Some(std::sync::Arc::new(
+            move |called_home, name, body| {
+                if called_home != expected_home.as_path() {
+                    return None;
+                }
+                entered_hook.store(true, Ordering::SeqCst);
+                while !release_hook.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let envelope = crate::transport::DeliveryEnvelope::new(
+                    name,
+                    crate::transport::SessionLocator::claude(
+                        "http://127.0.0.1:43123".to_string(),
+                        "assignment-wake-test".to_string(),
+                        "test-token".to_string(),
+                    ),
+                    crate::transport::DeliveryKind::Notification,
+                    body,
+                    None,
+                );
+                Some(Ok(crate::transport::DeliveryReceipt::for_state(
+                    &envelope,
+                    crate::transport::DeliveryState::ProtocolAccepted,
+                )))
+            },
+        )));
+
+        reconcile_all(&home, "2026-07-13T00:00:01Z");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !entered.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            entered.load(Ordering::SeqCst),
+            "wake must reach the delivery worker"
+        );
+        assert_eq!(
+            store::get(&home, "o/r", "feat/x", "reviewer")
+                .unwrap()
+                .next_nudge_at,
+            rec.next_nudge_at,
+            "accepted queue admission must not advance the lease early"
+        );
+
+        release.store(true, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while crate::daemon::delivery_worker::test_support::transport_dispatch_count(
+            &home, "reviewer",
+        ) == 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            store::get(&home, "o/r", "feat/x", "reviewer")
+                .unwrap()
+                .next_nudge_at,
+            "2026-07-13T00:01:01+00:00",
+            "accepted adapter outcome advances the bounded lease"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn queue_full_assignment_wake_records_failure_and_short_retry() {
+        let home = tmp_home("queue-full-assignment-wake");
+        let rec = mk("o/r", "feat/x", "reviewer", 7, "2026-07-13T00:00:00Z");
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  reviewer:\n    backend: claude\n    env:\n      AGEND_TRANSPORT_MODE: channel_bridge\n",
+        )
+        .unwrap();
+        install_test_claude_locator(&home, "reviewer");
+
+        let _full = crate::daemon::delivery_worker::test_support::force_full_guard();
+        crate::daemon::delivery_worker::test_support::set_force_full(true);
+        reconcile_all(&home, "2026-07-13T00:00:01Z");
+        crate::daemon::delivery_worker::test_support::set_force_full(false);
+
+        let after = store::get(&home, "o/r", "feat/x", "reviewer").unwrap();
+        assert_eq!(
+            after.next_nudge_at, "2026-07-13T00:00:06+00:00",
+            "queue admission failure must use the bounded retry lease"
+        );
+        let receipts = std::fs::read_to_string(crate::transport::delivery_path_for_instance(
+            &home, "reviewer",
+        ))
+        .unwrap();
+        assert!(receipts.contains("\"state\":\"Failed\""));
+        assert!(receipts.contains("bounded transport delivery queue full"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn fenced_assignment_wake_records_failure_and_short_retry() {
+        let home = tmp_home("fenced-assignment-wake");
+        let rec = mk("o/r", "feat/x", "reviewer", 7, "2026-07-13T00:00:00Z");
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  reviewer:\n    backend: claude\n    env:\n      AGEND_TRANSPORT_MODE: channel_bridge\n",
+        )
+        .unwrap();
+        install_test_claude_locator(&home, "reviewer");
+
+        let cleanup = crate::daemon::delivery_worker::begin_transport_cleanup(&home, "reviewer");
+        reconcile_all(&home, "2026-07-13T00:00:01Z");
+
+        let after = store::get(&home, "o/r", "feat/x", "reviewer").unwrap();
+        assert_eq!(
+            after.next_nudge_at, "2026-07-13T00:00:06+00:00",
+            "fenced admission must use the bounded retry lease"
+        );
+        let receipts = std::fs::read_to_string(crate::transport::delivery_path_for_instance(
+            &home, "reviewer",
+        ))
+        .unwrap();
+        assert!(receipts.contains("\"state\":\"Failed\""));
+        assert!(receipts.contains("fenced during generation transition"));
+        drop(cleanup);
         std::fs::remove_dir_all(&home).ok();
     }
 
