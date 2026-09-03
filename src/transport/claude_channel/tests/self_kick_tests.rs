@@ -1,5 +1,21 @@
 use super::*;
 
+/// A per-tick pass that observed whatever marker the row carries right now and
+/// has just made its notice durable. r4 threads the OBSERVED marker into
+/// `clear_self_kick_notice`, so a test standing in for that pass must read the
+/// marker BEFORE it clears — exactly what the production caller does via
+/// `SelfKickOutcome::observed_notice`.
+fn clear_observed_notice(home: &Path, instance: &str, delivery_id: Uuid) -> anyhow::Result<bool> {
+    let store = ReceiptStore::for_instance(home, instance)?;
+    let Some(observed) = store
+        .latest(delivery_id)?
+        .and_then(|receipt| receipt.notice_pending)
+    else {
+        return Ok(true);
+    };
+    clear_self_kick_notice(home, instance, delivery_id, &observed)
+}
+
 #[test]
 fn channel_bridge_queue_without_turn_start_is_truthfully_overdue() {
     let _delivery_hook_guard = super::super::super::registry::test_support::delivery_hook_guard();
@@ -43,7 +59,9 @@ fn channel_bridge_queue_without_turn_start_is_truthfully_overdue() {
         .record_if_latest_state(accepted.delivery_id, DeliveryState::ProtocolAccepted, old)
         .expect("backdate"));
     assert_eq!(
-        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now()).expect("watchdog"),
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+            .expect("watchdog")
+            .len(),
         1
     );
     assert_eq!(
@@ -143,7 +161,9 @@ fn self_kick_late_ack_after_four_minutes_is_admissible_and_completes() {
         .expect("backdate")
         .then_some(());
     assert_eq!(
-        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now()).expect("watchdog"),
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+            .expect("watchdog")
+            .len(),
         1
     );
     let started = mcp_message(
@@ -310,8 +330,10 @@ fn self_kick_ack_is_exact_id_and_has_no_reply_or_sse_side_effect() {
             &home,
             "claude-agent",
             Utc::now() + chrono::Duration::hours(1),
+            &|_| None,
         )
-        .expect("successful turn watchdog"),
+        .expect("successful turn watchdog")
+        .len(),
         0,
         "a completed self-kick must not produce a missing-ack alert"
     );
@@ -337,11 +359,26 @@ fn self_kick_watchdog_replays_durable_acceptance_and_alerts_once() {
 
     let now = Utc::now();
     assert_eq!(
-        self_kick_watchdog_pass_at(&home, "claude-agent", now).expect("watchdog"),
+        self_kick_watchdog_pass_at(&home, "claude-agent", now, &|_| None)
+            .expect("watchdog")
+            .len(),
         1
     );
+    // PR #3495: the alert is latched by the state CAS, but its durable notice
+    // intent is replayed until the caller confirms the notice is enqueued —
+    // that replay is the crash-gap guarantee, not a second alert.
     assert_eq!(
-        self_kick_watchdog_pass_at(&home, "claude-agent", now).expect("latch"),
+        self_kick_watchdog_pass_at(&home, "claude-agent", now, &|_| None)
+            .expect("replay")
+            .len(),
+        1,
+        "an unconfirmed notice intent is replayed"
+    );
+    assert!(clear_observed_notice(&home, "claude-agent", envelope.delivery_id).expect("clear"));
+    assert_eq!(
+        self_kick_watchdog_pass_at(&home, "claude-agent", now, &|_| None)
+            .expect("latch")
+            .len(),
         0
     );
     assert_eq!(
@@ -402,5 +439,768 @@ fn self_kick_receipt_cas_stress_has_one_terminal_winner() {
             .state,
         DeliveryState::AckOverdue
     );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// t-…-82348-105: an `ack_start` that arrives AFTER the watchdog declared
+/// `AckOverdue` must leave a durable, typed reconciliation marker so the
+/// daemon can tell the operator the earlier alarm is resolved — and must do
+/// so exactly once, for the ack and for the watchdog pass that consumes it.
+#[test]
+fn self_kick_late_ack_after_overdue_marks_and_reconciles_exactly_once() {
+    let (home, runtime, envelope, _chat_id) = self_kick_fixture("late-ack-marker");
+    let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+    let mut old = store
+        .latest(envelope.delivery_id)
+        .expect("latest")
+        .expect("accepted");
+    old.recorded_at = (Utc::now()
+        - chrono::Duration::seconds(SELF_KICK_ACK_WINDOW.as_secs() as i64 + 14))
+    .to_rfc3339();
+    assert!(store
+        .record_if_latest_state(envelope.delivery_id, DeliveryState::ProtocolAccepted, old)
+        .expect("backdate"));
+    assert_eq!(
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+            .expect("watchdog")
+            .len(),
+        1
+    );
+
+    let ack = json!({
+        "jsonrpc":"2.0", "id":1, "method":"tools/call",
+        "params":{"name":"ack_start","arguments":{"delivery_id":envelope.delivery_id}}
+    });
+    let started = mcp_message(ack.clone(), &runtime).expect("late start response");
+    assert_eq!(
+        started["result"]["structuredContent"]["state"],
+        "TurnStarted"
+    );
+
+    let latest = store
+        .latest(envelope.delivery_id)
+        .expect("latest")
+        .expect("receipt");
+    assert_eq!(
+        latest.backend_event.as_deref(),
+        Some("claude_channel_turn_started_late"),
+        "a post-AckOverdue ack must be marked as the late one"
+    );
+    let late_by = latest.late_ack_secs.expect("late_ack_secs must be stamped");
+    assert!(
+        (14..=16).contains(&late_by),
+        "late_ack_secs must measure the overshoot past the window, got {late_by}"
+    );
+
+    let log = fs::read_to_string(home.join("event-log.jsonl")).expect("event log");
+    assert_eq!(log.matches("claude_self_kick_ack_late").count(), 1);
+
+    // A second ack is an idempotent no-op: no second event, no re-stamp.
+    mcp_message(ack, &runtime).expect("repeat ack");
+    let log = fs::read_to_string(home.join("event-log.jsonl")).expect("event log");
+    assert_eq!(
+        log.matches("claude_self_kick_ack_late").count(),
+        1,
+        "a repeated ack must not log a second late-ack event"
+    );
+
+    // PR #3495 r3: the late ack does NOT supersede the overdue notice the
+    // watchdog persisted and nobody has sent yet (the r2 behaviour, ruled a
+    // violation: the operator was told to inspect the agent and never told
+    // the alarm was raised at all). The pass replays the OVERDUE intent
+    // first...
+    let outcomes = self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+        .expect("overdue replay pass");
+    assert_eq!(outcomes.len(), 1, "one outcome: {outcomes:?}");
+    assert!(
+        matches!(outcomes[0].kind, SelfKickOutcomeKind::AckOverdue { .. }),
+        "the unsent overdue alert comes first: {:?}",
+        outcomes[0].kind
+    );
+    assert!(
+        clear_observed_notice(&home, "claude-agent", envelope.delivery_id).expect("clear overdue"),
+        "the caller clears it once that notice is durably enqueued"
+    );
+
+    // ...and only then derives the distinct resolving notice from the
+    // `late_ack_secs` the same ack stamped.
+    let outcomes = self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+        .expect("reconcile pass");
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "one reconciliation outcome: {outcomes:?}"
+    );
+    assert!(
+        matches!(
+            outcomes[0].kind,
+            SelfKickOutcomeKind::AckLate { late_by_secs } if late_by_secs == late_by
+        ),
+        "the outcome must be AckLate carrying the overshoot: {:?}",
+        outcomes[0].kind
+    );
+    // PR #3495: the pass MOVES the marker into a durable notice intent rather
+    // than consuming it, so the outcome is replayed until the caller confirms
+    // the notice is enqueued. Until then a repeat pass re-offers the SAME
+    // outcome (that is the crash-gap retry), and only the clear ends it.
+    assert_eq!(
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+            .expect("replay pass")
+            .len(),
+        1,
+        "an unconfirmed notice intent is replayed, not dropped"
+    );
+    assert!(
+        clear_observed_notice(&home, "claude-agent", envelope.delivery_id).expect("clear"),
+        "the caller clears the intent once the notice is durably enqueued"
+    );
+    assert_eq!(
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+            .expect("second reconcile pass")
+            .len(),
+        0,
+        "the late ack is reconciled exactly once"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// PR #3495 (d): two scanners that read the SAME durable snapshot must not
+/// both reconcile it. The late-ack transition PRESERVES `TurnStarted`, so a
+/// state-only compare-and-append is not a linearization point for it: both
+/// scanners pass it — sequentially, under the store's own file lock — and the
+/// operator gets the resolving notice twice. The marker-aware CAS makes the
+/// scanner holding the stale marker lose.
+#[test]
+fn concurrent_stale_snapshot_reconciles_once() {
+    let (home, runtime, envelope, _chat_id) = self_kick_fixture("stale-snapshot");
+    let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+    let mut old = store
+        .latest(envelope.delivery_id)
+        .expect("latest")
+        .expect("accepted");
+    old.recorded_at = (Utc::now()
+        - chrono::Duration::seconds(SELF_KICK_ACK_WINDOW.as_secs() as i64 + 12))
+    .to_rfc3339();
+    assert!(store
+        .record_if_latest_state(envelope.delivery_id, DeliveryState::ProtocolAccepted, old)
+        .expect("backdate"));
+
+    // The overdue half: the state CHANGES, so a stale scanner already loses
+    // there — pinned below — but the intent must be durable before the notice.
+    let overdue_snapshot = store
+        .latest(envelope.delivery_id)
+        .expect("latest")
+        .expect("receipt");
+    assert_eq!(
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+            .expect("watchdog")
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .latest(envelope.delivery_id)
+            .expect("latest")
+            .expect("receipt")
+            .notice_pending
+            .map(|notice| notice.kind),
+        Some(crate::transport::PendingNotice::ACK_OVERDUE.to_string()),
+        "the overdue notice intent must be persisted by the SAME CAS that moves the state"
+    );
+    let mut stale_overdue = overdue_snapshot.clone();
+    stale_overdue.state = DeliveryState::AckOverdue;
+    stale_overdue.notice_pending = Some(crate::transport::PendingNotice::new(
+        crate::transport::PendingNotice::ACK_OVERDUE,
+        None,
+    ));
+    assert!(
+        !store
+            .record_if_marker(
+                envelope.delivery_id,
+                DeliveryState::ProtocolAccepted,
+                overdue_snapshot.late_ack_secs,
+                overdue_snapshot.notice_pending.as_ref(),
+                stale_overdue,
+            )
+            .expect("stale overdue CAS"),
+        "a second scanner holding the pre-transition snapshot must lose"
+    );
+    assert!(
+        clear_observed_notice(&home, "claude-agent", envelope.delivery_id).expect("clear overdue")
+    );
+
+    // The late-ack half: the state is PRESERVED, which is where a state-only
+    // predicate admits the duplicate.
+    let ack = json!({
+        "jsonrpc":"2.0", "id":1, "method":"tools/call",
+        "params":{"name":"ack_start","arguments":{"delivery_id":envelope.delivery_id}}
+    });
+    assert_eq!(
+        mcp_message(ack, &runtime).expect("late start response")["result"]["structuredContent"]
+            ["state"],
+        "TurnStarted"
+    );
+    let snapshot_a = store
+        .latest(envelope.delivery_id)
+        .expect("latest")
+        .expect("receipt");
+    let late_by = snapshot_a.late_ack_secs.expect("late_ack_secs");
+    // Scanner B reads the identical snapshot before A commits anything.
+    let snapshot_b = snapshot_a.clone();
+
+    // A reconciles in full: intent CAS, (the caller's enqueue), clear.
+    assert_eq!(
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+            .expect("scanner A")
+            .len(),
+        1,
+        "scanner A reconciles the late ack"
+    );
+    assert!(
+        clear_observed_notice(&home, "claude-agent", envelope.delivery_id).expect("clear late"),
+        "and clears the intent after its notice is durable"
+    );
+
+    // B now attempts the same transition from its stale snapshot.
+    let mut reconciled = snapshot_b.clone();
+    reconciled.late_ack_secs = None;
+    reconciled.notice_pending = Some(crate::transport::PendingNotice::new(
+        crate::transport::PendingNotice::LATE_ACK,
+        Some(late_by),
+    ));
+    assert!(
+        !store
+            .record_if_marker(
+                envelope.delivery_id,
+                DeliveryState::TurnStarted,
+                snapshot_b.late_ack_secs,
+                snapshot_b.notice_pending.as_ref(),
+                reconciled,
+            )
+            .expect("stale late-ack CAS"),
+        "the scanner holding the stale reconciliation marker must lose its CAS"
+    );
+    assert_eq!(
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+            .expect("final pass")
+            .len(),
+        0,
+        "and exactly one reconciliation happened overall"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// PR #3495 r3 (a): the reviewer's repro. The watchdog persists
+/// `state=AckOverdue` together with the durable INTENT to notify; a truthful
+/// but LATE `ack_start` that lands before the per-tick caller enqueues that
+/// notice must NOT destroy the intent. The overdue alert is owed to the
+/// operator whatever happens afterwards — losing it here (a crash between the
+/// transition and the enqueue) makes it underivable from the durable log,
+/// which can then only produce the later, distinct late-ack notice.
+#[test]
+fn late_ack_preserves_pending_overdue_notice() {
+    let (home, runtime, envelope, _chat_id) = self_kick_fixture("late-ack-preserve-intent");
+    let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+    let mut old = store
+        .latest(envelope.delivery_id)
+        .expect("latest")
+        .expect("accepted");
+    old.recorded_at = (Utc::now()
+        - chrono::Duration::seconds(SELF_KICK_ACK_WINDOW.as_secs() as i64 + 7))
+    .to_rfc3339();
+    assert!(store
+        .record_if_latest_state(envelope.delivery_id, DeliveryState::ProtocolAccepted, old)
+        .expect("backdate"));
+    assert_eq!(
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+            .expect("watchdog")
+            .len(),
+        1,
+        "the watchdog persists the overdue intent"
+    );
+    assert_eq!(
+        store
+            .latest(envelope.delivery_id)
+            .expect("latest")
+            .expect("receipt")
+            .notice_pending
+            .map(|notice| notice.kind),
+        Some(crate::transport::PendingNotice::ACK_OVERDUE.to_string()),
+        "precondition: the intent is durable and UNSENT"
+    );
+
+    // The late ack arrives before the per-tick pass enqueues anything.
+    let ack = json!({
+        "jsonrpc":"2.0", "id":1, "method":"tools/call",
+        "params":{"name":"ack_start","arguments":{"delivery_id":envelope.delivery_id}}
+    });
+    assert_eq!(
+        mcp_message(ack, &runtime).expect("late start response")["result"]["structuredContent"]
+            ["state"],
+        "TurnStarted"
+    );
+
+    let latest = store
+        .latest(envelope.delivery_id)
+        .expect("latest")
+        .expect("receipt");
+    assert_eq!(
+        latest.state,
+        DeliveryState::TurnStarted,
+        "the truthful ack still advances the state"
+    );
+    assert_eq!(
+        latest
+            .notice_pending
+            .as_ref()
+            .map(|notice| notice.kind.as_str()),
+        Some(crate::transport::PendingNotice::ACK_OVERDUE),
+        "and it must CARRY the unsent overdue intent forward: {latest:?}"
+    );
+    assert!(
+        latest.late_ack_secs.is_some(),
+        "while still stamping the late-ack overshoot for the second notice: {latest:?}"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// PR #3495 r3 (d): a transition computed from a STALE `AckOverdue` snapshot
+/// must not reintroduce an intent the per-tick pass has already cleared —
+/// that would re-deliver the overdue notice under a new key-free window. The
+/// marker-aware CAS makes the stale attempt lose; the bounded retry then
+/// re-reads and commits against the fresh row.
+#[test]
+fn stale_ack_transition_cannot_reintroduce_cleared_intent() {
+    let (home, _runtime, envelope, _chat_id) = self_kick_fixture("stale-ack-reintroduce");
+    let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+    let mut old = store
+        .latest(envelope.delivery_id)
+        .expect("latest")
+        .expect("accepted");
+    old.recorded_at = (Utc::now()
+        - chrono::Duration::seconds(SELF_KICK_ACK_WINDOW.as_secs() as i64 + 5))
+    .to_rfc3339();
+    assert!(store
+        .record_if_latest_state(envelope.delivery_id, DeliveryState::ProtocolAccepted, old)
+        .expect("backdate"));
+    assert_eq!(
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+            .expect("watchdog")
+            .len(),
+        1
+    );
+    // The snapshot the ack's transition is computed from: AckOverdue, intent
+    // still pending.
+    let stale = store
+        .latest(envelope.delivery_id)
+        .expect("latest")
+        .expect("receipt");
+    assert!(stale.notice_pending.is_some());
+
+    // Meanwhile the per-tick pass enqueues the overdue notice and clears it.
+    assert!(
+        clear_observed_notice(&home, "claude-agent", envelope.delivery_id).expect("clear overdue")
+    );
+
+    // The ack now applies its transition from the stale snapshot.
+    let started = crate::transport::claude_channel::record_self_kick_turn_started(
+        &home,
+        "claude-agent",
+        "self-kick-session",
+        &store,
+        &envelope,
+        stale,
+        Utc::now(),
+    )
+    .expect("late ack from a stale snapshot");
+    assert_eq!(started.state, DeliveryState::TurnStarted);
+    assert!(
+        started.notice_pending.is_none(),
+        "the cleared intent must NOT be resurrected: {started:?}"
+    );
+    assert!(
+        started.late_ack_secs.is_some(),
+        "and the retry against the fresh row still stamps the overshoot: {started:?}"
+    );
+    let durable = store
+        .latest(envelope.delivery_id)
+        .expect("latest")
+        .expect("receipt");
+    assert!(durable.notice_pending.is_none(), "durably too: {durable:?}");
+
+    // Exactly one further outcome — the late-ack reconciliation — and no
+    // second overdue notice.
+    let outcomes =
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None).expect("pass");
+    assert_eq!(outcomes.len(), 1, "one outcome: {outcomes:?}");
+    assert!(
+        matches!(outcomes[0].kind, SelfKickOutcomeKind::AckLate { .. }),
+        "and it is the late-ack one: {:?}",
+        outcomes[0].kind
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// PR #3495 r3, the SIBLING path of (a): `ack_complete` rewrites the receipt
+/// too. The consumer normally calls it moments after `ack_start`, i.e. inside
+/// the same gap, and `Completed` is TERMINAL — so a completion that dropped
+/// the pending intent would put the owed notices permanently out of the
+/// watchdog's reach.
+#[test]
+fn completion_preserves_pending_overdue_notice() {
+    let (home, runtime, envelope, _chat_id) = self_kick_fixture("complete-preserve-intent");
+    let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+    let mut old = store
+        .latest(envelope.delivery_id)
+        .expect("latest")
+        .expect("accepted");
+    old.recorded_at = (Utc::now()
+        - chrono::Duration::seconds(SELF_KICK_ACK_WINDOW.as_secs() as i64 + 6))
+    .to_rfc3339();
+    assert!(store
+        .record_if_latest_state(envelope.delivery_id, DeliveryState::ProtocolAccepted, old)
+        .expect("backdate"));
+    assert_eq!(
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+            .expect("watchdog")
+            .len(),
+        1
+    );
+    for tool in ["ack_start", "ack_complete"] {
+        let call = json!({
+            "jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params":{"name":tool,"arguments":{"delivery_id":envelope.delivery_id}}
+        });
+        assert!(
+            mcp_message(call, &runtime).is_some(),
+            "{tool} must be accepted"
+        );
+    }
+    let latest = store
+        .latest(envelope.delivery_id)
+        .expect("latest")
+        .expect("receipt");
+    assert_eq!(latest.state, DeliveryState::Completed);
+    assert_eq!(
+        latest
+            .notice_pending
+            .as_ref()
+            .map(|notice| notice.kind.as_str()),
+        Some(crate::transport::PendingNotice::ACK_OVERDUE),
+        "completion must carry the unsent overdue intent: {latest:?}"
+    );
+    assert!(
+        latest.late_ack_secs.is_some(),
+        "and the late-ack overshoot: {latest:?}"
+    );
+
+    // A terminal receipt that still owes notices stays visible to the scan.
+    let outcomes = self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+        .expect("replay pass");
+    assert_eq!(outcomes.len(), 1, "the overdue replay: {outcomes:?}");
+    assert!(matches!(
+        outcomes[0].kind,
+        SelfKickOutcomeKind::AckOverdue { .. }
+    ));
+    assert!(clear_observed_notice(&home, "claude-agent", envelope.delivery_id).expect("clear"));
+    let outcomes = self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+        .expect("late pass");
+    assert_eq!(outcomes.len(), 1, "then the late-ack one: {outcomes:?}");
+    assert!(matches!(
+        outcomes[0].kind,
+        SelfKickOutcomeKind::AckLate { .. }
+    ));
+    assert!(clear_observed_notice(&home, "claude-agent", envelope.delivery_id).expect("clear"));
+    assert_eq!(
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+            .expect("final pass")
+            .len(),
+        0,
+        "and nothing is owed after both notices"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// A self-kick row parked at `ProtocolAccepted`, accepted `age_secs` ago —
+/// the shape the watchdog acts on, without a bridge.
+fn seed_overdue_row(home: &Path, age_secs: i64) -> (DeliveryEnvelope, ReceiptStore) {
+    let locator = SessionLocator::claude(
+        "http://127.0.0.1:1".to_string(),
+        "self-kick-session".to_string(),
+        "token".to_string(),
+    );
+    let envelope = DeliveryEnvelope::self_kick("claude-agent", locator, "[AGEND-RESUME] id=r4");
+    let store = ReceiptStore::for_instance(home, "claude-agent").expect("store");
+    store.record_queued(&envelope).expect("queued");
+    let mut accepted = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
+    accepted.protocol_request_id = Some(envelope.delivery_id.to_string());
+    accepted.backend_event = Some("webhook_accepted".to_string());
+    accepted.recorded_at = (Utc::now() - chrono::Duration::seconds(age_secs)).to_rfc3339();
+    store.record(accepted).expect("accepted");
+    (envelope, store)
+}
+
+fn marker_of(store: &ReceiptStore, delivery_id: Uuid) -> Option<crate::transport::PendingNotice> {
+    store
+        .latest(delivery_id)
+        .expect("latest")
+        .expect("receipt")
+        .notice_pending
+}
+
+/// PR #3495 r4 (b): the unit contract of the clear. `clear_self_kick_notice`
+/// must compare against the marker the caller OBSERVED, so a caller holding a
+/// superseded marker is a no-op rather than a silent erase of a newer one.
+#[test]
+fn clear_with_observed_marker_is_a_noop_when_marker_moved() {
+    let home = home("clear-observed-marker");
+    let (envelope, store) = seed_overdue_row(&home, 31);
+    let delivery_id = envelope.delivery_id;
+
+    let outcomes =
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None).expect("watchdog");
+    assert_eq!(outcomes.len(), 1, "one overdue outcome: {outcomes:?}");
+    let observed = outcomes[0].observed_notice.clone();
+    assert_eq!(observed.kind, crate::transport::PendingNotice::ACK_OVERDUE);
+
+    // The marker moves on under the caller's feet.
+    let current = store.latest(delivery_id).expect("latest").expect("receipt");
+    let newer =
+        crate::transport::PendingNotice::new(crate::transport::PendingNotice::LATE_ACK, Some(9));
+    let mut moved = current.clone();
+    moved.notice_pending = Some(newer.clone());
+    assert!(store
+        .record_if_marker(
+            delivery_id,
+            current.state,
+            current.late_ack_secs,
+            current.notice_pending.as_ref(),
+            moved,
+        )
+        .expect("marker moved"));
+
+    assert!(
+        !clear_self_kick_notice(&home, "claude-agent", delivery_id, &observed)
+            .expect("stale clear"),
+        "clearing with a superseded marker must report that it did nothing"
+    );
+    assert_eq!(
+        marker_of(&store, delivery_id).as_ref(),
+        Some(&newer),
+        "and must leave the newer marker exactly where it was"
+    );
+
+    assert!(
+        clear_self_kick_notice(&home, "claude-agent", delivery_id, &newer).expect("clear"),
+        "clearing with the marker actually on the row still works"
+    );
+    assert!(marker_of(&store, delivery_id).is_none());
+    let _ = fs::remove_dir_all(home);
+}
+
+/// PR #3495 r4 (c): `deliver_resident`'s post-202 write reads the latest
+/// receipt and then appends. A consumer `ack_start` that lands in that window
+/// must not be regressed to `ProtocolAccepted` by the append.
+#[test]
+fn deliver_resident_does_not_regress_turn_started() {
+    let _delivery_hook_guard = super::super::super::registry::test_support::delivery_hook_guard();
+    let home = home("post-202-no-regress-turn-started");
+    let mut channel = FakeChannel::spawn(1);
+    let port = channel.port;
+    let mut locator = SessionLocator::claude(
+        format!("http://127.0.0.1:{port}"),
+        "claude-registry-session".to_string(),
+        "registry-token".to_string(),
+    );
+    locator.managed = true;
+    locator.server_pid = Some(std::process::id());
+    locator.server_start_token = crate::process::process_start_token(std::process::id());
+    fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  claude-agent:\n    backend: claude\n",
+    )
+    .expect("fleet");
+    super::super::super::registry::save_session_locator(&home, "claude-agent", &locator)
+        .expect("locator publication");
+
+    let hook_home = home.clone();
+    let observed_at_hook = Arc::new(Mutex::new(None));
+    let hook_observed = Arc::clone(&observed_at_hook);
+    crate::transport::claude_channel::set_post_202_rendezvous_hook_for_test(
+        move |delivery_id, observed| {
+            // r5: the hook fires INSIDE the guarded write, after the snapshot
+            // the compare-and-append will compare against. Record what that
+            // snapshot said, then let the consumer acknowledge the exact
+            // delivery_id underneath it — a real `ack_start`, not a planted
+            // receipt — so the append that follows must MISS its CAS.
+            *hook_observed.lock() = Some(observed);
+            crate::transport::claude_channel::ack_start_for_test(
+                &hook_home,
+                "claude-agent",
+                delivery_id,
+            )
+            .expect("ack_start inside the post-202 window");
+        },
+    );
+
+    let accepted = super::super::super::registry::deliver_self_kick_notification(
+        &home,
+        "claude-agent",
+        "[AGEND-RESUME] id=post-202-turn-started",
+        move |_, _, _| Ok(()),
+    )
+    .expect("ChannelBridge webhook queue admission");
+
+    let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+    let latest = store
+        .latest(accepted.delivery_id)
+        .expect("latest")
+        .expect("receipt");
+    assert_eq!(
+        latest.state,
+        DeliveryState::TurnStarted,
+        "the post-202 append must never regress an acknowledged self-kick: {latest:?}"
+    );
+    assert_eq!(
+        accepted.state,
+        DeliveryState::TurnStarted,
+        "and deliver_resident must report the already-advanced row: {accepted:?}"
+    );
+    assert_eq!(
+        *observed_at_hook.lock(),
+        Some(DeliveryState::Queued),
+        "the rendezvous must fire on the snapshot the guarded write OBSERVED, \
+         which is still Queued — otherwise the test never exercises a CAS miss"
+    );
+    assert_eq!(
+        crate::transport::claude_channel::post_202_cas_miss_count_for_test(),
+        1,
+        "exactly one compare-and-append must have been refused: the observed \
+         Queued row moved under the write, and the bounded retry then re-read it"
+    );
+    let _ = channel.stop_and_join();
+    let _ = fs::remove_dir_all(home);
+}
+
+/// PR #3495 r4 (d): the same window, but the WATCHDOG wins it — the row moves
+/// to `AckOverdue` and carries an unsent notice intent. The post-202 append
+/// must neither regress the state nor drop the intent, or the operator never
+/// hears about the overdue self-kick.
+#[test]
+fn deliver_resident_does_not_regress_ack_overdue_intent() {
+    let _delivery_hook_guard = super::super::super::registry::test_support::delivery_hook_guard();
+    let home = home("post-202-no-regress-ack-overdue");
+    let mut channel = FakeChannel::spawn(1);
+    let port = channel.port;
+    let mut locator = SessionLocator::claude(
+        format!("http://127.0.0.1:{port}"),
+        "claude-registry-session".to_string(),
+        "registry-token".to_string(),
+    );
+    locator.managed = true;
+    locator.server_pid = Some(std::process::id());
+    locator.server_start_token = crate::process::process_start_token(std::process::id());
+    fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  claude-agent:\n    backend: claude\n",
+    )
+    .expect("fleet");
+    super::super::super::registry::save_session_locator(&home, "claude-agent", &locator)
+        .expect("locator publication");
+
+    let hook_home = home.clone();
+    let observed_at_hook = Arc::new(Mutex::new(None));
+    let hook_observed = Arc::clone(&observed_at_hook);
+    crate::transport::claude_channel::set_post_202_rendezvous_hook_for_test(
+        move |delivery_id, observed| {
+            *hook_observed.lock() = Some(observed);
+            let store = ReceiptStore::for_instance(&hook_home, "claude-agent").expect("store");
+            let (envelope, current) = store
+                .delivery(delivery_id)
+                .expect("delivery")
+                .expect("receipt");
+            // The row the bridge already accepted, backdated past the ack window
+            // — the state the real watchdog acts on.
+            let mut accepted =
+                DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
+            accepted.protocol_request_id = Some(delivery_id.to_string());
+            accepted.backend_event = Some("webhook_accepted".to_string());
+            accepted.recorded_at = (Utc::now()
+                - chrono::Duration::seconds(SELF_KICK_ACK_WINDOW.as_secs() as i64 + 5))
+            .to_rfc3339();
+            assert!(store
+                .record_if_latest_state(delivery_id, current.state, accepted)
+                .expect("backdate"));
+            // The REAL watchdog latches the overdue condition and parks the intent.
+            assert_eq!(
+                self_kick_watchdog_pass_at(&hook_home, "claude-agent", Utc::now(), &|_| None)
+                    .expect("watchdog in the post-202 window")
+                    .len(),
+                1
+            );
+        },
+    );
+
+    let accepted = super::super::super::registry::deliver_self_kick_notification(
+        &home,
+        "claude-agent",
+        "[AGEND-RESUME] id=post-202-ack-overdue",
+        move |_, _, _| Ok(()),
+    )
+    .expect("ChannelBridge webhook queue admission");
+
+    let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+    let latest = store
+        .latest(accepted.delivery_id)
+        .expect("latest")
+        .expect("receipt");
+    assert_eq!(
+        latest.state,
+        DeliveryState::AckOverdue,
+        "the post-202 append must not regress an overdue row: {latest:?}"
+    );
+    assert_eq!(
+        latest
+            .notice_pending
+            .as_ref()
+            .map(|notice| notice.kind.as_str()),
+        Some(crate::transport::PendingNotice::ACK_OVERDUE),
+        "and must not drop the unsent notice intent: {latest:?}"
+    );
+    assert_eq!(
+        *observed_at_hook.lock(),
+        Some(DeliveryState::Queued),
+        "the rendezvous must fire on the snapshot the guarded write OBSERVED"
+    );
+    assert_eq!(
+        crate::transport::claude_channel::post_202_cas_miss_count_for_test(),
+        1,
+        "the real watchdog moved the observed Queued row, so exactly one \
+         compare-and-append must have been refused"
+    );
+
+    // The next pass still owes exactly one overdue notice, and only one.
+    let outcomes = self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+        .expect("replay pass");
+    assert_eq!(outcomes.len(), 1, "one owed notice: {outcomes:?}");
+    assert!(matches!(
+        outcomes[0].kind,
+        SelfKickOutcomeKind::AckOverdue { .. }
+    ));
+    assert!(clear_self_kick_notice(
+        &home,
+        "claude-agent",
+        accepted.delivery_id,
+        &outcomes[0].observed_notice,
+    )
+    .expect("clear"));
+    assert_eq!(
+        self_kick_watchdog_pass_at(&home, "claude-agent", Utc::now(), &|_| None)
+            .expect("final pass")
+            .len(),
+        0,
+        "delivered exactly once"
+    );
+    let _ = channel.stop_and_join();
     let _ = fs::remove_dir_all(home);
 }

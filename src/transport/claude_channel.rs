@@ -7,7 +7,7 @@
 
 use super::{
     safe_component, AgentDeliveryTransport, BackendEvent, DeliveryEnvelope, DeliveryReceipt,
-    DeliveryState, ReceiptStore, SessionLocator, TransportCapability, TransportMode,
+    DeliveryState, PendingNotice, ReceiptStore, SessionLocator, TransportCapability, TransportMode,
 };
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
@@ -27,6 +27,16 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 mod replay;
+/// PR #3495 r4: the self-kick reconciliation helpers, re-homed here when this
+/// file crossed the 2500-LOC anti-monolith ceiling. Re-exported unchanged so
+/// every `crate::transport::claude_channel::…` path keeps working.
+mod self_kick;
+#[cfg(test)]
+pub(crate) use self_kick::{ack_start_for_test, self_kick_watchdog_pass_at};
+pub(crate) use self_kick::{
+    clear_self_kick_notice, record_self_kick_turn_started, self_kick_watchdog_pass,
+    SelfKickOutcome, SelfKickOutcomeKind, TurnObservation,
+};
 
 pub(crate) const CHANNEL_SERVER_NAME: &str = "agend-claude-channel";
 const MIN_CLAUDE_VERSION: (u64, u64, u64) = (2, 1, 80);
@@ -39,7 +49,7 @@ const SSE_READ_TIMEOUT: Duration = Duration::from_secs(20);
 /// A fresh-restart self-kick must prove consumer admission promptly. This is
 /// deliberately a bounded ambiguity window, not a retry timer: accepted
 /// without an exact consumer ack is never resent automatically.
-const SELF_KICK_ACK_WINDOW: Duration = Duration::from_secs(30);
+pub(crate) const SELF_KICK_ACK_WINDOW: Duration = Duration::from_secs(30);
 const HTTP_PATH: &str = "/webhook";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -433,81 +443,16 @@ impl ChannelRuntime {
     /// compare-and-append receipt transition is intentionally separate from
     /// `remember_reply`: it emits no reply event and no SSE notification.
     fn acknowledge_self_kick(&self, delivery_id: Uuid) -> anyhow::Result<DeliveryReceipt> {
-        let (store, envelope, mut current) = self.self_kick_receipt(delivery_id)?;
-        if current.state == DeliveryState::TurnStarted {
-            return Ok(current);
-        }
-        if current.state.is_terminal() && current.state != DeliveryState::Ambiguous {
-            anyhow::bail!("self-kick delivery is no longer awaiting start acknowledgement")
-        }
-        if !matches!(
-            current.state,
-            DeliveryState::Queued
-                | DeliveryState::ProtocolAccepted
-                | DeliveryState::Ambiguous
-                | DeliveryState::AckOverdue
-        ) {
-            anyhow::bail!("self-kick delivery is not awaiting start acknowledgement")
-        }
-
-        // The bridge can write the notification and receive the consumer's
-        // ack before the daemon-side post-202 receipt append. Preserve the
-        // truthful ProtocolAccepted state first when the durable row is still
-        // Queued, then advance it to TurnStarted.
-        if current.state == DeliveryState::Queued {
-            let mut accepted = current.clone();
-            accepted.state = DeliveryState::ProtocolAccepted;
-            accepted.protocol_request_id = Some(delivery_id.to_string());
-            accepted.backend_session_id = Some(self.session_id.clone());
-            accepted.backend_event = Some("webhook_accepted".to_string());
-            if store.record_if_latest_state(delivery_id, DeliveryState::Queued, accepted)? {
-                current = store
-                    .latest(delivery_id)?
-                    .ok_or_else(|| anyhow::anyhow!("self-kick receipt disappeared after accept"))?;
-            } else {
-                current = store.latest(delivery_id)?.ok_or_else(|| {
-                    anyhow::anyhow!("self-kick receipt disappeared during accept")
-                })?;
-            }
-        }
-
-        if current.state == DeliveryState::TurnStarted {
-            return Ok(current);
-        }
-        if !matches!(
-            current.state,
-            DeliveryState::ProtocolAccepted | DeliveryState::Ambiguous | DeliveryState::AckOverdue
-        ) {
-            anyhow::bail!("self-kick delivery is not protocol-accepted")
-        }
-        let mut started = DeliveryReceipt::for_state(&envelope, DeliveryState::TurnStarted);
-        started.protocol_request_id = current
-            .protocol_request_id
-            .or_else(|| Some(delivery_id.to_string()));
-        started.backend_session_id = Some(self.session_id.clone());
-        started.backend_event = Some("claude_channel_turn_started".to_string());
-        started.detail = Some("consumer acknowledged exact self-kick delivery_id".to_string());
-        let mut expected = current.state;
-        loop {
-            if store.record_if_latest_state(delivery_id, expected, started.clone())? {
-                return Ok(started);
-            }
-            let latest = store
-                .latest(delivery_id)?
-                .ok_or_else(|| anyhow::anyhow!("self-kick receipt disappeared during start ack"))?;
-            if latest.state == DeliveryState::TurnStarted {
-                return Ok(latest);
-            }
-            if !matches!(
-                latest.state,
-                DeliveryState::ProtocolAccepted
-                    | DeliveryState::Ambiguous
-                    | DeliveryState::AckOverdue
-            ) {
-                anyhow::bail!("self-kick start acknowledgement lost a receipt race")
-            }
-            expected = latest.state;
-        }
+        let (store, envelope, current) = self.self_kick_receipt(delivery_id)?;
+        record_self_kick_turn_started(
+            &self.home,
+            &self.instance,
+            &self.session_id,
+            &store,
+            &envelope,
+            current,
+            Utc::now(),
+        )
     }
 
     /// Complete a self-kick only after the successor has finished its bounded
@@ -521,27 +466,42 @@ impl ChannelRuntime {
         if current.state != DeliveryState::TurnStarted {
             anyhow::bail!("self-kick completion requires a prior exact start acknowledgement")
         }
-        let mut completed = DeliveryReceipt::for_state(&envelope, DeliveryState::Completed);
-        completed.protocol_request_id = current.protocol_request_id;
-        completed.backend_session_id = Some(self.session_id.clone());
-        completed.backend_event = Some("claude_channel_self_kick_completed".to_string());
-        completed.detail = Some("successor completed bounded restart recovery".to_string());
-        if store.record_if_latest_state(
-            delivery_id,
-            DeliveryState::TurnStarted,
-            completed.clone(),
-        )? {
-            Ok(completed)
-        } else {
+        // r3, the sibling of the `ack_start` finding: the consumer normally
+        // completes moments after it acknowledges, i.e. INSIDE the gap between
+        // the durable notice intent and the per-tick enqueue — and `Completed`
+        // is terminal. Dropping the markers here would put the owed notices
+        // permanently out of the watchdog's reach, so completion carries them
+        // and commits marker-aware, with one bounded retry.
+        let mut current = current;
+        for _ in 0..2 {
+            let mut completed = DeliveryReceipt::for_state(&envelope, DeliveryState::Completed);
+            completed.protocol_request_id = current.protocol_request_id.clone();
+            completed.backend_session_id = Some(self.session_id.clone());
+            completed.backend_event = Some("claude_channel_self_kick_completed".to_string());
+            completed.detail = Some("successor completed bounded restart recovery".to_string());
+            completed.late_ack_secs = current.late_ack_secs;
+            completed.notice_pending = current.notice_pending.clone();
+            if store.record_if_marker(
+                delivery_id,
+                DeliveryState::TurnStarted,
+                current.late_ack_secs,
+                current.notice_pending.as_ref(),
+                completed.clone(),
+            )? {
+                return Ok(completed);
+            }
             let latest = store.latest(delivery_id)?.ok_or_else(|| {
                 anyhow::anyhow!("self-kick receipt disappeared during completion")
             })?;
             if latest.state == DeliveryState::Completed {
-                Ok(latest)
-            } else {
+                return Ok(latest);
+            }
+            if latest.state != DeliveryState::TurnStarted {
                 anyhow::bail!("self-kick completion lost a receipt race")
             }
+            current = latest;
         }
+        anyhow::bail!("self-kick completion lost a receipt race")
     }
 
     fn reject_self_kick_reply(&self, delivery_id: Uuid) -> anyhow::Result<()> {
@@ -1331,72 +1291,6 @@ fn run_http_listener(listener: TcpListener, runtime: Arc<ChannelRuntime>, stop: 
     }
 }
 
-fn self_kick_ack_elapsed(recorded_at: &str, now: DateTime<Utc>) -> Option<Duration> {
-    let recorded = DateTime::parse_from_rfc3339(recorded_at)
-        .ok()?
-        .with_timezone(&Utc);
-    now.signed_duration_since(recorded).to_std().ok()
-}
-
-/// Reconcile accepted self-kicks from the durable receipt log. This scan is
-/// intentionally separate from Claude hook observations: elapsed time only
-/// creates a truthful nonterminal AckOverdue alert, never a TurnStarted proof
-/// or retry.
-fn self_kick_watchdog_pass_at(
-    home: &Path,
-    instance: &str,
-    now: DateTime<Utc>,
-) -> anyhow::Result<usize> {
-    let store = ReceiptStore::for_instance(home, instance)?;
-    let mut alerts = 0;
-    for (envelope, current) in store.pending_deliveries()? {
-        if !envelope.self_kick
-            || current.state != DeliveryState::ProtocolAccepted
-            || self_kick_ack_elapsed(&current.recorded_at, now)
-                .is_none_or(|elapsed| elapsed < SELF_KICK_ACK_WINDOW)
-        {
-            continue;
-        }
-        let mut overdue = current.clone();
-        overdue.state = DeliveryState::AckOverdue;
-        overdue.backend_event = Some("claude_channel_self_kick_ack_timeout".to_string());
-        overdue.detail = Some(format!(
-            "ProtocolAccepted but no exact consumer ack within {:?}; no automatic retry; inspect the agent and reconcile delivery {}",
-            SELF_KICK_ACK_WINDOW, envelope.delivery_id
-        ));
-        if !store.record_if_latest_state(
-            envelope.delivery_id,
-            DeliveryState::ProtocolAccepted,
-            overdue,
-        )? {
-            continue;
-        }
-        let alert = format!(
-            "[claude-self-kick] {} accepted delivery {} but received no exact consumer ack within {:?}; state=AckOverdue; no automatic retry — inspect the agent and reconcile manually",
-            instance, envelope.delivery_id, SELF_KICK_ACK_WINDOW
-        );
-        let channels = crate::channel::notify_all_escalation_channels(
-            instance,
-            crate::channel::NotifySeverity::Error,
-            &alert,
-            false,
-        );
-        tracing::warn!(agent = %instance, delivery_id = %envelope.delivery_id, "{alert}");
-        crate::event_log::log(
-            home,
-            "claude_self_kick_ack_overdue",
-            instance,
-            &format!("{alert} notified_channels={channels}"),
-        );
-        alerts += 1;
-    }
-    Ok(alerts)
-}
-
-pub(crate) fn self_kick_watchdog_pass(home: &Path, instance: &str) -> anyhow::Result<usize> {
-    self_kick_watchdog_pass_at(home, instance, Utc::now())
-}
-
 pub(crate) fn run_channel_server(home: &Path, instance: &str) -> anyhow::Result<()> {
     let (locator, listener) = bind_and_publish_channel(home, instance)?;
     let runtime = Arc::new(ChannelRuntime::new(home, instance, &locator)?);
@@ -1774,10 +1668,31 @@ fn complete_receipt(home: &Path, instance: &str, event: &ReplyEvent) -> anyhow::
     );
     let mut receipt = DeliveryReceipt::for_state(&envelope, DeliveryState::Completed);
     receipt.delivery_id = event.delivery_id;
-    receipt.payload_digest = previous.payload_digest;
-    receipt.protocol_request_id = previous.protocol_request_id;
+    receipt.payload_digest = previous.payload_digest.clone();
+    receipt.protocol_request_id = previous.protocol_request_id.clone();
     receipt.backend_event = Some("claude_reply".to_string());
-    store.record(receipt)
+    // r4: `Completed` is terminal, and `DeliveryReceipt::for_state` starts with
+    // empty markers — appending this unconditionally would carry an unsent
+    // notice intent (or an unreconciled `late_ack_secs`) out of the watchdog's
+    // reach forever. Carry them, and commit against the snapshot READ ABOVE so
+    // a writer that moved the row in the meantime wins instead of being
+    // silently overwritten. Losing that race is benign: the row advanced, and
+    // whoever advanced it owns the completion.
+    receipt.late_ack_secs = previous.late_ack_secs;
+    receipt.notice_pending = previous.notice_pending.clone();
+    if !store.record_if_marker(
+        event.delivery_id,
+        previous.state,
+        previous.late_ack_secs,
+        previous.notice_pending.as_ref(),
+        receipt,
+    )? {
+        tracing::debug!(
+            delivery_id = %event.delivery_id,
+            "claude_channel: the reply completion lost its compare-and-append; the durable row stands"
+        );
+    }
+    Ok(())
 }
 
 struct SseStream {
@@ -1935,6 +1850,138 @@ pub(crate) fn stop_instance_state(home: &Path, instance: &str) {
     }
 }
 
+/// What a guarded post-`record_queued` write did, so `deliver_resident` can
+/// report the truth without ever regressing the durable row.
+enum GuardedWrite {
+    /// The row was still `Queued` and this receipt was appended.
+    Appended(DeliveryReceipt),
+    /// Another writer — the consumer's `ack_start`, the watchdog, a
+    /// completion — advanced the row inside the read/write window. Its receipt
+    /// stands, markers and all.
+    AlreadyAdvanced(DeliveryReceipt),
+}
+
+/// r4 P1: append `next` only while the delivery is still the `Queued` row
+/// `record_queued` just wrote.
+///
+/// `deliver_resident` used to `latest()` and then `record()` UNCONDITIONALLY.
+/// The bridge can hand the notification to Claude and receive its `ack_start`
+/// — or the watchdog can declare the delivery `AckOverdue` and park a notice
+/// intent on it — between those two calls, and the append then regressed the
+/// state and dropped `late_ack_secs` / `notice_pending`. That is a lost
+/// operator notice, i.e. a loss bug.
+///
+/// The write is therefore a marker-aware compare-and-append whose expectation
+/// is the snapshot READ IN THE SAME ITERATION, with one bounded retry. If the
+/// row has advanced there is nothing to write: the later state is truthful and
+/// this returns it. It never regresses and never reports a failure for a
+/// delivery the bridge accepted.
+fn write_if_still_queued(
+    store: &ReceiptStore,
+    delivery_id: Uuid,
+    next: &DeliveryReceipt,
+) -> anyhow::Result<GuardedWrite> {
+    for _ in 0..2 {
+        let Some(previous) = store.latest(delivery_id)? else {
+            // No durable row at all (the queued append is gone): nothing can
+            // be regressed, so the unconditional write is the honest one.
+            store.record(next.clone())?;
+            return Ok(GuardedWrite::Appended(next.clone()));
+        };
+        if previous.state != DeliveryState::Queued {
+            tracing::debug!(
+                %delivery_id,
+                state = ?previous.state,
+                "claude_channel: the durable row advanced before the post-202 write; not regressing it"
+            );
+            return Ok(GuardedWrite::AlreadyAdvanced(previous));
+        }
+        // r5 P1: the rendezvous belongs HERE — after the snapshot the
+        // compare-and-append will name as its expected value, and before the
+        // append. Firing it any earlier only produces the `AlreadyAdvanced`
+        // branch above and never exercises the window this helper exists to
+        // close.
+        #[cfg(test)]
+        fire_post_202_rendezvous_hook_for_test(delivery_id, previous.state);
+        // A `Queued` row carries no markers today; carrying them anyway means
+        // this write can never DROP one a future writer parks there.
+        let mut candidate = next.clone();
+        candidate.late_ack_secs = previous.late_ack_secs;
+        candidate.notice_pending = previous.notice_pending.clone();
+        if store.record_if_marker(
+            delivery_id,
+            DeliveryState::Queued,
+            previous.late_ack_secs,
+            previous.notice_pending.as_ref(),
+            candidate.clone(),
+        )? {
+            return Ok(GuardedWrite::Appended(candidate));
+        }
+        #[cfg(test)]
+        note_post_202_cas_miss_for_test();
+    }
+    // Lost the CAS twice: something else owns the row. Report what is durable
+    // rather than forcing this receipt over it.
+    let latest = store.latest(delivery_id)?.ok_or_else(|| {
+        anyhow::anyhow!("self-kick receipt disappeared during the post-202 write")
+    })?;
+    tracing::info!(
+        %delivery_id,
+        state = ?latest.state,
+        "claude_channel: post-202 write lost its compare-and-append twice; the durable row stands"
+    );
+    Ok(GuardedWrite::AlreadyAdvanced(latest))
+}
+
+// A one-shot rendezvous armed by a test, fired INSIDE `write_if_still_queued`
+// — after the snapshot read that the compare-and-append will compare against,
+// and before the append itself. That position is the whole point: a hook that
+// fires BEFORE the read only ever produces the `AlreadyAdvanced` short circuit
+// and never exercises a CAS miss, which is the interleaving the guarded write
+// exists for. The hook receives the state the helper actually OBSERVED so a
+// test can assert it read `Queued` and still lost the append.
+#[cfg(test)]
+type Post202RendezvousHook = std::cell::RefCell<Option<Box<dyn FnOnce(Uuid, DeliveryState)>>>;
+
+#[cfg(test)]
+thread_local! {
+    static POST_202_RENDEZVOUS_HOOK: Post202RendezvousHook =
+        const { std::cell::RefCell::new(None) };
+    /// How many times the post-202 compare-and-append has been REFUSED because
+    /// the row moved between the observed read and the append.
+    static POST_202_CAS_MISSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_post_202_rendezvous_hook_for_test(
+    hook: impl FnOnce(Uuid, DeliveryState) + 'static,
+) {
+    POST_202_CAS_MISSES.with(std::cell::Cell::take);
+    POST_202_RENDEZVOUS_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// CAS misses observed since the hook was armed. A test that drives the
+/// rendezvous asserts this is exactly 1: the helper read `Queued`, the hook
+/// advanced the row, the append was refused, and the bounded retry re-read the
+/// advanced row instead of forcing its receipt over it.
+#[cfg(test)]
+pub(crate) fn post_202_cas_miss_count_for_test() -> usize {
+    POST_202_CAS_MISSES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn note_post_202_cas_miss_for_test() {
+    POST_202_CAS_MISSES.with(|misses| misses.set(misses.get().saturating_add(1)));
+}
+
+#[cfg(test)]
+fn fire_post_202_rendezvous_hook_for_test(delivery_id: Uuid, observed: DeliveryState) {
+    let hook = POST_202_RENDEZVOUS_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(delivery_id, observed);
+    }
+}
+
 pub(crate) fn deliver_resident(
     home: &Path,
     instance: &str,
@@ -1944,18 +1991,23 @@ pub(crate) fn deliver_resident(
     ensure_event_worker(home, instance, &locator);
     let store = ReceiptStore::for_instance(home, instance)?;
     store.record_queued(&envelope)?;
+    // r4: every write after `record_queued` goes through the same guarded
+    // helper. These two run before the bridge has seen anything, so nothing
+    // can have advanced the row — but a uniform rule is what makes the
+    // inventory free of "unreachable" entries, and a guarded write can never
+    // mask the real probe error behind a store refusal.
     let capability = health_probe(&locator).map_err(|error| {
         let mut receipt = DeliveryReceipt::for_state(&envelope, DeliveryState::Failed);
         receipt.detail = Some(format!(
             "Claude ChannelBridge readiness failed closed: {error}"
         ));
-        let _ = store.record(receipt);
+        let _ = write_if_still_queued(&store, envelope.delivery_id, &receipt);
         error
     })?;
     if !capability.ready {
         let mut receipt = DeliveryReceipt::for_state(&envelope, DeliveryState::Failed);
         receipt.detail = capability.degraded_reason;
-        store.record(receipt)?;
+        write_if_still_queued(&store, envelope.delivery_id, &receipt)?;
         anyhow::bail!("Claude ChannelBridge capability probe failed closed");
     }
     let chat_id = chat_id_for_delivery(&envelope.instance, envelope.delivery_id);
@@ -1978,27 +2030,24 @@ pub(crate) fn deliver_resident(
             "Claude ChannelBridge webhook rejected: {}",
             response_detail(&response)
         ));
-        store.record(receipt)?;
+        // Same shape as the accepted write: the request DID reach the bridge,
+        // so a concurrent writer is possible. `Failed` is terminal and would
+        // take any marker with it, so it is only written while the row is
+        // still `Queued`.
+        write_if_still_queued(&store, envelope.delivery_id, &receipt)?;
         anyhow::bail!("Claude ChannelBridge webhook rejected: {}", response.status);
     }
-    let mut receipt = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
-    receipt.protocol_request_id = Some(envelope.delivery_id.to_string());
-    receipt.backend_event = Some("webhook_accepted".to_string());
-    if let Some(previous) = store.latest(envelope.delivery_id)? {
-        if previous.state.is_terminal()
-            || matches!(
-                previous.state,
-                DeliveryState::TurnStarted | DeliveryState::AckOverdue
-            )
-        {
-            // Claude may acknowledge (or complete) the self-kick while the
-            // daemon-side delivery worker is still writing its post-202
-            // receipt. Preserve every later state rather than appending a
-            // ProtocolAccepted regression.
-            return Ok(previous);
-        }
-    }
-    store.record(receipt.clone())?;
+    let mut accepted = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
+    accepted.protocol_request_id = Some(envelope.delivery_id.to_string());
+    accepted.backend_event = Some("webhook_accepted".to_string());
+    let receipt = match write_if_still_queued(&store, envelope.delivery_id, &accepted)? {
+        GuardedWrite::Appended(receipt) => receipt,
+        // Claude acknowledged (or completed) the self-kick, or the watchdog
+        // declared it overdue, while the daemon-side worker was still writing
+        // its post-202 receipt. Every later state — and every marker it
+        // carries — is truthful and stands.
+        GuardedWrite::AlreadyAdvanced(previous) => return Ok(previous),
+    };
     if let Ok(response) = client_request(
         &locator,
         "GET",

@@ -5,13 +5,80 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
 /// Receipt metadata is intentionally bounded.  The first record for a
 /// delivery owns the durable envelope body; compaction keeps that owner and
 /// the latest receipt, while dropping superseded metadata records.
+///
+/// PR #3495 r5 — BOUNDED-OVERFLOW POLICY. These two limits are the budget for
+/// EVICTABLE rows only. A delivery that carries unfinished notice debt (see
+/// [`DeliveryHistory::pinned`]) is PINNED: compaction may never evict it,
+/// because `deliveries_owing_notices` can only rediscover a parked notice
+/// through the durable row, and losing the row loses the operator notice —
+/// the NO-LOSS half of the contract. The file is therefore bounded by
+/// `MAX_RECEIPT_BYTES` PLUS the live debt, not by `MAX_RECEIPT_BYTES` alone.
+/// The debt is at most one unfinished notice per in-flight self-kick, and it
+/// clears within a per-tick pass of its enqueue ONLY while the pass still
+/// visits the instance: `daemon/per_tick/claude_self_kick.rs` iterates
+/// `fleet.instances` and skips any agent not in `ChannelBridge` mode, so debt
+/// parked by an agent later removed from `fleet.yaml` — or moved off
+/// ChannelBridge — is never drained and stays pinned for good. That is growth
+/// in the safe direction (the notice is kept, never lost), but it is NOT
+/// self-limiting; draining orphaned debt is a follow-up. If the pinned set
+/// alone ever exceeds the byte budget, compaction FAILS CLOSED — it evicts
+/// nothing at all and the log is allowed to exceed the limit (logged once per
+/// exceedance episode) rather than dropping owed debt.
 const MAX_RECEIPT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_RETAINED_DELIVERIES: usize = 1024;
+
+// The retention budget in force for this thread.
+//
+// Production always reads the two constants above. Tests lower them (via
+// `set_retention_limits_for_test`) so a compaction test can run in
+// milliseconds instead of writing 4 MiB; the override is thread-local, so it
+// cannot leak into a test running in parallel, and a guard restores it.
+#[cfg(test)]
+thread_local! {
+    static RETENTION_LIMITS_OVERRIDE: std::cell::RefCell<Option<(u64, usize)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct RetentionLimitsGuard;
+
+#[cfg(test)]
+impl Drop for RetentionLimitsGuard {
+    fn drop(&mut self) {
+        RETENTION_LIMITS_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_retention_limits_for_test(
+    max_bytes: u64,
+    max_deliveries: usize,
+) -> RetentionLimitsGuard {
+    RETENTION_LIMITS_OVERRIDE.with(|slot| *slot.borrow_mut() = Some((max_bytes, max_deliveries)));
+    RetentionLimitsGuard
+}
+
+fn max_receipt_bytes() -> u64 {
+    #[cfg(test)]
+    if let Some((bytes, _)) = RETENTION_LIMITS_OVERRIDE.with(|slot| *slot.borrow()) {
+        return bytes;
+    }
+    MAX_RECEIPT_BYTES
+}
+
+fn max_retained_deliveries() -> usize {
+    #[cfg(test)]
+    if let Some((_, deliveries)) = RETENTION_LIMITS_OVERRIDE.with(|slot| *slot.borrow()) {
+        return deliveries;
+    }
+    MAX_RETAINED_DELIVERIES
+}
 const OPENCODE_MESSAGE_ID_PREFIX: &str = "msg_";
 const OPENCODE_MESSAGE_ID_NATIVE_SUFFIX_LEN: usize = 12 + 14;
 
@@ -48,6 +115,69 @@ impl DeliveryState {
     pub(crate) fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Ambiguous)
     }
+
+    /// PR #3495 r4: the durable PROGRESSION order of a self-kick delivery,
+    /// used by the store's non-regression guard.
+    ///
+    /// The enum's DECLARATION order is deliberately not this order:
+    /// `AckOverdue` is declared last because it was added after the others and
+    /// the variant order is part of the on-disk serde shape. The real
+    /// progression a self-kick walks is
+    ///
+    ///   Queued < ProtocolAccepted < ObservedInSession < AckOverdue
+    ///          < TurnStarted < {Completed, Failed, Ambiguous}
+    ///
+    /// `AckOverdue` sits BELOW `TurnStarted` because it is deliberately
+    /// nonterminal: a truthful late `ack_start` still advances an overdue
+    /// delivery to `TurnStarted`. The three terminal outcomes share the top
+    /// rank — they never legitimately supersede one another, and the guard
+    /// only fences moves DOWN this ladder.
+    fn progression_rank(self) -> u8 {
+        match self {
+            Self::Queued => 0,
+            Self::ProtocolAccepted => 1,
+            Self::ObservedInSession => 2,
+            Self::AckOverdue => 3,
+            Self::TurnStarted => 4,
+            Self::Completed | Self::Failed | Self::Ambiguous => 5,
+        }
+    }
+}
+
+/// PR #3495: the durable INTENT to emit exactly one operator-facing notice for
+/// this delivery.
+///
+/// It exists because the notice is enqueued by a DIFFERENT layer (the per-tick
+/// handler owns the fleet, the recipient and the registry) than the one that
+/// owns the durable state (this store). Persisting the intent BEFORE the
+/// enqueue — and clearing it only AFTER the enqueue reports success — is what
+/// makes the reconciliation crash-safe: a daemon that dies in the gap, or an
+/// enqueue that returns `Err`, leaves the marker set and the next watchdog pass
+/// replays it. The replay is safe because the enqueue is idempotent by key
+/// (`self-kick:<delivery_id>:<kind>`, see `crate::inbox::idempotent`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PendingNotice {
+    /// `"ack_overdue"` or `"late_ack"` — also the `<kind>` half of the
+    /// idempotency key, so the key is recomputable from the durable row alone.
+    pub kind: String,
+    /// The `AckLate` overshoot the notice must quote. Carried here because the
+    /// same CAS that persists the intent CLEARS `late_ack_secs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub late_by_secs: Option<i64>,
+    pub created_at: String,
+}
+
+impl PendingNotice {
+    pub(crate) const ACK_OVERDUE: &'static str = "ack_overdue";
+    pub(crate) const LATE_ACK: &'static str = "late_ack";
+
+    pub(crate) fn new(kind: &str, late_by_secs: Option<i64>) -> Self {
+        Self {
+            kind: kind.to_string(),
+            late_by_secs,
+            created_at: Utc::now().to_rfc3339(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +202,20 @@ pub(crate) struct DeliveryReceipt {
     pub attempt: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
+    /// t-20260902165405106195-82348-105: set ONLY on a `TurnStarted` receipt
+    /// that superseded an `AckOverdue` — the seconds by which the consumer's
+    /// `ack_start` missed the acknowledgement window. Additive audit metadata
+    /// that the daemon's per-tick watchdog consumes to emit exactly one
+    /// late-ack reconciliation notice; it never participates in a state
+    /// transition, and the CAS that clears it is state-preserving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub late_ack_secs: Option<i64>,
+    /// PR #3495: an unfinished operator notice for this delivery — see
+    /// [`PendingNotice`]. Set by the watchdog pass in the SAME compare-and-append
+    /// that consumes the condition it reports, and cleared by a second CAS only
+    /// after the notice is durably in the recipient's inbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice_pending: Option<PendingNotice>,
     pub recorded_at: String,
 }
 
@@ -93,6 +237,8 @@ impl DeliveryReceipt {
             route: envelope.transport_mode.clone(),
             attempt: 1,
             outcome: Some(state.outcome_name().to_string()),
+            late_ack_secs: None,
+            notice_pending: None,
             recorded_at: Utc::now().to_rfc3339(),
         }
     }
@@ -142,6 +288,22 @@ fn is_native_opencode_protocol_request_id(value: &str) -> bool {
         && random.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
+/// Whether an append names the value it expects to supersede.
+///
+/// The distinction is the whole content of the r4 store guard: only a
+/// marker-aware compare-and-append (which was handed the OBSERVED state and
+/// markers) may move a self-kick row's markers; everything else is fenced by
+/// [`ReceiptStore::reject_self_kick_regression_locked`].
+#[derive(Debug, Clone, Copy)]
+enum AppendMode {
+    /// Reached only through [`ReceiptStore::record_if`], whose predicate has
+    /// already established that the latest row is exactly what the caller
+    /// observed.
+    MarkerAwareCas,
+    /// Every other writer. Guarded.
+    Unconditional,
+}
+
 impl ReceiptStore {
     pub(crate) fn for_instance(home: &Path, instance: &str) -> anyhow::Result<Self> {
         let dir = delivery_dir(home);
@@ -170,10 +332,13 @@ impl ReceiptStore {
         }
         let mut receipt = DeliveryReceipt::queued(envelope);
         receipt.attempt = self.next_attempt_locked(envelope)?;
-        self.append_locked(DurableRecord {
-            envelope: Some(envelope.clone()),
-            receipt: receipt.clone(),
-        })?;
+        self.append_locked(
+            DurableRecord {
+                envelope: Some(envelope.clone()),
+                receipt: receipt.clone(),
+            },
+            AppendMode::Unconditional,
+        )?;
         Ok(receipt)
     }
 
@@ -186,29 +351,74 @@ impl ReceiptStore {
                 receipt.route = previous.route;
             }
         }
-        self.append_locked(DurableRecord {
-            envelope: None,
-            receipt,
-        })
+        self.append_locked(
+            DurableRecord {
+                envelope: None,
+                receipt,
+            },
+            AppendMode::Unconditional,
+        )
     }
 
     /// Append `next` only when the latest durable state is `expected`.
+    ///
+    /// PR #3495 r3: TEST-ONLY. Every production writer now uses the
+    /// marker-aware [`Self::record_if_marker`] instead — a state-only
+    /// predicate cannot see a durable notice intent moving under it, which is
+    /// exactly how a late `ack_start` used to destroy one. Fixtures that need
+    /// to plant a receipt keep it.
     ///
     /// The compare-and-append is held under the same per-instance lock as
     /// receipt writes. The self-kick ack and timeout watchdog therefore
     /// linearize: an ack that wins prevents the watchdog from emitting a
     /// stale Ambiguous receipt, and a timeout that wins cannot be overwritten
     /// by a late ack.
+    #[cfg(test)]
     pub(crate) fn record_if_latest_state(
         &self,
         delivery_id: Uuid,
         expected: DeliveryState,
         next: DeliveryReceipt,
     ) -> anyhow::Result<bool> {
+        self.record_if(delivery_id, next, |latest| latest.state == expected)
+    }
+
+    /// PR #3495: MARKER-AWARE compare-and-append.
+    ///
+    /// `record_if_latest_state` compares only `state`, which is not a
+    /// linearization point for a transition that PRESERVES the state and moves
+    /// only a marker (the late-ack reconciliation is exactly that). Two
+    /// scanners holding the same stale snapshot both pass a state-only
+    /// predicate — sequentially, under this same lock — and both emit the
+    /// outcome. Including the markers in the predicate makes the stale
+    /// scanner's CAS fail, so the outcome is produced exactly once.
+    pub(crate) fn record_if_marker(
+        &self,
+        delivery_id: Uuid,
+        expected: DeliveryState,
+        expected_late_ack_secs: Option<i64>,
+        expected_notice: Option<&PendingNotice>,
+        next: DeliveryReceipt,
+    ) -> anyhow::Result<bool> {
+        self.record_if(delivery_id, next, |latest| {
+            latest.state == expected
+                && latest.late_ack_secs == expected_late_ack_secs
+                && latest.notice_pending.as_ref() == expected_notice
+        })
+    }
+
+    /// The shared compare-and-append body: read the latest durable receipt
+    /// under the per-instance lock, test `matches`, and append only on a hit.
+    fn record_if(
+        &self,
+        delivery_id: Uuid,
+        next: DeliveryReceipt,
+        matches: impl Fn(&DeliveryReceipt) -> bool,
+    ) -> anyhow::Result<bool> {
         let _lock = crate::store::acquire_file_lock(&self.lock_path())?;
         restrict_permissions(&self.lock_path(), 0o600)?;
         let latest = self.latest_locked(delivery_id)?;
-        if latest.as_ref().map(|receipt| receipt.state) != Some(expected) {
+        if !latest.as_ref().is_some_and(&matches) {
             return Ok(false);
         }
         let mut next = next;
@@ -218,10 +428,13 @@ impl ReceiptStore {
                 next.route = previous.route;
             }
         }
-        self.append_locked(DurableRecord {
-            envelope: None,
-            receipt: next,
-        })?;
+        self.append_locked(
+            DurableRecord {
+                envelope: None,
+                receipt: next,
+            },
+            AppendMode::MarkerAwareCas,
+        )?;
         Ok(true)
     }
 
@@ -274,6 +487,15 @@ impl ReceiptStore {
     ) -> anyhow::Result<Option<(DeliveryEnvelope, DeliveryReceipt)>> {
         let _lock = crate::store::acquire_file_lock(&self.lock_path())?;
         restrict_permissions(&self.lock_path(), 0o600)?;
+        self.delivery_locked(delivery_id)
+    }
+
+    /// [`Self::delivery`] for a caller that already holds the per-instance
+    /// lock — the store guard runs inside `append_locked`, under it.
+    fn delivery_locked(
+        &self,
+        delivery_id: Uuid,
+    ) -> anyhow::Result<Option<(DeliveryEnvelope, DeliveryReceipt)>> {
         if !self.path.exists() {
             return Ok(None);
         }
@@ -301,6 +523,32 @@ impl ReceiptStore {
     pub(crate) fn pending_deliveries(
         &self,
     ) -> anyhow::Result<Vec<(DeliveryEnvelope, DeliveryReceipt)>> {
+        self.deliveries_where(|receipt| !receipt.state.is_terminal())
+    }
+
+    /// PR #3495 r3: what the self-kick watchdog must still reconcile — every
+    /// non-terminal delivery PLUS terminal ones that still carry an unfinished
+    /// notice intent or an unreconciled `late_ack_secs`.
+    ///
+    /// The consumer can complete a self-kick inside the gap between the
+    /// durable intent and the per-tick enqueue, and `Completed` is terminal:
+    /// filtering on state alone would strand the notices the operator is owed.
+    /// The markers are cleared only once their notices are durable, so this
+    /// widening keeps exactly the rows with outstanding work.
+    pub(crate) fn deliveries_owing_notices(
+        &self,
+    ) -> anyhow::Result<Vec<(DeliveryEnvelope, DeliveryReceipt)>> {
+        self.deliveries_where(|receipt| {
+            !receipt.state.is_terminal()
+                || receipt.notice_pending.is_some()
+                || receipt.late_ack_secs.is_some()
+        })
+    }
+
+    fn deliveries_where(
+        &self,
+        keep: impl Fn(&DeliveryReceipt) -> bool,
+    ) -> anyhow::Result<Vec<(DeliveryEnvelope, DeliveryReceipt)>> {
         let _lock = crate::store::acquire_file_lock(&self.lock_path())?;
         restrict_permissions(&self.lock_path(), 0o600)?;
         if !self.path.exists() {
@@ -324,8 +572,22 @@ impl ReceiptStore {
             .into_values()
             .filter_map(|(envelope, receipt)| {
                 let receipt = receipt?;
-                if receipt.state.is_terminal() {
+                if !keep(&receipt) {
                     return None;
+                }
+                // r5: discovery needs the ENVELOPE, so a row whose body owner
+                // is missing is invisible to the watchdog no matter what its
+                // markers say. Compaction now pins those rows, so reaching
+                // this arm means a log that predates the pin (or was truncated
+                // outside this store) — make it observable instead of silent.
+                if envelope.is_none()
+                    && (receipt.notice_pending.is_some() || receipt.late_ack_secs.is_some())
+                {
+                    tracing::error!(
+                        delivery_id = %receipt.delivery_id,
+                        "receipt carries an owed self-kick notice but its durable envelope is \
+                         gone; the notice cannot be delivered from this row"
+                    );
                 }
                 Some((envelope?, receipt))
             })
@@ -384,7 +646,72 @@ impl ReceiptStore {
         Ok(latest)
     }
 
-    fn append_locked(&self, record: DurableRecord) -> anyhow::Result<()> {
+    /// PR #3495 r4: the store-level NON-REGRESSION invariant, and the single
+    /// place it is enforced.
+    ///
+    /// RULE — a CAS whose expected value comes from a fresh re-read is not a
+    /// CAS. Every marker-aware write must compare against the value its caller
+    /// OBSERVED and acted on. This guard is the store-side half of that rule:
+    /// it makes the property hold even for a writer that never heard of the
+    /// markers, so no reviewer has to accept an "unreachable" claim about some
+    /// unconditional append.
+    ///
+    /// For a delivery whose durable envelope says `self_kick`, an
+    /// UNCONDITIONAL append is refused when it would either
+    ///
+    ///  * move the row DOWN [`DeliveryState::progression_rank`], or
+    ///  * change or drop a `notice_pending` / `late_ack_secs` the latest row
+    ///    is carrying — those markers are owed operator notices, and losing
+    ///    one loses the notice.
+    ///
+    /// Only [`Self::record_if_marker`] (and its `#[cfg(test)]` sibling) may
+    /// move the markers, because only they name the observed value. Non
+    /// self-kick deliveries keep their unconditional semantics untouched: the
+    /// codex and opencode adapters legitimately overwrite their rows in place.
+    fn reject_self_kick_regression_locked(&self, next: &DeliveryReceipt) -> anyhow::Result<()> {
+        let Some((envelope, latest)) = self.delivery_locked(next.delivery_id)? else {
+            return Ok(());
+        };
+        if !envelope.self_kick {
+            return Ok(());
+        }
+        if next.state.progression_rank() < latest.state.progression_rank() {
+            anyhow::bail!(
+                "unconditional receipt append for self-kick delivery {} would regress {:?} -> {:?}; \
+                 use the marker-aware compare-and-append",
+                next.delivery_id,
+                latest.state,
+                next.state
+            );
+        }
+        if latest.notice_pending.is_some() && next.notice_pending != latest.notice_pending {
+            anyhow::bail!(
+                "unconditional receipt append for self-kick delivery {} would change or drop a pending \
+                 notice_pending intent; only the marker-aware compare-and-append may move it",
+                next.delivery_id
+            );
+        }
+        if latest.late_ack_secs.is_some() && next.late_ack_secs != latest.late_ack_secs {
+            anyhow::bail!(
+                "unconditional receipt append for self-kick delivery {} would change or drop an \
+                 unreconciled late_ack_secs stamp; only the marker-aware compare-and-append may move it",
+                next.delivery_id
+            );
+        }
+        Ok(())
+    }
+
+    fn append_locked(&self, record: DurableRecord, mode: AppendMode) -> anyhow::Result<()> {
+        if matches!(mode, AppendMode::Unconditional) {
+            if let Err(error) = self.reject_self_kick_regression_locked(&record.receipt) {
+                tracing::error!(
+                    delivery_id = %record.receipt.delivery_id,
+                    state = ?record.receipt.state,
+                    "receipt store refused a regressing unconditional append: {error}"
+                );
+                return Err(error);
+            }
+        }
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -394,7 +721,7 @@ impl ReceiptStore {
         line.push(b'\n');
         file.write_all(&line)?;
         file.sync_data()?;
-        let should_compact = file.metadata()?.len() > MAX_RECEIPT_BYTES;
+        let should_compact = file.metadata()?.len() > max_receipt_bytes();
         drop(file);
         if should_compact {
             self.compact_locked()?;
@@ -407,6 +734,29 @@ impl ReceiptStore {
     /// only its latest receipt metadata is retained.  The newest deliveries
     /// win the byte and count budgets, so replay still has the latest durable
     /// body for every retained delivery.
+    ///
+    /// PR #3495 r5 — COMPACTION IS A WRITER, and the one rule it must obey.
+    ///
+    /// Under the sharpened rubric a writer of this store is any path that
+    /// changes what the store returns for a delivery: append ∪ delete ∪
+    /// compact ∪ rewrite. Compaction is the rewrite. It therefore honours the
+    /// same invariant every append does — it may not make an owed notice
+    /// unreachable — expressed as a PIN:
+    ///
+    ///  * a delivery whose latest receipt carries `notice_pending` or an
+    ///    unreconciled `late_ack_secs`, or a NONTERMINAL self-kick (which
+    ///    acquires an intent on its next watchdog pass), is PINNED and is
+    ///    always retained, envelope included — `deliveries_owing_notices`
+    ///    needs the envelope, so evicting it loses the notice just as surely
+    ///    as evicting the receipt;
+    ///  * the retention count and byte budgets apply to NON-pinned rows only;
+    ///  * if the pinned set alone exceeds the byte budget there is nothing
+    ///    safe to evict, so compaction FAILS CLOSED: it rewrites nothing at
+    ///    all, the log is allowed to exceed the limit, and the exceedance is
+    ///    reported once per episode. Bounded overflow is a smaller harm than a
+    ///    lost operator notice. The debt is bounded only for instances the
+    ///    per-tick pass still visits, and NOT self-limiting for the rest (see
+    ///    the constants doc).
     fn compact_locked(&self) -> anyhow::Result<()> {
         if !self.path.exists() {
             return Ok(());
@@ -422,6 +772,7 @@ impl ReceiptStore {
                     envelope: None,
                     latest: None,
                     last_index: index,
+                    pinned: false,
                 });
             if record.envelope.is_some() && entry.envelope.is_none() {
                 entry.envelope = Some(record.clone());
@@ -429,38 +780,57 @@ impl ReceiptStore {
             entry.latest = Some(record);
             entry.last_index = index;
         }
+        for history in histories.values_mut() {
+            let Some(latest) = history.latest.as_ref() else {
+                continue;
+            };
+            let envelope = latest.envelope.as_ref().or_else(|| {
+                history
+                    .envelope
+                    .as_ref()
+                    .and_then(|owner| owner.envelope.as_ref())
+            });
+            history.pinned = DeliveryHistory::is_pinned(&latest.receipt, envelope);
+        }
 
         let mut histories: Vec<DeliveryHistory> = histories.into_values().collect();
         histories.sort_by_key(|history| std::cmp::Reverse(history.last_index));
-        let mut retained = Vec::new();
-        let mut retained_bytes = 0_u64;
-        for history in histories.into_iter().take(MAX_RETAINED_DELIVERIES) {
-            let Some(latest) = history.latest else {
+        let mut pinned: Vec<(usize, Vec<DurableRecord>)> = Vec::new();
+        let mut pinned_bytes = 0_u64;
+        let mut evictable: Vec<(usize, Vec<DurableRecord>, u64)> = Vec::new();
+        for history in histories {
+            let is_pinned = history.pinned;
+            let Some((index, records, bytes)) = records_to_retain(history)? else {
                 continue;
             };
-            let records = if latest.envelope.is_some() {
-                vec![latest]
+            if is_pinned {
+                pinned_bytes = pinned_bytes.saturating_add(bytes);
+                pinned.push((index, records));
             } else {
-                let mut records = Vec::with_capacity(2);
-                if let Some(envelope) = history.envelope {
-                    records.push(envelope);
-                }
-                records.push(latest);
-                records
-            };
-            let mut bytes = 0_u64;
-            for record in &records {
-                let mut line = serde_json::to_vec(record)?;
-                line.push(b'\n');
-                bytes = bytes.saturating_add(line.len() as u64);
+                evictable.push((index, records, bytes));
             }
-            // Always retain the newest delivery, even if its one required
-            // envelope exceeds the normal aggregate byte budget.
-            if !retained.is_empty() && retained_bytes.saturating_add(bytes) > MAX_RECEIPT_BYTES {
+        }
+        if pinned_bytes > max_receipt_bytes() {
+            self.note_compaction_overflow(pinned_bytes, pinned.len());
+            return Ok(());
+        }
+        self.end_compaction_overflow_episode();
+
+        let mut retained = pinned;
+        let mut retained_bytes = 0_u64;
+        let mut kept_evictable = 0_usize;
+        for (index, records, bytes) in evictable {
+            if kept_evictable >= max_retained_deliveries() {
+                break;
+            }
+            // Always retain the newest evictable delivery, even if its one
+            // required envelope exceeds the normal aggregate byte budget.
+            if kept_evictable > 0 && retained_bytes.saturating_add(bytes) > max_receipt_bytes() {
                 continue;
             }
             retained_bytes = retained_bytes.saturating_add(bytes);
-            retained.push((history.last_index, records));
+            kept_evictable += 1;
+            retained.push((index, records));
         }
         retained.sort_by_key(|(index, _)| *index);
 
@@ -476,8 +846,58 @@ impl ReceiptStore {
         Ok(())
     }
 
+    /// Enter (or stay in) a compaction-overflow episode for this log, logging
+    /// the exceedance exactly ONCE per episode. Compaction runs on every
+    /// append once the log is over budget, so a per-append error would bury
+    /// the operator's log; a per-episode error says the thing that is actually
+    /// news — this instance's owed notices no longer fit the budget.
+    fn note_compaction_overflow(&self, pinned_bytes: u64, pinned_deliveries: usize) {
+        let mut episodes = compaction_overflow_episodes()
+            .lock()
+            .expect("receipt overflow episode registry");
+        let episode = episodes.entry(self.path.clone()).or_default();
+        if episode.open {
+            return;
+        }
+        episode.open = true;
+        episode.logs = episode.logs.saturating_add(1);
+        drop(episodes);
+        tracing::error!(
+            path = %self.path.display(),
+            pinned_bytes,
+            pinned_deliveries,
+            budget_bytes = max_receipt_bytes(),
+            "receipt compaction is failing closed: the deliveries carrying owed self-kick \
+             notices exceed the retention budget on their own, so nothing is being evicted and \
+             the log is allowed to exceed the limit until the notices are delivered"
+        );
+    }
+
+    /// The pinned set fits again: close the episode so a future exceedance is
+    /// reported as the new event it is.
+    fn end_compaction_overflow_episode(&self) {
+        let mut episodes = compaction_overflow_episodes()
+            .lock()
+            .expect("receipt overflow episode registry");
+        if let Some(episode) = episodes.get_mut(&self.path) {
+            episode.open = false;
+        }
+    }
+
     fn lock_path(&self) -> PathBuf {
         self.path.with_extension("jsonl.lock")
+    }
+
+    /// How many compaction-overflow `tracing::error!` lines this log has
+    /// emitted. The contract the tests pin: ONE per exceedance episode, no
+    /// matter how many appends run while the pinned set is over budget.
+    #[cfg(test)]
+    pub(crate) fn compaction_overflow_log_count_for_test(&self) -> usize {
+        compaction_overflow_episodes()
+            .lock()
+            .expect("receipt overflow episode registry")
+            .get(&self.path)
+            .map_or(0, |episode| episode.logs)
     }
 }
 
@@ -486,6 +906,87 @@ struct DeliveryHistory {
     envelope: Option<DurableRecord>,
     latest: Option<DurableRecord>,
     last_index: usize,
+    /// PR #3495 r5: this delivery carries unfinished notice debt, or can still
+    /// acquire some, so compaction may not evict it. See
+    /// [`DeliveryHistory::is_pinned`].
+    pinned: bool,
+}
+
+/// The records compaction would write for one delivery — the body owner (kept
+/// exactly once) and the latest receipt — with their encoded size and the log
+/// position that orders them. `None` for a history with no receipt at all.
+fn records_to_retain(
+    history: DeliveryHistory,
+) -> anyhow::Result<Option<(usize, Vec<DurableRecord>, u64)>> {
+    let last_index = history.last_index;
+    let Some(latest) = history.latest else {
+        return Ok(None);
+    };
+    let records = if latest.envelope.is_some() {
+        vec![latest]
+    } else {
+        let mut records = Vec::with_capacity(2);
+        if let Some(envelope) = history.envelope {
+            records.push(envelope);
+        }
+        records.push(latest);
+        records
+    };
+    let mut bytes = 0_u64;
+    for record in &records {
+        let mut line = serde_json::to_vec(record)?;
+        line.push(b'\n');
+        bytes = bytes.saturating_add(line.len() as u64);
+    }
+    Ok(Some((last_index, records, bytes)))
+}
+
+impl DeliveryHistory {
+    /// The PIN rule, in one place.
+    ///
+    /// A delivery is pinned when its latest receipt carries an unfinished
+    /// operator notice — `notice_pending` or an unreconciled `late_ack_secs` —
+    /// or when it is a NONTERMINAL self-kick, which has not yet reached a state
+    /// from which it can no longer acquire debt (`ProtocolAccepted` becomes
+    /// `AckOverdue` with an intent on the very next watchdog pass). Everything
+    /// else is evictable.
+    fn is_pinned(latest: &DeliveryReceipt, envelope: Option<&DeliveryEnvelope>) -> bool {
+        if latest.notice_pending.is_some() || latest.late_ack_secs.is_some() {
+            return true;
+        }
+        envelope.is_some_and(|envelope| envelope.self_kick) && !latest.state.is_terminal()
+    }
+}
+
+/// PR #3495 r5: notice debt that [`remove_instance_delivery_state`] destroyed.
+///
+/// Deleting an instance's delivery state is a WRITER of the receipt store by
+/// the r4 rubric (writer = append ∪ delete ∪ compact ∪ rewrite), and it is the
+/// one writer that is allowed to discard debt — see the doc on that function.
+/// It never does so silently: every dropped intent is returned to the caller
+/// and logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DroppedNoticeDebt {
+    pub delivery_id: Uuid,
+    pub notice_kind: Option<String>,
+    pub late_ack_secs: Option<i64>,
+}
+
+/// One receipt log's compaction OVERFLOW episode: a stretch of appends during
+/// which the pinned set alone exceeds the byte budget, so compaction fails
+/// closed. `logs` counts the `tracing::error!` lines emitted for this log —
+/// exactly one per episode, not one per append.
+#[derive(Debug, Default, Clone, Copy)]
+struct OverflowEpisode {
+    open: bool,
+    logs: usize,
+}
+
+/// Overflow episodes keyed by log path, so the episode is per-instance (and,
+/// in tests, per temp home) rather than process-global.
+fn compaction_overflow_episodes() -> &'static Mutex<HashMap<PathBuf, OverflowEpisode>> {
+    static EPISODES: OnceLock<Mutex<HashMap<PathBuf, OverflowEpisode>>> = OnceLock::new();
+    EPISODES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn restrict_permissions(path: &Path, mode: u32) -> anyhow::Result<()> {
@@ -514,9 +1015,49 @@ pub(crate) fn delivery_path_for_instance(home: &Path, instance: &str) -> PathBuf
 /// Remove all durable delivery state for an instance, including the advisory
 /// lock sidecar. The caller must hold the delivery-worker cleanup guard so no
 /// queued or in-flight transport job can recreate the files after removal.
-pub(crate) fn remove_instance_delivery_state(home: &Path, instance: &str) -> anyhow::Result<()> {
+///
+/// PR #3495 r5 — THE ONE WRITER ALLOWED TO DISCARD DEBT, and why.
+///
+/// By the sharpened rubric a "writer" of the receipt store is any path that
+/// changes what the store returns for a delivery: append ∪ delete ∪ compact ∪
+/// rewrite. This is the delete. Its four production callers each destroy the
+/// instance the receipts describe, under a `DeleteFence`:
+///
+///  * `agent_ops::delete_instance_with_exit_status` (src/agent_ops.rs:339)
+///  * `daemon::lifecycle::delete_transaction` (src/daemon/lifecycle.rs:132)
+///  * `mcp::handlers::instance_state::lifecycle` full delete
+///    (src/mcp/handlers/instance_state/lifecycle.rs:311)
+///  * restart with `mode != "resume"`
+///    (src/mcp/handlers/instance_state/mod.rs:605), which destroys the backend
+///    session every receipt is keyed to
+///
+/// The debt these rows carry is a notice ABOUT a self-kick of that instance,
+/// addressed to its orchestrator. Keeping it would mean announcing an
+/// unacknowledged resume for a session the operator deliberately destroyed —
+/// which is precisely the escalation the restart path's comment refuses. So
+/// deletion DISCHARGES the debt by policy rather than delivering it, and this
+/// function is the documented exception to NO-LOSS.
+///
+/// What is NOT allowed is discharging it silently: every dropped intent is
+/// scanned out of the log before the removal, returned to the caller, and
+/// logged at `warn!`. Callers treat the value as advisory audit evidence.
+pub(crate) fn remove_instance_delivery_state(
+    home: &Path,
+    instance: &str,
+) -> anyhow::Result<Vec<DroppedNoticeDebt>> {
     let path = delivery_path_for_instance(home, instance);
     let lock_path = path.with_extension("jsonl.lock");
+    let dropped = notice_debt_in_log(&path);
+    for debt in &dropped {
+        tracing::warn!(
+            agent = %instance,
+            delivery_id = %debt.delivery_id,
+            notice_kind = ?debt.notice_kind,
+            late_ack_secs = ?debt.late_ack_secs,
+            "removing delivery state for a deleted or fresh-restarted instance DISCARDS an owed \
+             self-kick notice: the session it reports no longer exists"
+        );
+    }
     for candidate in [&path, &lock_path] {
         match std::fs::remove_file(candidate) {
             Ok(()) => {}
@@ -531,7 +1072,50 @@ pub(crate) fn remove_instance_delivery_state(home: &Path, instance: &str) -> any
             std::fs::remove_dir(&dir)?;
         }
     }
-    Ok(())
+    Ok(dropped)
+}
+
+/// The unfinished notice debt a receipt log is carrying, newest row per
+/// delivery. Best effort by construction: this runs on a log that is about to
+/// be deleted, so a malformed or unreadable line yields no audit rather than
+/// blocking the teardown.
+fn notice_debt_in_log(path: &Path) -> Vec<DroppedNoticeDebt> {
+    let Ok(file) = File::open(path) else {
+        return Vec::new();
+    };
+    let mut latest: HashMap<Uuid, DeliveryReceipt> = HashMap::new();
+    let mut order: Vec<Uuid> = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            return Vec::new();
+        };
+        let Ok(record) = serde_json::from_str::<DurableRecord>(&line) else {
+            continue;
+        };
+        if latest
+            .insert(record.receipt.delivery_id, record.receipt.clone())
+            .is_none()
+        {
+            order.push(record.receipt.delivery_id);
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|delivery_id| {
+            let receipt = latest.get(&delivery_id)?;
+            if receipt.notice_pending.is_none() && receipt.late_ack_secs.is_none() {
+                return None;
+            }
+            Some(DroppedNoticeDebt {
+                delivery_id,
+                notice_kind: receipt
+                    .notice_pending
+                    .as_ref()
+                    .map(|notice| notice.kind.clone()),
+                late_ack_secs: receipt.late_ack_secs,
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn safe_component(value: &str) -> String {
@@ -1126,6 +1710,596 @@ mod tests {
         );
         assert_eq!(recovered.session.username.as_deref(), Some("bearer"));
 
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// PR #3495 r4: the store-level non-regression GUARD.
+    ///
+    /// Every "unreachable" claim about an unconditional writer is replaced by
+    /// this invariant: the lowest-level append REFUSES an unconditional write
+    /// that would move a self-kick delivery BACKWARDS, or that would drop the
+    /// durable notice markers the row is carrying. Only a marker-aware
+    /// compare-and-append may change those markers.
+    fn self_kick_home(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("agend-transport-receipt-{tag}-{}", Uuid::new_v4()))
+    }
+
+    fn self_kick_envelope() -> DeliveryEnvelope {
+        DeliveryEnvelope::self_kick(
+            "claude-agent",
+            SessionLocator::claude(
+                "http://127.0.0.1:1".to_string(),
+                "self-kick-session".to_string(),
+                "token".to_string(),
+            ),
+            "[AGEND-RESUME] id=guard",
+        )
+    }
+
+    /// (i) An unconditional `record` may not regress `TurnStarted` back to
+    /// `ProtocolAccepted` — the shape `deliver_resident`'s post-202 write had.
+    #[test]
+    fn unconditional_record_refuses_to_regress_a_self_kick_row() {
+        let home = self_kick_home("guard-regress");
+        let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+        let envelope = self_kick_envelope();
+        store.record_queued(&envelope).expect("queued");
+        store
+            .record(DeliveryReceipt::for_state(
+                &envelope,
+                DeliveryState::TurnStarted,
+            ))
+            .expect("turn started");
+
+        let error = store
+            .record(DeliveryReceipt::for_state(
+                &envelope,
+                DeliveryState::ProtocolAccepted,
+            ))
+            .expect_err("a regressing unconditional append must be refused");
+        assert!(
+            error.to_string().contains("would regress"),
+            "the refusal must name the invariant: {error}"
+        );
+        assert_eq!(
+            store
+                .latest(envelope.delivery_id)
+                .expect("latest")
+                .expect("receipt")
+                .state,
+            DeliveryState::TurnStarted,
+            "and must leave the row untouched"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// (ii) An unconditional append over an `AckOverdue` row carrying an
+    /// unsent notice intent must be refused with the intent intact — dropping
+    /// it is the loss bug the guard exists to make impossible.
+    #[test]
+    fn unconditional_record_refuses_to_drop_a_pending_notice_intent() {
+        let home = self_kick_home("guard-intent");
+        let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+        let envelope = self_kick_envelope();
+        store.record_queued(&envelope).expect("queued");
+        let mut accepted = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
+        accepted.protocol_request_id = Some(envelope.delivery_id.to_string());
+        store.record(accepted).expect("accepted");
+        let mut overdue = DeliveryReceipt::for_state(&envelope, DeliveryState::AckOverdue);
+        let intent = PendingNotice::new(PendingNotice::ACK_OVERDUE, None);
+        overdue.notice_pending = Some(intent.clone());
+        assert!(store
+            .record_if_marker(
+                envelope.delivery_id,
+                DeliveryState::ProtocolAccepted,
+                None,
+                None,
+                overdue,
+            )
+            .expect("overdue CAS"));
+
+        // A same-state unconditional append that simply forgets the marker.
+        let mut forgetful = DeliveryReceipt::for_state(&envelope, DeliveryState::AckOverdue);
+        forgetful.detail = Some("a writer that never heard of notice_pending".to_string());
+        let error = store
+            .record(forgetful)
+            .expect_err("dropping a pending notice intent must be refused");
+        assert!(
+            error.to_string().contains("notice_pending"),
+            "the refusal must name the marker: {error}"
+        );
+        assert_eq!(
+            store
+                .latest(envelope.delivery_id)
+                .expect("latest")
+                .expect("receipt")
+                .notice_pending,
+            Some(intent),
+            "the unsent intent survives"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// (iii) The legitimate marker-aware transitions are unaffected: the
+    /// guard fences unconditional writers, not the CAS that owns the markers.
+    #[test]
+    fn marker_aware_cas_transitions_still_apply() {
+        let home = self_kick_home("guard-cas");
+        let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+        let envelope = self_kick_envelope();
+        store.record_queued(&envelope).expect("queued");
+        let mut accepted = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
+        accepted.protocol_request_id = Some(envelope.delivery_id.to_string());
+        store.record(accepted).expect("accepted");
+
+        let mut overdue = DeliveryReceipt::for_state(&envelope, DeliveryState::AckOverdue);
+        let intent = PendingNotice::new(PendingNotice::ACK_OVERDUE, None);
+        overdue.notice_pending = Some(intent.clone());
+        assert!(store
+            .record_if_marker(
+                envelope.delivery_id,
+                DeliveryState::ProtocolAccepted,
+                None,
+                None,
+                overdue,
+            )
+            .expect("overdue CAS"));
+
+        // Clearing the marker is a state-preserving CAS — allowed.
+        let mut cleared = DeliveryReceipt::for_state(&envelope, DeliveryState::AckOverdue);
+        cleared.notice_pending = None;
+        assert!(store
+            .record_if_marker(
+                envelope.delivery_id,
+                DeliveryState::AckOverdue,
+                None,
+                Some(&intent),
+                cleared,
+            )
+            .expect("clear CAS"));
+        let latest = store
+            .latest(envelope.delivery_id)
+            .expect("latest")
+            .expect("receipt");
+        assert_eq!(latest.state, DeliveryState::AckOverdue);
+        assert!(latest.notice_pending.is_none());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// (iv) Non-self-kick deliveries are untouched by the guard: every other
+    /// transport still appends terminal receipts unconditionally, and the
+    /// codex/opencode adapters legitimately overwrite a row in place.
+    #[test]
+    fn non_self_kick_deliveries_are_unaffected_by_the_guard() {
+        let home = self_kick_home("guard-other");
+        let store = ReceiptStore::for_instance(&home, "agent/one").expect("store");
+        let envelope = DeliveryEnvelope::new(
+            "agent/one",
+            SessionLocator::codex(PathBuf::from("/tmp/sock"), Some("thread".to_string())),
+            DeliveryKind::Prompt,
+            "body",
+            None,
+        );
+        assert!(!envelope.self_kick);
+        store.record_queued(&envelope).expect("queued");
+        store
+            .record(DeliveryReceipt::for_state(
+                &envelope,
+                DeliveryState::TurnStarted,
+            ))
+            .expect("turn started");
+        store
+            .record(DeliveryReceipt::for_state(
+                &envelope,
+                DeliveryState::ProtocolAccepted,
+            ))
+            .expect("a non-self-kick row keeps its unconditional semantics");
+        assert_eq!(
+            store
+                .latest(envelope.delivery_id)
+                .expect("latest")
+                .expect("receipt")
+                .state,
+            DeliveryState::ProtocolAccepted
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    // ── PR #3495 r5: compaction is a WRITER, and it may not evict debt ─────
+    //
+    // The r4 review's P0: `append_locked` compacts once the log passes the byte
+    // budget, and `compact_locked` kept the newest N deliveries with no
+    // exemption for a row carrying an owed notice. Enough later traffic to the
+    // same instance therefore EVICTED the envelope and latest receipt of a
+    // delivery with a parked intent, and `deliveries_owing_notices` — which
+    // needs both — could never rediscover it. The notice was gone for good.
+
+    /// An ordinary (non-self-kick) delivery compaction is free to evict, padded
+    /// so a lowered byte budget is reached in a handful of appends.
+    fn filler_delivery(store: &ReceiptStore, index: usize) -> Uuid {
+        let envelope = DeliveryEnvelope::new(
+            "claude-agent",
+            SessionLocator::codex(PathBuf::from("/tmp/sock"), Some("thread".to_string())),
+            DeliveryKind::Prompt,
+            format!("filler-{index}-{}", "x".repeat(512)),
+            None,
+        );
+        store.record_queued(&envelope).expect("filler queued");
+        store
+            .record(DeliveryReceipt::for_state(
+                &envelope,
+                DeliveryState::Completed,
+            ))
+            .expect("filler completed");
+        envelope.delivery_id
+    }
+
+    /// A self-kick delivery parked at `AckOverdue` with an UNSENT notice intent
+    /// — the debt the operator is owed.
+    fn parked_ack_overdue(store: &ReceiptStore) -> (DeliveryEnvelope, PendingNotice) {
+        let envelope = self_kick_envelope();
+        store.record_queued(&envelope).expect("queued");
+        let mut accepted = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
+        accepted.protocol_request_id = Some(envelope.delivery_id.to_string());
+        store.record(accepted).expect("accepted");
+        let intent = PendingNotice::new(PendingNotice::ACK_OVERDUE, None);
+        let mut overdue = DeliveryReceipt::for_state(&envelope, DeliveryState::AckOverdue);
+        overdue.notice_pending = Some(intent.clone());
+        assert!(store
+            .record_if_marker(
+                envelope.delivery_id,
+                DeliveryState::ProtocolAccepted,
+                None,
+                None,
+                overdue,
+            )
+            .expect("overdue CAS"));
+        (envelope, intent)
+    }
+
+    /// Every delivery id the compacted log still holds an ENVELOPE for — the
+    /// only rows `deliveries_owing_notices` can return.
+    fn surviving_body_owners(store: &ReceiptStore) -> std::collections::HashSet<Uuid> {
+        let file = File::open(store.path()).expect("receipt log");
+        let mut owners = std::collections::HashSet::new();
+        for line in BufReader::new(file).lines() {
+            let record: DurableRecord =
+                serde_json::from_str(&line.expect("line")).expect("valid record");
+            if record.envelope.is_some() {
+                owners.insert(record.receipt.delivery_id);
+            }
+        }
+        owners
+    }
+
+    fn log_len(store: &ReceiptStore) -> u64 {
+        std::fs::metadata(store.path()).expect("receipt log").len()
+    }
+
+    /// (a) A parked `notice_pending` survives any amount of later traffic, and
+    /// the per-tick pass still finds and delivers it.
+    #[test]
+    fn compaction_pins_a_delivery_with_a_pending_notice_intent() {
+        let home = self_kick_home("compaction-pin-intent");
+        let _limits = set_retention_limits_for_test(16 * 1024, 4);
+        let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+        let (envelope, intent) = parked_ack_overdue(&store);
+        for index in 0..40 {
+            filler_delivery(&store, index);
+        }
+        assert!(
+            log_len(&store) < 40 * 1024,
+            "compaction must actually have run: {} bytes",
+            log_len(&store)
+        );
+
+        let (retained, latest) = store
+            .delivery(envelope.delivery_id)
+            .expect("delivery")
+            .expect("the delivery carrying an owed notice must survive compaction");
+        assert_eq!(retained.delivery_id, envelope.delivery_id);
+        assert_eq!(
+            latest.notice_pending,
+            Some(intent),
+            "and must keep its unsent intent: {latest:?}"
+        );
+        assert!(
+            store
+                .deliveries_owing_notices()
+                .expect("owing")
+                .iter()
+                .any(|(candidate, _)| candidate.delivery_id == envelope.delivery_id),
+            "the watchdog must still be able to rediscover the owed notice"
+        );
+
+        let outcomes = crate::transport::claude_channel::self_kick_watchdog_pass_at(
+            &home,
+            "claude-agent",
+            Utc::now(),
+            &|_| None,
+        )
+        .expect("per-tick pass");
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "the per-tick pass delivers the owed notice exactly once: {outcomes:?}"
+        );
+        assert_eq!(outcomes[0].delivery_id, envelope.delivery_id);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// (b) The same for the other two pinned shapes: a TERMINAL row still
+    /// carrying an unreconciled `late_ack_secs`, and a NONTERMINAL self-kick
+    /// that carries no debt yet but can acquire some on the next pass.
+    #[test]
+    fn compaction_pins_late_ack_secs_and_nonterminal_self_kicks() {
+        let home = self_kick_home("compaction-pin-late-ack");
+        let _limits = set_retention_limits_for_test(16 * 1024, 4);
+        let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+
+        // A completed self-kick whose late ack has not been reconciled yet.
+        let late = self_kick_envelope();
+        store.record_queued(&late).expect("queued");
+        let mut accepted = DeliveryReceipt::for_state(&late, DeliveryState::ProtocolAccepted);
+        accepted.protocol_request_id = Some(late.delivery_id.to_string());
+        store.record(accepted).expect("accepted");
+        let mut completed = DeliveryReceipt::for_state(&late, DeliveryState::Completed);
+        completed.late_ack_secs = Some(7);
+        assert!(store
+            .record_if_marker(
+                late.delivery_id,
+                DeliveryState::ProtocolAccepted,
+                None,
+                None,
+                completed,
+            )
+            .expect("late-ack CAS"));
+
+        // A self-kick the bridge has accepted and nothing has acknowledged: no
+        // debt yet, but the next watchdog pass parks an AckOverdue intent on it.
+        let inflight = self_kick_envelope();
+        store.record_queued(&inflight).expect("queued");
+        let mut inflight_accepted =
+            DeliveryReceipt::for_state(&inflight, DeliveryState::ProtocolAccepted);
+        inflight_accepted.protocol_request_id = Some(inflight.delivery_id.to_string());
+        store.record(inflight_accepted).expect("accepted");
+
+        for index in 0..40 {
+            filler_delivery(&store, index);
+        }
+
+        assert_eq!(
+            store
+                .latest(late.delivery_id)
+                .expect("latest")
+                .expect("the late-ack row must survive compaction")
+                .late_ack_secs,
+            Some(7)
+        );
+        assert!(
+            surviving_body_owners(&store).contains(&late.delivery_id),
+            "and must keep the envelope `deliveries_owing_notices` needs"
+        );
+        assert_eq!(
+            store
+                .latest(inflight.delivery_id)
+                .expect("latest")
+                .expect("a nonterminal self-kick must survive compaction")
+                .state,
+            DeliveryState::ProtocolAccepted
+        );
+        assert!(surviving_body_owners(&store).contains(&inflight.delivery_id));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// (c) The bounded-overflow policy: when the PINNED set alone exceeds the
+    /// byte budget there is nothing safe to evict, so compaction evicts
+    /// NOTHING, the log is allowed to exceed the limit, and the exceedance is
+    /// logged once per episode — not once per append. Once the debt is
+    /// discharged, the next append compacts normally.
+    #[test]
+    fn compaction_refuses_to_evict_debt_when_pinned_set_exceeds_budget() {
+        let home = self_kick_home("compaction-overflow");
+        let _limits = set_retention_limits_for_test(4 * 1024, 4);
+        let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+        let parked: Vec<_> = (0..12).map(|_| parked_ack_overdue(&store)).collect();
+        assert!(
+            log_len(&store) > 4 * 1024,
+            "the pinned set alone must already exceed the budget: {} bytes",
+            log_len(&store)
+        );
+
+        // Several more appends, each of which finds the log over budget and
+        // therefore attempts a compaction that must fail closed.
+        for index in 0..5 {
+            filler_delivery(&store, index);
+        }
+        let owners = surviving_body_owners(&store);
+        for (envelope, intent) in &parked {
+            assert!(
+                owners.contains(&envelope.delivery_id),
+                "no pinned delivery may be evicted while compaction is over budget"
+            );
+            assert_eq!(
+                store
+                    .latest(envelope.delivery_id)
+                    .expect("latest")
+                    .expect("pinned receipt")
+                    .notice_pending
+                    .as_ref(),
+                Some(intent)
+            );
+        }
+        assert!(
+            log_len(&store) > 4 * 1024,
+            "failing closed means the log is ALLOWED to exceed the limit"
+        );
+        assert_eq!(
+            store.compaction_overflow_log_count_for_test(),
+            1,
+            "the exceedance episode is logged exactly once, not once per append"
+        );
+
+        // Discharge every notice, then append again: compaction resumes.
+        for (envelope, intent) in &parked {
+            let mut cleared = DeliveryReceipt::for_state(envelope, DeliveryState::Completed);
+            cleared.notice_pending = None;
+            assert!(store
+                .record_if_marker(
+                    envelope.delivery_id,
+                    DeliveryState::AckOverdue,
+                    None,
+                    Some(intent),
+                    cleared,
+                )
+                .expect("discharge CAS"));
+        }
+        let before = log_len(&store);
+        filler_delivery(&store, 99);
+        assert!(
+            log_len(&store) < before,
+            "with the debt discharged the log compacts normally: {} -> {}",
+            before,
+            log_len(&store)
+        );
+        assert_eq!(
+            store.compaction_overflow_log_count_for_test(),
+            1,
+            "and the closed episode is not re-logged"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// (d) Control: pinning is an exemption for debt, not a licence to keep
+    /// everything. Non-pinned deliveries are still evicted down to the limits
+    /// while pinned rows are present.
+    #[test]
+    fn compaction_still_evicts_non_debt_rows() {
+        let home = self_kick_home("compaction-evicts-non-debt");
+        // A budget the log exceeds again as soon as it is compacted, so the
+        // LAST append is itself a compaction and the surviving set is exactly
+        // what compaction chose — not "what it chose plus whatever was
+        // appended since".
+        let _limits = set_retention_limits_for_test(3 * 1024, 4);
+        let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+        let (pinned, _intent) = parked_ack_overdue(&store);
+        let fillers: Vec<Uuid> = (0..40)
+            .map(|index| filler_delivery(&store, index))
+            .collect();
+        assert!(
+            log_len(&store) > 3 * 1024,
+            "the fixture must leave the log over budget so the last append compacted"
+        );
+
+        let owners = surviving_body_owners(&store);
+        assert!(owners.contains(&pinned.delivery_id));
+        let surviving_fillers = fillers.iter().filter(|id| owners.contains(id)).count();
+        assert!(
+            (1..=4).contains(&surviving_fillers),
+            "non-pinned rows are evicted down to the retention limits, and the \
+             newest still survives: {surviving_fillers} survived"
+        );
+        assert!(
+            !owners.contains(&fillers[0]),
+            "the oldest non-pinned delivery must still be evicted"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// r5 sweep item (3) — SCHEMA is a way to lose a notice too. A row written
+    /// before the markers existed must still parse (they are `serde(default)`),
+    /// and a row written by this binary must survive the daemon restart that
+    /// re-reads the log: a fresh `ReceiptStore` must find the debt AND keep it
+    /// discoverable through `deliveries_owing_notices`.
+    #[test]
+    fn legacy_rows_parse_and_notice_debt_survives_a_reopen() {
+        let home = self_kick_home("schema-round-trip");
+        let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+        let (owed, intent) = parked_ack_overdue(&store);
+
+        // A row in the pre-#3495 shape: no marker fields at all.
+        let legacy_envelope = self_kick_envelope();
+        let legacy = DurableRecord {
+            receipt: DeliveryReceipt::queued(&legacy_envelope),
+            envelope: Some(legacy_envelope.clone()),
+        };
+        let mut legacy = serde_json::to_value(&legacy).expect("legacy record");
+        let receipt = legacy["receipt"]
+            .as_object_mut()
+            .expect("legacy receipt object");
+        for field in ["notice_pending", "late_ack_secs", "backend_session_id"] {
+            receipt.remove(field);
+        }
+        let line = format!("{legacy}\n");
+        assert!(!line.contains("notice_pending"));
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(store.path())
+            .expect("append legacy row");
+        file.write_all(line.as_bytes()).expect("legacy write");
+        drop(file);
+
+        // A restarted daemon: a brand-new store over the same durable file.
+        let reopened = ReceiptStore::for_instance(&home, "claude-agent").expect("reopen");
+        let legacy_latest = reopened
+            .latest(legacy_envelope.delivery_id)
+            .expect("legacy latest")
+            .expect("a pre-marker row must still parse");
+        assert!(legacy_latest.notice_pending.is_none());
+        assert!(legacy_latest.late_ack_secs.is_none());
+        assert_eq!(
+            reopened
+                .latest(owed.delivery_id)
+                .expect("latest")
+                .expect("receipt")
+                .notice_pending,
+            Some(intent),
+            "the debt must survive the reopen verbatim"
+        );
+        assert!(
+            reopened
+                .deliveries_owing_notices()
+                .expect("owing")
+                .iter()
+                .any(|(candidate, _)| candidate.delivery_id == owed.delivery_id),
+            "and must still be discoverable after the restart"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// (f) The delete path is the one writer allowed to discard debt — and it
+    /// must never do so silently. It reports every intent it destroyed.
+    #[test]
+    fn removing_instance_delivery_state_reports_the_debt_it_discards() {
+        let home = self_kick_home("delete-reports-debt");
+        let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+        let (envelope, intent) = parked_ack_overdue(&store);
+        let dropped = remove_instance_delivery_state(&home, "claude-agent").expect("removal");
+        assert_eq!(
+            dropped,
+            vec![DroppedNoticeDebt {
+                delivery_id: envelope.delivery_id,
+                notice_kind: Some(intent.kind.clone()),
+                late_ack_secs: None,
+            }],
+            "deleting an instance discharges its notice debt BY POLICY, and the \
+             audit must name what it discarded"
+        );
+        assert!(!delivery_path_for_instance(&home, "claude-agent").exists());
+
+        // A delete with nothing owed reports nothing.
+        let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+        let settled = self_kick_envelope();
+        store.record_queued(&settled).expect("queued");
+        store
+            .record(DeliveryReceipt::for_state(
+                &settled,
+                DeliveryState::Completed,
+            ))
+            .expect("completed");
+        assert!(remove_instance_delivery_state(&home, "claude-agent")
+            .expect("removal")
+            .is_empty());
         let _ = std::fs::remove_dir_all(home);
     }
 }

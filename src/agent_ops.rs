@@ -334,16 +334,25 @@ pub(crate) fn delete_instance_with_exit_status(
     // The public runtime entry owns the complete deletion fence even for an
     // external agent. External-first resolution must not bypass transport
     // invalidation: a queued job for the same name can otherwise outlive the
-    // early return and recreate delivery state or reach an adapter.
+    // early return and recreate delivery state or reach an adapter. The fence
+    // still fronts the whole window (it drops at the end of this function),
+    // but the delivery-state removal itself must wait until teardown is
+    // confirmed: a refused teardown (child-exit timeout) leaves the instance
+    // alive and retained for retry, and that surviving recipient can still be
+    // owed a parked operator notice — deleting the log unconditionally would
+    // discard it silently.
     let _delete_fence = crate::daemon::lifecycle::DeleteFence::new(home, name, true);
-    if let Err(error) = crate::transport::remove_instance_delivery_state(home, name) {
-        tracing::warn!(
-            agent = %name,
-            error = %error,
-            "delete: transport delivery cleanup failed"
-        );
+    let (outcome, observed_exit) = delete_instance_impl(home, name, context, skip_exit_wait);
+    if observed_exit {
+        if let Err(error) = crate::transport::remove_instance_delivery_state(home, name) {
+            tracing::warn!(
+                agent = %name,
+                error = %error,
+                "delete: transport delivery cleanup failed"
+            );
+        }
     }
-    delete_instance_impl(home, name, context, skip_exit_wait)
+    (outcome, observed_exit)
 }
 
 /// Delete through the shared transaction body when the caller already owns the
@@ -1082,6 +1091,7 @@ pub(crate) fn list_snapshot(
                 api_in_flight,
                 last_api_activity_at,
                 observed_status,
+                self_kick,
             ) = {
                 let c = handle.core.lock();
                 (
@@ -1095,6 +1105,7 @@ pub(crate) fn list_snapshot(
                     c.api_activity.in_flight,
                     c.api_activity.last_active_epoch_ms,
                     c.observed_status.clone(),
+                    c.health.last_self_kick.clone(),
                 )
             };
             let entry = json!({
@@ -1118,6 +1129,17 @@ pub(crate) fn list_snapshot(
                 "api_in_flight": api_in_flight,
                 "last_api_activity_at": last_api_activity_at,
                 "observed_status": observed_status,
+                // t-…-82348-105: the last RECONCILED fresh-restart self-kick
+                // outcome, or null when nothing went wrong. Purely additive
+                // evidence so an orchestrator sees an unacknowledged resume in
+                // list_instances instead of only in the event log.
+                "self_kick": self_kick.map(|e| json!({
+                    "delivery_id": e.delivery_id,
+                    "accepted_at": e.accepted_at.to_rfc3339(),
+                    "state": e.state,
+                    "turn_observed_since_kick": e.turn_observed_since_kick,
+                    "at": e.at.to_rfc3339(),
+                })),
                 "kind": "managed",
             });
             (name, entry)
