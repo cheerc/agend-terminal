@@ -82,6 +82,8 @@ mod ready;
 mod render;
 #[cfg_attr(windows, allow(dead_code))]
 mod reply_ledger;
+#[cfg_attr(windows, allow(dead_code))]
+mod resource_limits;
 mod review_receipt;
 #[cfg(test)]
 mod review_repro_test_util;
@@ -943,6 +945,9 @@ fn main() -> anyhow::Result<()> {
             // to register with the supervisor in detached mode), so the
             // detach branch only fires when a fleet path is in play.
             let force_foreground = foreground || !agents.is_empty();
+            if force_foreground {
+                resource_limits::raise_daemon_nofile_limit();
+            }
 
             // Wave 1 CLI consolidation: `--agents` subsumes the former
             // `daemon` subcommand. When provided, skip fleet loading and
