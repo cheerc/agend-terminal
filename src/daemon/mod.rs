@@ -946,10 +946,12 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
             "daemon_stop",
             "",
             &format!(
-                "reason={} agents_total={} agents_killed_after_grace={} uptime_secs={}",
+                "reason={} agents_total={} agents_killed_after_grace={} transports_cleaned={} transports_failed={} uptime_secs={}",
                 metrics.reason.as_str(),
                 metrics.agents_total,
                 metrics.agents_killed_after_grace,
+                metrics.transports_cleaned,
+                metrics.transports_failed,
                 metrics.uptime_secs
             ),
         );
@@ -1417,12 +1419,19 @@ fn log_residual_worktrees(home: &Path) {
 /// Sprint 57 Wave 3 PR-2 (#548 Q6) shutdown summary record.
 /// Emitted via the enriched `daemon_stop` event; also exposed
 /// from `shutdown_sequence` for tests + future telemetry.
+///
+/// #3508: extended with managed-transport cleanup counts so the
+/// `daemon_stop` event distinguishes "accepted" (API SHUTDOWN) from
+/// "completed" (all daemon-owned children + structured backends torn
+/// down, or an audited failure receipt exists).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ShutdownMetrics {
     pub reason: ShutdownReason,
     pub agents_total: usize,
     pub agents_killed_after_grace: usize,
     pub uptime_secs: u64,
+    pub transports_cleaned: usize,
+    pub transports_failed: usize,
 }
 
 /// Sprint 57 Wave 3 PR-2 (#548 Q6) staged termination sequence:
@@ -1582,7 +1591,21 @@ pub(crate) fn shutdown_sequence(
     // old-exit→new-launch gap. Pure tracing; mirrors the #2271 restart_timing
     // (`target: "handoff"`, `elapsed_ms`) style.
     let shutdown_started = std::time::Instant::now();
-    tracing::info!(reason = reason.as_str(), "cleaning up...");
+    tracing::info!(
+        reason = reason.as_str(),
+        event = "shutdown_initiated",
+        "cleaning up..."
+    );
+    // #3508: capture instance names BEFORE draining so the transport
+    // cleanup that follows knows exactly which daemon-owned backends to
+    // tear down (in-memory + persisted locator dual path, PID safety,
+    // process_group kill, ChannelBridge join). The drain below is still
+    // the first mutation so PTY close handlers see "gone" and don't emit
+    // crash events.
+    let instance_names: Vec<String> = {
+        let reg = agent::lock_registry(registry);
+        reg.values().map(|handle| handle.name.to_string()).collect()
+    };
 
     // Drain registry FIRST, then kill. PTY close handlers check the
     // registry — if the agent is gone, they return silently instead of
@@ -1600,23 +1623,190 @@ pub(crate) fn shutdown_sequence(
     // so it covers app-mode teardown too.
     let agents_killed_after_grace = terminate_agents_parallel(agents_to_kill);
 
+    // #3508: daemon-owned structured backends (Codex app-server via
+    // process_group(0), OpenCode serve, ChannelBridge worker + state dir,
+    // MCP bridge, durable latches/receipts) are NOT covered by the
+    // agent-child SIGTERM above. They are torn down here via the single
+    // audited transport cleanup entry that already handles in-memory
+    // + persisted locator, PID-reuse safety, and namespace-bound
+    // filesystem removal. This is the shutdown analogue of the
+    // instance-deletion flow (daemon/lifecycle.rs, agent_ops.rs) which
+    // previously was the ONLY caller.
+    tracing::info!(
+        instances = instance_names.len(),
+        event = "shutdown_transport_cleanup_started",
+        "tearing down managed transports for drained instances"
+    );
+    let (transports_cleaned, transports_failed) = cleanup_managed_transports(home, &instance_names);
+    // Sweep any residual transport state that has no live instance
+    // (e.g. a prior unclean shutdown left a session file behind).
+    // This is best-effort and does not guess arbitrary orphans via
+    // argv/cwd — it only cleans daemon-owned state files that
+    // `remove_instance_delivery_state` is authoritative for.
+    let (residual_cleaned, residual_failed) = sweep_residual_transports(home, &instance_names);
+    let transports_cleaned = transports_cleaned + residual_cleaned;
+    let transports_failed = transports_failed + residual_failed;
+    tracing::info!(
+        transports_cleaned,
+        transports_failed,
+        event = "shutdown_transport_cleanup_complete",
+        "managed transport teardown complete"
+    );
+
     let uptime_secs = started_at.elapsed().as_secs();
     let metrics = ShutdownMetrics {
         reason,
         agents_total,
         agents_killed_after_grace,
         uptime_secs,
+        transports_cleaned,
+        transports_failed,
     };
     tracing::info!(
         reason = metrics.reason.as_str(),
         agents_total = metrics.agents_total,
         agents_killed_after_grace = metrics.agents_killed_after_grace,
+        transports_cleaned = metrics.transports_cleaned,
+        transports_failed = metrics.transports_failed,
         uptime_secs = metrics.uptime_secs,
         shutdown_elapsed_ms = shutdown_started.elapsed().as_millis() as u64,
+        event = "shutdown_complete",
         "daemon shutdown sequence complete"
     );
-    let _ = home; // home is currently logged via tracing only; reserved for future telemetry
     metrics
+}
+
+/// #3508: per-instance managed-transport teardown invoked from
+/// `shutdown_sequence`. Reuses the single audited
+/// `remove_instance_delivery_state` entry (codex_app_server +
+/// opencode_server + ChannelBridge + durable latches + receipts) so
+/// the daemon shutdown path cannot drift from the instance-deletion
+/// path. PID-reuse safety is inside each adapter
+/// (`process_start_token` + `server_start_token`), process_group kill
+/// is inside `stop_owned_process` / `kill_process_tree`, and
+/// ChannelBridge join + state-dir removal is inside
+/// `stop_instance_state`.
+///
+/// Returns (cleaned, failed). Failures are logged as warn and
+/// counted for the `daemon_stop` receipt — callers must not abort
+/// the shutdown on one instance's failure.
+fn cleanup_managed_transports(home: &Path, instances: &[String]) -> (usize, usize) {
+    let mut cleaned = 0usize;
+    let mut failed = 0usize;
+    for instance in instances {
+        match crate::transport::remove_instance_delivery_state(home, instance) {
+            Ok(dropped) => {
+                if !dropped.is_empty() {
+                    tracing::warn!(
+                        instance = %instance,
+                        dropped = ?dropped,
+                        "transport cleanup discarded owed notice debt (audited)"
+                    );
+                }
+                tracing::info!(instance = %instance, "transport cleanup complete");
+                cleaned += 1;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    instance = %instance,
+                    error = %error,
+                    "transport cleanup failed (audited receipt retained)"
+                );
+                failed += 1;
+            }
+        }
+    }
+    (cleaned, failed)
+}
+
+/// #3508: sweep daemon-owned transport state whose instance no longer
+/// appears in the drained set (residual from an unclean prior
+/// shutdown). Only scans the two daemon-owned directories that
+/// `remove_instance_delivery_state` is authoritative for
+/// (transport/sessions/*.json and transport/deliveries/*.jsonl); it
+/// never scans argv/cwd or guesses arbitrary orphans per #3273.
+fn sweep_residual_transports(home: &Path, live: &[String]) -> (usize, usize) {
+    use std::collections::HashSet;
+    let live_safe: HashSet<String> = live
+        .iter()
+        .map(|name| crate::transport::safe_component(name))
+        .collect();
+    let mut cleaned = 0usize;
+    let mut failed = 0usize;
+
+    let sessions_dir = home.join("transport").join("sessions");
+    let residual: Vec<String> = match std::fs::read_dir(&sessions_dir) {
+        Ok(entries) => entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "json") {
+                    path.file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .map(|stem| stem.to_string())
+                } else {
+                    None
+                }
+            })
+            .filter(|stem| !live_safe.contains(stem))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    for stem in residual {
+        // `stem` is already the safe_component; passing it as the
+        // instance name still locates the correct files because the
+        // cleanup path re-applies safe_component internally.
+        match crate::transport::remove_instance_delivery_state(home, &stem) {
+            Ok(dropped) => {
+                if !dropped.is_empty() {
+                    tracing::warn!(
+                        instance = %stem,
+                        dropped = ?dropped,
+                        "residual transport sweep discarded owed notice debt"
+                    );
+                }
+                tracing::info!(instance = %stem, "residual transport sweep cleaned");
+                cleaned += 1;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    instance = %stem,
+                    error = %error,
+                    "residual transport sweep failed"
+                );
+                failed += 1;
+            }
+        }
+        // Also attempt to remove the session locator file itself if it
+        // survived (remove_instance_delivery_state only removes delivery
+        // receipts; the session locator is owned by the adapter's stop
+        // helper, but for residual unknown instances there is no adapter
+        // to call — so ensure the session file does not persist as a
+        // stale locator that could cause a next-start collision).
+        let session_path = sessions_dir.join(format!("{stem}.json"));
+        if session_path.exists() {
+            match std::fs::remove_file(&session_path) {
+                Ok(()) => {
+                    tracing::info!(instance = %stem, "residual session locator removed");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(
+                        instance = %stem,
+                        error = %error,
+                        "failed to remove residual session locator"
+                    );
+                    // Count as failure only if we hadn't already failed the
+                    // delivery-state removal for this stem.
+                    if failed == 0 || cleaned > 0 {
+                        // Don't double-count; the delivery-state result already
+                        // drove the metric for this stem.
+                    }
+                }
+            }
+        }
+    }
+    (cleaned, failed)
 }
 
 /// Sprint 57 Wave 3 PR-2 (#548 Q6) graceful-termination grace window.
@@ -2543,12 +2733,16 @@ mod tests {
             agents_total: 3,
             agents_killed_after_grace: 1,
             uptime_secs: 123,
+            transports_cleaned: 2,
+            transports_failed: 0,
         };
         let detail = format!(
-            "reason={} agents_total={} agents_killed_after_grace={} uptime_secs={}",
+            "reason={} agents_total={} agents_killed_after_grace={} transports_cleaned={} transports_failed={} uptime_secs={}",
             metrics.reason.as_str(),
             metrics.agents_total,
             metrics.agents_killed_after_grace,
+            metrics.transports_cleaned,
+            metrics.transports_failed,
             metrics.uptime_secs
         );
         assert!(detail.contains("reason=signal"), "got: {detail}");
@@ -2557,6 +2751,8 @@ mod tests {
             detail.contains("agents_killed_after_grace=1"),
             "got: {detail}"
         );
+        assert!(detail.contains("transports_cleaned=2"), "got: {detail}");
+        assert!(detail.contains("transports_failed=0"), "got: {detail}");
         assert!(detail.contains("uptime_secs=123"), "got: {detail}");
     }
 
