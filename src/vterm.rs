@@ -381,6 +381,9 @@ impl Dimensions for VTermSize {
     }
 }
 
+#[rustfmt::skip]
+fn append_termode_sequences(out: &mut Vec<u8>, mode: term::TermMode) { for (m,s) in [(term::TermMode::ALT_SCREEN,b"\x1b[?1049h" as &[u8]),(term::TermMode::MOUSE_REPORT_CLICK,b"\x1b[?1000h"),(term::TermMode::MOUSE_DRAG,b"\x1b[?1002h"),(term::TermMode::MOUSE_MOTION,b"\x1b[?1003h"),(term::TermMode::SGR_MOUSE,b"\x1b[?1006h")] { if mode.contains(m) { out.extend_from_slice(s); } } }
+
 pub struct VTerm {
     term: term::Term<PtyWriteListener>,
     processor: Processor,
@@ -1005,9 +1008,8 @@ impl VTerm {
         let cols = self.cols as usize;
         let rows = self.rows as usize;
 
-        if self.term.mode().contains(term::TermMode::ALT_SCREEN) {
-            out.extend_from_slice(b"\x1b[?1049h");
-        }
+        // rustfmt::skip
+        append_termode_sequences(&mut out, *self.term.mode());
         out.extend_from_slice(b"\x1b[H\x1b[2J");
 
         let mut last_fg: Option<Color> = None;
