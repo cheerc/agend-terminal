@@ -516,6 +516,7 @@ fn dispatch_transport(
                 &context.target,
                 &context.lease_now,
                 context.assignment_id,
+                "stale-teardown",
             );
         }
         return;
@@ -532,15 +533,21 @@ fn dispatch_transport(
         },
     );
     if let Some(context) = assignment_wake.as_ref() {
-        let successful = matches!(
-            result.as_ref(),
-            Ok(receipt)
-                if !matches!(
-                    receipt.state,
-                    crate::transport::DeliveryState::Failed
-                        | crate::transport::DeliveryState::Ambiguous
-                )
-        );
+        // #3504 R1: LegacyPty's successful write is Ambiguous (unproven
+        // acceptance) — it must not be treated as fenced/queue-full. ChannelBridge
+        // never returns Ambiguous on success (ProtocolAccepted), so only
+        // LegacyPty's Ambiguous is the successful-but-unproven case.
+        let is_legacy_pty = crate::transport::mode_for_instance(&home, &agent)
+            == crate::transport::TransportMode::LegacyPty;
+        let successful = match result.as_ref() {
+            Ok(receipt) if receipt.state == crate::transport::DeliveryState::Failed => false,
+            Ok(receipt) if receipt.state == crate::transport::DeliveryState::Ambiguous => {
+                // LegacyPty success is Ambiguous; other transports' Ambiguous is failure.
+                is_legacy_pty
+            }
+            Ok(_) => true,
+            Err(_) => false,
+        };
         let lease_result = if successful {
             crate::daemon::assignment_authority::advance_lease_after_wake(
                 &home,
@@ -558,6 +565,7 @@ fn dispatch_transport(
                 &context.target,
                 &context.lease_now,
                 context.assignment_id,
+                "adapter-failed",
             )
         };
         if let Err(error) = lease_result {

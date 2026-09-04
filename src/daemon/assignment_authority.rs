@@ -525,7 +525,10 @@ pub(crate) fn advance_lease_after_wake(
 
 /// Set a short retry lease after a fenced / queue-full wake failure (#3504).
 /// Bounded at 5s so the next reconcile retries quickly without advancing the
-/// full 60s invisibly. CAS on `assignment_id`.
+/// full 60s invisibly. CAS on `assignment_id`. `reason` is the caller-known
+/// failure class (e.g. "fenced", "queue-full", "stale-teardown",
+/// "adapter-failed") and is emitted verbatim in both tracing and the durable
+/// event_log so the #3504 diagnostic record is trustworthy.
 pub(crate) fn set_short_retry_lease(
     home: &Path,
     repo: &str,
@@ -533,6 +536,7 @@ pub(crate) fn set_short_retry_lease(
     target: &str,
     now: &str,
     expected_id: uuid::Uuid,
+    reason: &str,
 ) -> anyhow::Result<bool> {
     let _lock = lock_branch(home, repo, branch)?;
     let path = record_file(home, repo, branch, target);
@@ -543,15 +547,14 @@ pub(crate) fn set_short_retry_lease(
             tracing::warn!(
                 repo = %repo, branch = %branch, target = %target,
                 next_nudge_at = %cur.next_nudge_at,
-                "review assignment wake fenced/queue-full — short retry lease set"
+                reason = %reason,
+                "review assignment wake {reason} — short retry lease set"
             );
             crate::event_log::log(
                 home,
                 "review_assignment_wake_retry",
                 target,
-                &format!(
-                    "wake for {repo}@{branch} fenced/queue-full at {now}; short retry lease set"
-                ),
+                &format!("wake for {repo}@{branch} {reason} at {now}; short retry lease set"),
             );
             return Ok(true);
         }

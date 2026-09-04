@@ -120,11 +120,16 @@ pub(crate) fn reconcile_all(home: &Path, now: &str) {
             detail.assignment_id,
             now,
         );
-        if matches!(
-            result,
-            Err(crate::daemon::delivery_worker::TransportEnqueueError::QueueFull { .. })
-                | Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced { .. })
-        ) {
+        let reason = match &result {
+            Err(crate::daemon::delivery_worker::TransportEnqueueError::QueueFull { .. }) => {
+                Some("queue-full")
+            }
+            Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced { .. }) => {
+                Some("fenced")
+            }
+            _ => None,
+        };
+        if let Some(reason) = reason {
             // Admission failure is known synchronously; retain the row and let
             // the bounded retry make the failure visible to the next tick.
             let _ = store::set_short_retry_lease(
@@ -134,6 +139,7 @@ pub(crate) fn reconcile_all(home: &Path, now: &str) {
                 &detail.target,
                 now,
                 detail.assignment_id,
+                reason,
             );
         }
     }

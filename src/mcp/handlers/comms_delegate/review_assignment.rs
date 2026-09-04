@@ -524,6 +524,10 @@ fn dispatch_review_assignment_via_store_impl(
         record.assignment_id,
         &now,
     ) {
+        let reason = match &error {
+            crate::daemon::delivery_worker::TransportEnqueueError::QueueFull { .. } => "queue-full",
+            crate::daemon::delivery_worker::TransportEnqueueError::Fenced { .. } => "fenced",
+        };
         let _ = crate::daemon::assignment_authority::set_short_retry_lease(
             home,
             repo_slug,
@@ -531,10 +535,12 @@ fn dispatch_review_assignment_via_store_impl(
             target,
             &now,
             record.assignment_id,
+            reason,
         );
         tracing::warn!(
             target = %target,
             error = ?error,
+            reason = %reason,
             "review assignment wake admission failed; durable short retry retained"
         );
     }
