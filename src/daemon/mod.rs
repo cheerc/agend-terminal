@@ -48,6 +48,7 @@ mod revoke_assignment_tests;
 pub(crate) mod router;
 /// #2413 Shadow Observer — local plane (claude hooks side-channel). Spike, flag-OFF.
 pub mod shadow;
+pub(crate) mod shutdown_cleanup;
 pub(crate) mod supervisor;
 pub(crate) mod task_progress;
 pub(crate) mod task_sweep;
@@ -946,10 +947,12 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
             "daemon_stop",
             "",
             &format!(
-                "reason={} agents_total={} agents_killed_after_grace={} uptime_secs={}",
+                "reason={} agents_total={} agents_killed_after_grace={} transports_cleaned={} transports_failed={} uptime_secs={}",
                 metrics.reason.as_str(),
                 metrics.agents_total,
                 metrics.agents_killed_after_grace,
+                metrics.transports_cleaned,
+                metrics.transports_failed,
                 metrics.uptime_secs
             ),
         );
@@ -1417,12 +1420,19 @@ fn log_residual_worktrees(home: &Path) {
 /// Sprint 57 Wave 3 PR-2 (#548 Q6) shutdown summary record.
 /// Emitted via the enriched `daemon_stop` event; also exposed
 /// from `shutdown_sequence` for tests + future telemetry.
+///
+/// #3508: extended with managed-transport cleanup counts so the
+/// `daemon_stop` event distinguishes "accepted" (API SHUTDOWN) from
+/// "completed" (all daemon-owned children + structured backends torn
+/// down, or an audited failure receipt exists).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ShutdownMetrics {
     pub reason: ShutdownReason,
     pub agents_total: usize,
     pub agents_killed_after_grace: usize,
     pub uptime_secs: u64,
+    pub transports_cleaned: usize,
+    pub transports_failed: usize,
 }
 
 /// Sprint 57 Wave 3 PR-2 (#548 Q6) staged termination sequence:
@@ -1582,7 +1592,21 @@ pub(crate) fn shutdown_sequence(
     // old-exit→new-launch gap. Pure tracing; mirrors the #2271 restart_timing
     // (`target: "handoff"`, `elapsed_ms`) style.
     let shutdown_started = std::time::Instant::now();
-    tracing::info!(reason = reason.as_str(), "cleaning up...");
+    tracing::info!(
+        reason = reason.as_str(),
+        event = "shutdown_initiated",
+        "cleaning up..."
+    );
+    // #3508: capture instance names BEFORE draining so the transport
+    // cleanup that follows knows exactly which daemon-owned backends to
+    // tear down (in-memory + persisted locator dual path, PID safety,
+    // process_group kill, ChannelBridge join). The drain below is still
+    // the first mutation so PTY close handlers see "gone" and don't emit
+    // crash events.
+    let instance_names: Vec<String> = {
+        let reg = agent::lock_registry(registry);
+        reg.values().map(|handle| handle.name.to_string()).collect()
+    };
 
     // Drain registry FIRST, then kill. PTY close handlers check the
     // registry — if the agent is gone, they return silently instead of
@@ -1600,22 +1624,58 @@ pub(crate) fn shutdown_sequence(
     // so it covers app-mode teardown too.
     let agents_killed_after_grace = terminate_agents_parallel(agents_to_kill);
 
+    // #3508: daemon-owned structured backends (Codex app-server via
+    // process_group(0), OpenCode serve, ChannelBridge worker + state dir,
+    // MCP bridge, durable latches/receipts) are NOT covered by the
+    // agent-child SIGTERM above. They are torn down here via the single
+    // audited transport cleanup entry that already handles in-memory
+    // + persisted locator, PID-reuse safety, and namespace-bound
+    // filesystem removal. This is the shutdown analogue of the
+    // instance-deletion flow (daemon/lifecycle.rs, agent_ops.rs) which
+    // previously was the ONLY caller.
+    tracing::info!(
+        instances = instance_names.len(),
+        event = "shutdown_transport_cleanup_started",
+        "tearing down managed transports for drained instances"
+    );
+    let (transports_cleaned, transports_failed) =
+        shutdown_cleanup::cleanup_managed_transports(home, &instance_names);
+    // Sweep any residual transport state that has no live instance
+    // (e.g. a prior unclean shutdown left a session file behind).
+    // This is best-effort and does not guess arbitrary orphans via
+    // argv/cwd — it only cleans daemon-owned state files that
+    // `remove_instance_delivery_state` is authoritative for.
+    let (residual_cleaned, residual_failed) =
+        shutdown_cleanup::sweep_residual_transports(home, &instance_names);
+    let transports_cleaned = transports_cleaned + residual_cleaned;
+    let transports_failed = transports_failed + residual_failed;
+    tracing::info!(
+        transports_cleaned,
+        transports_failed,
+        event = "shutdown_transport_cleanup_complete",
+        "managed transport teardown complete"
+    );
+
     let uptime_secs = started_at.elapsed().as_secs();
     let metrics = ShutdownMetrics {
         reason,
         agents_total,
         agents_killed_after_grace,
         uptime_secs,
+        transports_cleaned,
+        transports_failed,
     };
     tracing::info!(
         reason = metrics.reason.as_str(),
         agents_total = metrics.agents_total,
         agents_killed_after_grace = metrics.agents_killed_after_grace,
+        transports_cleaned = metrics.transports_cleaned,
+        transports_failed = metrics.transports_failed,
         uptime_secs = metrics.uptime_secs,
         shutdown_elapsed_ms = shutdown_started.elapsed().as_millis() as u64,
+        event = "shutdown_complete",
         "daemon shutdown sequence complete"
     );
-    let _ = home; // home is currently logged via tracing only; reserved for future telemetry
     metrics
 }
 
@@ -2543,12 +2603,16 @@ mod tests {
             agents_total: 3,
             agents_killed_after_grace: 1,
             uptime_secs: 123,
+            transports_cleaned: 2,
+            transports_failed: 0,
         };
         let detail = format!(
-            "reason={} agents_total={} agents_killed_after_grace={} uptime_secs={}",
+            "reason={} agents_total={} agents_killed_after_grace={} transports_cleaned={} transports_failed={} uptime_secs={}",
             metrics.reason.as_str(),
             metrics.agents_total,
             metrics.agents_killed_after_grace,
+            metrics.transports_cleaned,
+            metrics.transports_failed,
             metrics.uptime_secs
         );
         assert!(detail.contains("reason=signal"), "got: {detail}");
@@ -2557,6 +2621,8 @@ mod tests {
             detail.contains("agents_killed_after_grace=1"),
             "got: {detail}"
         );
+        assert!(detail.contains("transports_cleaned=2"), "got: {detail}");
+        assert!(detail.contains("transports_failed=0"), "got: {detail}");
         assert!(detail.contains("uptime_secs=123"), "got: {detail}");
     }
 
