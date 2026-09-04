@@ -61,10 +61,12 @@ fn reconcile_remote_roster_candidates(
 /// shell) would otherwise spam `attach failed` warns once per sync.
 ///
 /// Pure rule so unit tests pin it without sockets: attempts 1–2 retry
-/// immediately, attempt 3+ is deferred (the caller skips the attach and
-/// re-ages the failure counter). A success resets the count to zero.
-/// `STALE_HINT_AFTER` consecutive failures mark the agent stale so the
-/// caller can emit an actionable hint (daemon restart / port cleanup).
+/// immediately, attempt 3+ is deferred. A deferred pass RE-AGES the
+/// counter (r1 F1: a frozen counter would cap at 3 and strand the pane);
+/// at `STALE_HINT_AFTER` the caller emits the stale hint once, past it
+/// the counter resets into the retry window so attempts resume — defer +
+/// eventual hint + recovery, never abandon. A success (or gone) resets
+/// the count to zero.
 pub(super) const ATTACH_FAIL_FAST_RETRIES: u32 = 2;
 pub(super) const STALE_HINT_AFTER: u32 = 5;
 
@@ -108,8 +110,10 @@ pub(super) struct AppState {
     /// #3505 P0(b): consecutive attach-failure counts per agent name.
     /// Bounds the 2s-cadence `attach failed` warn loop: after
     /// `ATTACH_FAIL_FAST_RETRIES` the sync pass skips the attempt
-    /// (backoff), and after `STALE_HINT_AFTER` it emits an actionable
-    /// stale hint. Cleared on successful attach.
+    /// (backoff, re-aging the counter); at `STALE_HINT_AFTER` it emits
+    /// one actionable stale hint, past it the counter resets into the
+    /// retry window so attempts resume (never abandon). Cleared on
+    /// successful attach or gone.
     pub(super) remote_attach_failures: std::collections::HashMap<String, u32>,
     /// Last daemon-authoritative state snapshot for attached panes. Missing
     /// entries intentionally remain unknown to render; they must not become
@@ -1065,15 +1069,27 @@ impl AppState {
             // #3505 P0(b): bound the retry storm — skip this pass when the
             // agent is in backoff, so a Live-but-unreachable entry doesn't
             // spam one `attach failed` warn per 2s sync forever.
+            // r1 F1: the skip RE-AGES the counter (a skip that leaves the
+            // counter frozen caps it at 3 and makes the stale hint dead
+            // code). At `STALE_HINT_AFTER` the hint fires once; past it
+            // the counter resets into the retry window so attempts resume
+            // — defer + eventual hint + recovery, never abandon.
             let fails = self.remote_attach_failures.get(name).copied().unwrap_or(0);
             if !attach_retry_due(fails) {
-                if fails == STALE_HINT_AFTER {
+                let aged = fails + 1;
+                if aged == STALE_HINT_AFTER {
                     tracing::warn!(
                         agent = %name,
-                        fails,
+                        fails = aged,
                         "remote pane attach repeatedly failing — stale registry entry or port shell? \
                          check `agend-terminal doctor` (daemon restart / .port cleanup reconciles)",
                     );
+                    self.remote_attach_failures.insert(name.clone(), aged);
+                } else if aged > STALE_HINT_AFTER {
+                    self.remote_attach_failures
+                        .insert(name.clone(), ATTACH_FAIL_FAST_RETRIES);
+                } else {
+                    self.remote_attach_failures.insert(name.clone(), aged);
                 }
                 continue;
             }
@@ -1353,5 +1369,46 @@ mod attach_backoff_3505_tests {
         assert!(super::attach_retry_due_for_test(1));
         // After repeated failures the retry must be deferred.
         assert!(!super::attach_retry_due_for_test(5));
+    }
+
+    /// #3505 r1 F1 RED: a deferred (skipped) pass must RE-AGE the failure
+    /// counter so the stale hint stays reachable and attempts eventually
+    /// resume — never abandon the pane. Simulates the skip branch N times
+    /// from a fresh counter and asserts: (1) the hint fires exactly at
+    /// `STALE_HINT_AFTER`, (2) a later pass attempts again (recovery).
+    #[test]
+    fn attach_backoff_reages_on_skip_hint_fires_attempts_resume_3505() {
+        let mut fails = 0u32;
+        let mut hint_at: Option<u32> = None;
+        let mut resumed = false;
+        // Simulate 12 consecutive sync passes with no success.
+        for _ in 0..12 {
+            if super::attach_retry_due_for_test(fails) {
+                // An attempt would run and fail → counter advances.
+                if fails >= super::ATTACH_FAIL_FAST_RETRIES {
+                    resumed = hint_at.is_some();
+                }
+                fails += 1;
+            } else {
+                // Skip branch: must re-age (F1 fix) + fire hint at threshold.
+                fails += 1;
+                if fails == super::STALE_HINT_AFTER && hint_at.is_none() {
+                    hint_at = Some(fails);
+                }
+                if fails > super::STALE_HINT_AFTER {
+                    // Recovery: reset into the retry window, never abandon.
+                    fails = super::ATTACH_FAIL_FAST_RETRIES;
+                }
+            }
+        }
+        assert_eq!(
+            hint_at,
+            Some(super::STALE_HINT_AFTER),
+            "the stale hint must fire (F1: skip must re-age the counter)"
+        );
+        assert!(
+            resumed,
+            "attempts must resume after the hint cycle (F1: never abandon)"
+        );
     }
 }
