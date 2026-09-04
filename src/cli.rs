@@ -252,6 +252,25 @@ pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
         println!("    (none)");
     }
 
+    // #3505 P0(c): surface Live-registry vs *.port drift. A file-direct
+    // edit (or a refused/partial teardown) leaves one source stale while
+    // the other still names the agents — without this the TUI just loops
+    // `attach failed` warns with no actionable pointer.
+    {
+        let live: std::collections::HashSet<String> = agents.iter().cloned().collect();
+        let ports: Vec<String> = run
+            .as_ref()
+            .map(|r| crate::ipc::list_agent_ports(r))
+            .unwrap_or_default();
+        let drift = crate::runtime::detect_registry_port_drift(&live, &ports);
+        if !drift.is_empty() {
+            println!("\n  Registry/port drift ({}):", drift.len());
+            for line in &drift {
+                println!("    ⚠ {line}");
+            }
+        }
+    }
+
     println!("\n  Thread census:");
     let census = crate::thread_census::snapshot();
     if census.is_empty() {

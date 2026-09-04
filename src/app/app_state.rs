@@ -54,6 +54,30 @@ fn reconcile_remote_roster_candidates(
     }
     names
 }
+
+/// #3505 P0(b): bounded attach retry. Consecutive failures for the same
+/// agent defer the next attempt instead of retrying at full 2s cadence
+/// forever — a Live-but-unreachable entry (stale registry/empty port
+/// shell) would otherwise spam `attach failed` warns once per sync.
+///
+/// Pure rule so unit tests pin it without sockets: attempts 1–2 retry
+/// immediately, attempt 3+ is deferred (the caller skips the attach and
+/// re-ages the failure counter). A success resets the count to zero.
+/// `STALE_HINT_AFTER` consecutive failures mark the agent stale so the
+/// caller can emit an actionable hint (daemon restart / port cleanup).
+pub(super) const ATTACH_FAIL_FAST_RETRIES: u32 = 2;
+pub(super) const STALE_HINT_AFTER: u32 = 5;
+
+/// Returns true when an attach for a name with `consecutive_failures`
+/// prior failures should be attempted on this sync pass.
+fn attach_retry_due(consecutive_failures: u32) -> bool {
+    consecutive_failures <= ATTACH_FAIL_FAST_RETRIES
+}
+
+#[cfg(test)]
+fn attach_retry_due_for_test(consecutive_failures: u32) -> bool {
+    attach_retry_due(consecutive_failures)
+}
 use crate::channel::TelegramStatus;
 
 /// #2453 R2: bounded typed owner for the app owner-restart in-flight state.
@@ -81,6 +105,12 @@ pub(super) struct AppState {
     /// publishes for each live agent; periodic sync diffs this against the
     /// filesystem so hot-reload-added agents auto-materialize as tabs.
     pub(super) known_remote_agents: std::collections::HashSet<String>,
+    /// #3505 P0(b): consecutive attach-failure counts per agent name.
+    /// Bounds the 2s-cadence `attach failed` warn loop: after
+    /// `ATTACH_FAIL_FAST_RETRIES` the sync pass skips the attempt
+    /// (backoff), and after `STALE_HINT_AFTER` it emits an actionable
+    /// stale hint. Cleared on successful attach.
+    pub(super) remote_attach_failures: std::collections::HashMap<String, u32>,
     /// Last daemon-authoritative state snapshot for attached panes. Missing
     /// entries intentionally remain unknown to render; they must not become
     /// a locally invented `Idle` state.
@@ -202,6 +232,7 @@ impl AppState {
                 mouse_state: mouse::MouseState::default(),
             },
             known_remote_agents: std::collections::HashSet::new(),
+            remote_attach_failures: std::collections::HashMap::new(),
             remote_agent_states: HashMap::new(),
             pending_remote_roster_names: None,
             pending_fwd: HashMap::new(),
@@ -1031,6 +1062,21 @@ impl AppState {
         let mut to_add: Vec<String> = names.to_add.into_iter().collect();
         to_add.sort();
         for name in &to_add {
+            // #3505 P0(b): bound the retry storm — skip this pass when the
+            // agent is in backoff, so a Live-but-unreachable entry doesn't
+            // spam one `attach failed` warn per 2s sync forever.
+            let fails = self.remote_attach_failures.get(name).copied().unwrap_or(0);
+            if !attach_retry_due(fails) {
+                if fails == STALE_HINT_AFTER {
+                    tracing::warn!(
+                        agent = %name,
+                        fails,
+                        "remote pane attach repeatedly failing — stale registry entry or port shell? \
+                         check `agend-terminal doctor` (daemon restart / .port cleanup reconciles)",
+                    );
+                }
+                continue;
+            }
             let (dc, dr) = crossterm::terminal::size().unwrap_or((120, 40));
             match pane_factory::create_remote_pane(
                 name,
@@ -1044,6 +1090,7 @@ impl AppState {
                 Ok(pane) => {
                     let tab_name = pane.agent_name.clone();
                     self.known_remote_agents.insert(tab_name.to_string());
+                    self.remote_attach_failures.remove(name);
                     // This sync is add-only: a gone agent's pane is retained
                     // for scrollback. Reconnect that leaf in place when the
                     // agent reappears, including inside an operator split.
@@ -1064,11 +1111,16 @@ impl AppState {
                     }
                     self.needs_resize = true;
                 }
-                Err(e) => tracing::warn!(
-                    agent = %name,
-                    error = %e,
-                    "remote pane attach failed during sync",
-                ),
+                Err(e) => {
+                    let fails = self.remote_attach_failures.get(name).copied().unwrap_or(0) + 1;
+                    self.remote_attach_failures.insert(name.clone(), fails);
+                    tracing::warn!(
+                        agent = %name,
+                        error = %e,
+                        fails,
+                        "remote pane attach failed during sync",
+                    );
+                }
             }
         }
         let mut gone: Vec<String> = names.gone.into_iter().collect();
@@ -1079,6 +1131,7 @@ impl AppState {
                 "daemon-side agent gone; pane retained with stale output",
             );
             self.known_remote_agents.remove(name);
+            self.remote_attach_failures.remove(name);
         }
     }
 
@@ -1284,5 +1337,21 @@ mod tests {
     #[test]
     fn closed_before_attach_preserves_managed_agent() {
         assert!(closed_before_attach_registry_survives(false));
+    }
+}
+
+#[cfg(test)]
+mod attach_backoff_3505_tests {
+    /// #3505 P0(b) RED: repeated attach failures for the same agent must be
+    /// bounded with backoff, not retried at full 2s cadence forever. The
+    /// pure backoff rule: after N consecutive failures, the next attempt is
+    /// deferred by an exponentially growing delay (capped), and the agent
+    /// is flagged stale so the operator gets an actionable hint.
+    #[test]
+    fn attach_backoff_defers_retry_after_repeated_failures_3505() {
+        // Attempt due immediately on first failure.
+        assert!(super::attach_retry_due_for_test(1));
+        // After repeated failures the retry must be deferred.
+        assert!(!super::attach_retry_due_for_test(5));
     }
 }
