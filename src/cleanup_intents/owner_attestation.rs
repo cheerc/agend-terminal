@@ -128,6 +128,100 @@ pub(super) fn retire_merged_lane(home: &Path, repo: &str, branch: &str) {
     );
 }
 
+/// #3517 follow-up: re-raise the owner's obligation for a lane the merge closed
+/// and the branch then walked away from.
+///
+/// [`retire_merged_lane`] runs BEFORE the head-drift CAS in `settle_intent`, on
+/// purpose — refusing to retire on drift is what produced #3503's noise, where a
+/// post-merge CI commit held the row open forever. The cost is a window: a lane
+/// that merges and THEN gains a commit ends up with its row closed while branch
+/// and intent survive, and the "a later release at a new head raises a fresh
+/// row" self-healing only fires if a release happens again. If nobody ever opens
+/// a worktree on that branch, nothing ever asks.
+///
+/// So the sweep re-evaluates the RESIDUE instead of re-observing the merge:
+/// drift, on a lane whose last obligation the SYSTEM closed, is a question
+/// nobody has been asked. Keyed at the observed tip, which is what makes
+/// repetition free — [`crate::worktree_pool::record_retention_obligation`]
+/// already refuses an exact (repo, branch, head) duplicate and refuses any raise
+/// while a lane row is open, so a standing drift costs one row, not one per tick.
+///
+/// "The system closed it" is read as terminal with no `result`:
+/// `DoneSource::AutoCloseOnPrMerge` is deliberately not projected into `result`
+/// while an owner's answer is (task_events.rs `apply_done`), and `TaskRecord`
+/// carries no done-source of its own. A human `done` with an empty result would
+/// look the same — the honest limit of the proxy, and it errs toward asking.
+pub(super) fn reraise_drifted_merged_lane(home: &Path, intent: &CleanupIntent) {
+    let repo_path = Path::new(&intent.repo);
+    if !repo_path.is_dir() {
+        return;
+    }
+    let branch = intent.branch.as_str();
+    // Same typed 0/1/other existence contract the rest of this module uses: only
+    // a confirmed-present branch can have drifted, and anything unreadable is
+    // preserved rather than guessed at.
+    let full_ref = format!("refs/heads/{branch}");
+    match crate::git_helpers::git_bypass(repo_path, &["show-ref", "--verify", "--quiet", &full_ref])
+    {
+        Ok(out) if out.status.code() == Some(0) => {}
+        _ => return,
+    }
+    let tip = match crate::git_helpers::git_cmd(repo_path, &["rev-parse", branch]) {
+        Ok(tip) if !tip.trim().is_empty() => tip.trim().to_string(),
+        _ => return,
+    };
+    if tip == intent.expected_head {
+        return;
+    }
+
+    let project = retention_project(home, &intent.repo);
+    let lane_tag = crate::worktree_pool::retention_lane_key(&intent.repo, branch);
+    let mut lane_rows: Vec<_> = retention_obligations(home, &project)
+        .into_iter()
+        .filter(|task| task.tags.contains(&lane_tag))
+        .collect();
+    // A lane that never carried an obligation is one the release path decided
+    // did not need an owner; the sweep does not get to overrule that.
+    if lane_rows.is_empty() {
+        return;
+    }
+    // Someone is already holding this lane — asking twice is the duplicate this
+    // whole fix must not create.
+    if lane_rows.iter().any(|task| !task.status.is_terminal()) {
+        return;
+    }
+    // Generation order, and it is fixed when a row is created. `updated_at`
+    // answers "most recently written to" instead, which any touch on a closed
+    // row is enough to change
+    // (`a_touch_on_a_closed_row_does_not_make_it_the_lanes_latest_3517`).
+    lane_rows.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    // Only the LAST obligation speaks for the lane. Searching backward for any
+    // result-less row walks past a newer owner answer into an older
+    // system-closed one and re-asks a question that has been answered
+    // (`a_later_owner_answer_outranks_an_older_system_retirement_3517`).
+    let Some(last) = lane_rows.last().filter(|task| task.result.is_none()) else {
+        return;
+    };
+
+    tracing::info!(
+        repo = %intent.repo, %branch, merged_head = %intent.expected_head, drifted_head = %tip,
+        "branch-retention: merge-retired lane moved on — raising a fresh obligation"
+    );
+    crate::worktree_pool::record_retention_obligation(
+        home,
+        &intent.repo,
+        branch,
+        &tip,
+        &intent.task_id,
+        // Not the owner of ANY row — the owner of the LAST one, which is
+        // `None` for an orphan lane. Passing that through lets the one
+        // liveness projection in `record_retention_obligation` decide again,
+        // exactly as the release path does: escheat to the origin's creator if
+        // they are live, orphan-tag if nobody is.
+        last.owner.as_ref().map(|owner| owner.0.as_str()),
+    );
+}
+
 pub(super) fn retention_obligations(
     home: &Path,
     project: &str,
