@@ -1833,6 +1833,21 @@ fn ensure_event_worker(home: &Path, instance: &str, locator: &SessionLocator) {
     );
 }
 
+/// #3515 follow-up: set an events worker's stop flag WITHOUT waiting for it.
+///
+/// A worker only observes its flag when the SSE read it is blocked in returns,
+/// which `SSE_READ_TIMEOUT` bounds at 20s. [`stop_instance_state`] both signals
+/// and joins, so walking a fleet one instance at a time paid that window N
+/// times: each wait began only after the previous one ended. Signalling every
+/// worker first lets the windows overlap, so a fleet-wide stop costs about one
+/// of them. Nothing is skipped — the worker stays in the map and its own
+/// `stop_instance_state` still removes and joins it.
+pub(crate) fn signal_instance_stop(home: &Path, instance: &str) {
+    if let Some(worker) = event_workers().lock().get(&worker_key(home, instance)) {
+        worker.stop.store(true, Ordering::Release);
+    }
+}
+
 pub(crate) fn stop_instance_state(home: &Path, instance: &str) {
     let key = worker_key(home, instance);
     if let Some(mut worker) = event_workers().lock().remove(&key) {

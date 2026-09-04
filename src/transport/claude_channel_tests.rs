@@ -2164,5 +2164,94 @@ fn event_worker_switches_to_a_restarted_bridge_locator() {
     let _ = fs::remove_dir_all(home);
 }
 
+/// #3515 follow-up (RED): shutdown must not pay the stop-observation latency
+/// once PER INSTANCE.
+///
+/// `stop_instance_state` sets an events worker's stop flag and then joins it,
+/// but the worker only observes that flag when its current SSE read returns —
+/// bounded by `SSE_READ_TIMEOUT` (20s). `cleanup_managed_transports` walks the
+/// instances one at a time, so before the fix each instance's wait started only
+/// after the previous one finished: N stuck workers cost N × 20s. #3515 is what
+/// put that loop on the `agend-terminal stop` path.
+///
+/// The stand-in worker's wind-down starts when it OBSERVES its flag, not when it
+/// is spawned. That is what makes the gate deterministic: pre-fix, flag i is set
+/// only once the join for i-1 returned, so the cost is exactly N × WIND_DOWN;
+/// post-fix every flag is already set, so the wind-downs overlap and the cost is
+/// about one. Review r1 rejected an earlier version whose workers ran a free
+/// clock from spawn — scheduler phase then decided how many windows were
+/// actually paid, and the measured RED ranged 1.616s–2.423s against a 1.600s
+/// threshold: a near-boundary gate, the exact thing this is supposed to prevent.
+///
+/// With the wind-down anchored to the flag there is no phase to get lucky with:
+/// the threshold sits at half the sequential cost, ~4× from either side.
+#[test]
+fn shutdown_signals_every_event_worker_before_joining_3515() {
+    use std::time::{Duration, Instant};
+
+    const WORKERS: usize = 8;
+    /// What one worker costs the caller once its flag is set — the stand-in for
+    /// everything between noticing the stop and the thread actually exiting.
+    const WIND_DOWN: Duration = Duration::from_millis(400);
+    /// The flag is observed promptly; only the wind-down is meant to be paid.
+    const FLAG_POLL: Duration = Duration::from_millis(1);
+
+    let home = home("shutdown-batch-stop");
+    let instances: Vec<String> = (0..WORKERS).map(|i| format!("claude-agent-{i}")).collect();
+
+    for instance in &instances {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        // Stands in for the real worker's exit cost: the wind-down begins when
+        // the flag is OBSERVED, so what the caller pays is decided by when the
+        // flag was set, never by where a free-running sleep happened to be.
+        let join = std::thread::Builder::new()
+            .name(format!("test-sse-{instance}"))
+            .spawn(move || {
+                while !thread_stop.load(Ordering::Acquire) {
+                    std::thread::sleep(FLAG_POLL);
+                }
+                std::thread::sleep(WIND_DOWN);
+            })
+            .expect("spawn stand-in worker");
+        event_workers().lock().insert(
+            worker_key(&home, instance),
+            EventWorker {
+                stop,
+                join: Some(join),
+                locator: SessionLocator::claude(
+                    "http://127.0.0.1:43123".to_string(),
+                    format!("session-{instance}"),
+                    "test-token".to_string(),
+                ),
+            },
+        );
+    }
+
+    let started = Instant::now();
+    crate::daemon::shutdown_cleanup::cleanup_managed_transports(&home, &instances);
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < WIND_DOWN * (WORKERS as u32) / 2,
+        "shutdown paid each worker's wind-down in series: {elapsed:?} for {WORKERS} \
+         workers at {WIND_DOWN:?} each — the stop flags must all be set before any \
+         worker is joined so the wind-downs overlap (#3515 follow-up)"
+    );
+
+    // Speed must not cost completeness: every worker is stopped and gone.
+    for instance in &instances {
+        assert!(
+            event_workers()
+                .lock()
+                .get(&worker_key(&home, instance))
+                .is_none(),
+            "cleanup must still remove every event worker ({instance})"
+        );
+    }
+
+    let _ = fs::remove_dir_all(home);
+}
+
 #[path = "claude_channel/tests/self_kick_tests.rs"]
 mod self_kick_tests;
