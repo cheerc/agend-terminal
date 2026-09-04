@@ -3166,6 +3166,385 @@ fn fleet_read_failure_denies_mutation_fail_closed_2117_p3a() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3511: assignment crosses boards; settlement did not. A row created on board
+/// A and assigned to an agent whose project is board B was closable by NOBODY —
+/// the assignee cleared the ownership ACL but was stopped by board isolation,
+/// while everyone on board A cleared board isolation but was stopped by the
+/// ownership ACL. Each gate is right on its own; their intersection is a
+/// deadlock that only the operator could break. A row that NAMES you is your
+/// own tail to collect, wherever it lives.
+#[test]
+fn owner_settles_own_cross_board_row_3511() {
+    let home = tmp_home("3511-owner-settles");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        r#"
+instances:
+  devA:
+    backend: claude
+  devB:
+    backend: claude
+teams:
+  teamA:
+    members:
+      - devA
+    source_repo: /repos/orgA/projA
+  teamB:
+    members:
+      - devB
+    source_repo: /repos/orgB/projB
+"#,
+    )
+    .unwrap();
+
+    // devA (projA) creates the row on ITS OWN board and assigns it across — the
+    // shape every cross-board dispatch has.
+    let t = handle(
+        &home,
+        "devA",
+        &serde_json::json!({
+            "action": "create", "title": "cross-board dispatch", "assignee": "devB"
+        }),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        super::list_all_at(&home, &crate::task_events::board_root(&home, "orgA_projA"))
+            .into_iter()
+            .any(|x| x.id == t),
+        "precondition: the row must live on the CREATOR's board (projA), not the owner's"
+    );
+
+    // The other half of the deadlock, asserted so it stays closed: the creator
+    // is ON the row's board but is NOT its owner, so the ownership ACL refuses.
+    // #3511 does not touch that gate.
+    let creator_denied = handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "update", "id": &t, "status": "cancelled"}),
+    );
+    assert!(
+        creator_denied["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not authorized"),
+        "creator is not the owner — ownership ACL must still refuse: {creator_denied}"
+    );
+
+    // RED before the fix: the owner acts on board B, so board isolation denied
+    // it and the row could never reach a terminal status.
+    let settled = handle(
+        &home,
+        "devB",
+        &serde_json::json!({"action": "update", "id": &t, "status": "cancelled"}),
+    );
+    assert!(
+        settled.get("error").is_none(),
+        "the row's own assignee must be able to settle it across boards: {settled}"
+    );
+    assert_eq!(
+        super::list_all_at(&home, &crate::task_events::board_root(&home, "orgA_projA"))
+            .into_iter()
+            .find(|x| x.id == t)
+            .unwrap()
+            .status,
+        crate::task_events::TaskStatus::Cancelled,
+        "settlement must actually land on the row's own board"
+    );
+
+    // The same must hold for `done`, the other settlement verb. A second row,
+    // because a task can only be settled once.
+    let t2 = handle(
+        &home,
+        "devA",
+        &serde_json::json!({
+            "action": "create", "title": "second cross-board dispatch", "assignee": "devB"
+        }),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let done = handle(
+        &home,
+        "devB",
+        &serde_json::json!({"action": "done", "id": &t2, "result": "settled by its owner"}),
+    );
+    assert!(
+        done.get("error").is_none(),
+        "the row's own assignee must be able to `done` it across boards: {done}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3511 negative control — the exception is EXACTLY "the caller is this row's
+/// own assignee", not a relaxation of board isolation. A cross-board third party
+/// who is neither owner nor creator must still be refused on every mutation
+/// path, and an UNASSIGNED row must stay unreachable from another board (no
+/// owner ⇒ no exception ⇒ the boundary is the only authority). Without this,
+/// #3511 trades a deadlock for a hole.
+#[test]
+fn cross_board_third_party_still_denied_3511() {
+    let home = tmp_home("3511-third-party-denied");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        r#"
+instances:
+  devA:
+    backend: claude
+  devB:
+    backend: claude
+  devC:
+    backend: claude
+teams:
+  teamA:
+    members:
+      - devA
+    source_repo: /repos/orgA/projA
+  teamB:
+    members:
+      - devB
+    source_repo: /repos/orgB/projB
+  teamC:
+    members:
+      - devC
+    source_repo: /repos/orgC/projC
+"#,
+    )
+    .unwrap();
+
+    // A row on board A that names devA — someone else's work, from B and C's
+    // point of view.
+    let owned_by_a = handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "create", "title": "A's own work", "assignee": "devA"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // A row on board A that names nobody.
+    let unassigned = handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "create", "title": "nobody's work"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for caller in ["devB", "devC"] {
+        for action in ["done", "update", "claim"] {
+            for id in [&owned_by_a, &unassigned] {
+                let denied = handle(
+                    &home,
+                    caller,
+                    &serde_json::json!({"action": action, "id": id, "status": "blocked"}),
+                );
+                assert!(
+                    denied["error"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("cross-board mutation denied"),
+                    "{caller} is neither owner nor creator of {id} — {action} must stay \
+                     denied cross-board (#3511 must not widen board isolation): {denied}"
+                );
+            }
+        }
+    }
+
+    // Nothing moved: both rows are still Open on board A.
+    let board_a = super::list_all_at(&home, &crate::task_events::board_root(&home, "orgA_projA"));
+    for id in [&owned_by_a, &unassigned] {
+        assert_eq!(
+            board_a.iter().find(|x| &x.id == id).unwrap().status,
+            crate::task_events::TaskStatus::Open,
+            "a denied cross-board mutation must not change the row ({id})"
+        );
+    }
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3511 — the exception is SETTLEMENT-only, not general write authority.
+///
+/// This mirrors the review probe that rejected the first version of the fix: a
+/// cross-board owner sent `update` with nothing but `priority=urgent` and it
+/// went through, changing the authoritative record on a board the caller does
+/// not act on. `update` is the general mutation verb — priority, assignee,
+/// description, tags and result all ride the same call — so handing it the owner
+/// unconditionally turned "close your own tail" into a write channel into
+/// another board. `assignee` is the sharper case: it hands the work away.
+///
+/// A pure `status=cancelled` must still pass, and a cancellation carrying ANY
+/// other field must not — otherwise a real mutation rides along with a genuine
+/// settlement.
+#[test]
+fn cross_board_owner_cannot_make_general_updates_3511() {
+    let home = tmp_home("3511-settlement-only");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        r#"
+instances:
+  devA:
+    backend: claude
+  devB:
+    backend: claude
+  devC:
+    backend: claude
+teams:
+  teamA:
+    members:
+      - devA
+    source_repo: /repos/orgA/projA
+  teamB:
+    members:
+      - devB
+    source_repo: /repos/orgB/projB
+  teamC:
+    members:
+      - devC
+    source_repo: /repos/orgC/projC
+"#,
+    )
+    .unwrap();
+
+    let make_row = |title: &str| {
+        handle(
+            &home,
+            "devA",
+            &serde_json::json!({"action": "create", "title": title, "assignee": "devB"}),
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let row = make_row("owned across the boundary");
+
+    // Every one of these is a general mutation, not a settlement. devB owns the
+    // row, so the ownership ACL would accept it — board isolation is the only
+    // thing standing between a cross-board owner and someone else's board.
+    let general_updates = [
+        serde_json::json!({"action": "update", "id": &row, "priority": "urgent"}),
+        serde_json::json!({"action": "update", "id": &row, "assignee": "devC"}),
+        serde_json::json!({"action": "update", "id": &row, "description": "rewritten"}),
+        serde_json::json!({"action": "update", "id": &row, "tags": ["hijacked"]}),
+        serde_json::json!({"action": "update", "id": &row, "result": "not settled"}),
+        serde_json::json!({"action": "update", "id": &row, "status": "in_progress"}),
+        // A real mutation smuggled alongside a genuine cancellation.
+        serde_json::json!({
+            "action": "update", "id": &row, "status": "cancelled", "priority": "urgent"
+        }),
+    ];
+    for args in &general_updates {
+        let denied = handle(&home, "devB", args);
+        assert!(
+            denied["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("cross-board mutation denied"),
+            "a cross-board owner must not make general updates on another board's row \
+             ({args}): {denied}"
+        );
+    }
+
+    // Nothing leaked through: the authoritative record on board A is untouched.
+    let after = super::list_all_at(&home, &crate::task_events::board_root(&home, "orgA_projA"))
+        .into_iter()
+        .find(|x| x.id == row)
+        .unwrap();
+    assert_eq!(
+        after.priority,
+        crate::task_events::TaskPriority::Normal,
+        "the review probe's exact case: priority must not have changed"
+    );
+    assert_eq!(
+        after.assignee.as_deref(),
+        Some("devB"),
+        "the row must not have been handed to a third party"
+    );
+    assert_eq!(
+        after.status,
+        crate::task_events::TaskStatus::Open,
+        "no denied update may move the row"
+    );
+
+    // The settlement the exception exists for still works, alone.
+    let settled = handle(
+        &home,
+        "devB",
+        &serde_json::json!({"action": "update", "id": &row, "status": "cancelled"}),
+    );
+    assert!(
+        settled.get("error").is_none(),
+        "a pure cancellation by the row's own assignee must still pass: {settled}"
+    );
+
+    // …and so does `done`, which is terminal by construction.
+    let row2 = make_row("second row");
+    let done = handle(
+        &home,
+        "devB",
+        &serde_json::json!({"action": "done", "id": &row2, "result": "settled by its owner"}),
+    );
+    assert!(
+        done.get("error").is_none(),
+        "`done` by the row's own assignee must still pass: {done}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3511 fail-closed pin. `can_mutate_on_board` returns `false` for two very
+/// different states: a resolved cross-board mismatch, and a HARD fleet.yaml read
+/// failure where the caller's authority is simply unknown (#2133's deliberate
+/// fail-CLOSED hardening). The owner exception may override the first and must
+/// never override the second. The caller here is the row's OWN assignee — the
+/// exact identity the exception serves — so this is the sharpest place it could
+/// leak. `fleet_read_failure_denies_mutation_fail_closed_2117_p3a` also covers
+/// this incidentally; this one says so by name, so nobody unpins it by editing
+/// that test for #2133 reasons.
+#[test]
+fn owner_exception_does_not_bypass_fail_closed_3511() {
+    let home = tmp_home("3511-fail-closed-pin");
+    write_fleet_yaml(&home, &["dev"]);
+    let t = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action": "create", "title": "t", "assignee": "dev"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // File PRESENT but unparseable → `try_load_fleet` = Err, not the missing-file
+    // Ok(default) path, so the caller's project cannot be resolved at all.
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "{{{ not: : valid yaml ][",
+    )
+    .unwrap();
+
+    for action in ["done", "update"] {
+        let denied = handle(
+            &home,
+            "dev",
+            &serde_json::json!({"action": action, "id": &t, "status": "cancelled"}),
+        );
+        assert!(
+            denied["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("cross-board mutation denied"),
+            "the #3511 owner exception must not fire while the fleet is unreadable \
+             ({action}): {denied}"
+        );
+    }
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn test_claim_unknown_instance_rejected() {
     let home = tmp_home("claim-unknown");

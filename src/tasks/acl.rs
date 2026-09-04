@@ -1,3 +1,4 @@
+use serde_json::Value;
 use std::path::Path;
 
 use super::Task;
@@ -169,6 +170,120 @@ pub(crate) fn can_mutate_on_board(home: &Path, caller: &str, board_project: &str
         Ok(project) => project == board_project,
         Err(_) => false,
     }
+}
+
+/// #3511 — can the caller's OWN project be resolved at all?
+///
+/// The owner exception in `handler::cross_board_denied` must never fire while
+/// the fleet is unreadable. [`can_mutate_on_board`] collapses two different
+/// states into `false`: "resolved, and it is a different board" (a real
+/// cross-board mismatch, which the exception is allowed to override) and
+/// "could not resolve — hard fleet.yaml read failure" (#2117 P3a / #2133's
+/// fail-CLOSED state, where nothing about the caller's authority is known).
+/// Letting an exception through the second one would smuggle a mutation past a
+/// deliberate hardening, so it is gated on a clean resolve. Exactly mirrors
+/// `can_mutate_on_board`'s resolver so the two can never disagree about what
+/// "unresolvable" means.
+pub(super) fn caller_project_resolvable(home: &Path, caller: &str) -> bool {
+    super::board_router::resolve_current_project_checked(home, caller).is_ok()
+}
+
+/// #2117 P3a (FM5 / board isolation): per-board mutation authority. A task
+/// mutation resolves its board from the task_id, so a caller can name a task that
+/// lives on ANOTHER project's board. Deny unless the caller acts in that board's
+/// project — [`can_mutate_on_board`] (system identities bypass; a hard
+/// fleet read failure fail-closes). Single-project → caller project == task board project (both DEFAULT)
+/// → allow → byte-identical (no new denial). Returns `Some(error)` when denied.
+// #2760: `board_project` is the caller's ALREADY-resolved authoritative board
+// (from `super::load_routed`), so the mutation routes ONCE and this gate never
+// re-resolves (nor silently defaults). `None` = allowed.
+//
+// #3511: `owner` is the row's assignee when the call site has already resolved
+// the record AND the requested operation is settlement; it carries the ONE
+// exception below. `None` means "this call grants no owner exception" — either
+// the action has none at all, or (see [`update_settlement_owner`]) this
+// particular request is not a pure cancellation.
+/// #3511 — which `update` requests may use the board exception at all.
+///
+/// `update` is the GENERAL mutation verb: `priority`, `assignee`, `description`,
+/// `tags` and `result` all ride the same call as `status`. Handing
+/// [`cross_board_denied`] the owner unconditionally therefore turned "close your
+/// own tail" into general write authority over a row on someone else's board —
+/// caught in review by a behavioural probe that changed a foreign board's row to
+/// `priority=urgent` and nothing else. `assignee` is the sharper version of the
+/// same hole: it hands the work to a third party.
+///
+/// So the exception is OPERATION-aware, not just identity-aware. It is offered
+/// only for a pure terminal cancellation, expressed as an ALLOW-list of the keys
+/// such a request may carry. An allow-list is the point: a future mutable field
+/// added to `update` is board-isolated by default and only becomes exception-
+/// eligible when someone deliberately adds it here. Any extra key — even
+/// alongside a genuine `status=cancelled` — puts the whole call back behind
+/// board isolation, so nothing can ride along with a settlement.
+///
+/// `done` needs no equivalent: it is terminal by construction.
+pub(super) fn update_settlement_owner<'a>(
+    record: &'a crate::task_events::TaskRecord,
+    args: &Value,
+) -> Option<&'a str> {
+    /// Routing / identity keys only — none of them mutate the row.
+    const PURE_CANCELLATION_KEYS: &[&str] = &["action", "id", "task_id", "status", "project"];
+    if args["status"].as_str() != Some("cancelled") {
+        return None;
+    }
+    let only_settlement_keys = args.as_object().is_some_and(|obj| {
+        obj.keys()
+            .all(|k| PURE_CANCELLATION_KEYS.contains(&k.as_str()))
+    });
+    if !only_settlement_keys {
+        return None;
+    }
+    record.owner.as_ref().map(|o| o.0.as_str())
+}
+
+pub(super) fn cross_board_denied(
+    home: &Path,
+    caller: &str,
+    id: &str,
+    board_project: &str,
+    owner: Option<&str>,
+) -> Option<Value> {
+    if can_mutate_on_board(home, caller, board_project) {
+        return None;
+    }
+    // #3511 — the one exception to board isolation: a row's OWN assignee may
+    // settle it from another project's board. Assignment already crosses boards
+    // but settlement did not, so a row created on board A and assigned to an
+    // agent acting on board B was closable by nobody: the assignee cleared
+    // `can_mutate_record` and was stopped here, while everyone on board A
+    // cleared this gate and was stopped by `can_mutate_record`. Acting on a row
+    // that NAMES you is not reaching into another board's work; it is collecting
+    // your own tail.
+    //
+    // Deliberately EXACT-owner and nothing else — not the creator (granting a
+    // non-owner mutation rights changes the OWNERSHIP model, a strictly larger
+    // grant than this one), not the orchestrator-of-owner (transitive: it would
+    // reach every board where a member happens to be assigned), and not an
+    // unassigned row (no owner ⇒ no exception, so work can never be PULLED
+    // across a boundary). The ownership ACL still runs immediately after this
+    // gate at every call site that passes an owner.
+    //
+    // Gated on a clean project resolve: `can_mutate_on_board` returns `false`
+    // both for a genuine cross-board mismatch AND for a hard fleet.yaml read
+    // failure (#2133's fail-CLOSED state). The exception may override the
+    // first — the row names the caller, which the task log proves without the
+    // fleet — but never the second, where nothing about the caller's authority
+    // is knowable. `fleet_read_failure_denies_mutation_fail_closed_2117_p3a`
+    // is the pin: its caller IS the row's owner, so it fails without this.
+    if owner == Some(caller) && caller_project_resolvable(home, caller) {
+        return None;
+    }
+    Some(serde_json::json!({
+        "error": format!(
+            "cross-board mutation denied: task '{id}' lives on the '{board_project}' project \
+             board but caller '{caller}' acts in a different project (board isolation, #2117 P3a)"
+        )
+    }))
 }
 
 #[cfg(test)]
