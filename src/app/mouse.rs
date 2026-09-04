@@ -1473,4 +1473,113 @@ mod tests {
             "a pure click must not leave a zero-width selection"
         );
     }
+
+    /// #3500: REMOTE pane (blank VTerm, offthread None) must see wants_mouse
+    /// true after processing the first TAG_DATA dump that now carries TermMode,
+    /// for both offthread ON and OFF. This pins the dump fix for the
+    /// AGEND_OFFTHREAD_PARSE=0 (thin-client) and =1 paths.
+    #[test]
+    fn remote_pane_wants_mouse_after_dump_offthread_off() {
+        // Simulate daemon's VTerm that has already seen opencode's
+        // startup: 1000h + 1006h (wants_mouse + SGR).
+        let mut daemon_vt = VTerm::new(80, 24);
+        daemon_vt.process(b"\x1b[?1000h\x1b[?1006h");
+        assert!(daemon_vt.wants_mouse() && daemon_vt.mouse_sgr());
+        let dump = daemon_vt.dump_screen();
+        // Simulate TUI's REMOTE pane: blank VTerm, offthread None (thin-client default).
+        let mut remote_pane = leaf(1, "opencode-remote");
+        assert!(
+            !remote_pane.wants_mouse(),
+            "remote blank VTerm must start without mouse"
+        );
+        // First TAG_DATA (dump) arrives before any mouse event.
+        remote_pane.vterm.process(&dump);
+        assert!(
+            remote_pane.wants_mouse() && remote_pane.mouse_sgr(),
+            "remote pane after dump must have wants_mouse+mouse_sgr true (offthread OFF)"
+        );
+        // Also verify the SGR forwarding gate would route.
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("single".to_string(), remote_pane));
+        layout.active = 0;
+        layout.tabs[0].focus_id = 1;
+        layout.tabs[0].pane_rects.insert(1, (0, 0, 80, 24));
+        let mouse = scroll_up_at(10, 5);
+        assert!(
+            super::pane_for_mouse_forward(&layout, &mouse).is_some(),
+            "remote pane after dump must route wheel for SGR forwarding"
+        );
+    }
+
+    #[test]
+    fn remote_pane_wants_mouse_after_dump_offthread_on() {
+        // Same as above but via the offthread snapshot path.
+        let mut daemon_vt = VTerm::new(80, 24);
+        daemon_vt.process(b"\x1b[?1000h\x1b[?1006h");
+        let dump = daemon_vt.dump_screen();
+        // Build an offthread parser that will process the dump and publish a snapshot.
+        let (data_tx, data_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (wake_tx, wake_rx) = crossbeam_channel::unbounded::<usize>();
+        let parser_vt = VTerm::new(80, 24);
+        let handle = crate::render::offthread::spawn_offthread_parser(
+            2,
+            "opencode-remote-offthread".to_string(),
+            data_rx,
+            parser_vt,
+            wake_tx,
+        )
+        .expect("parser spawns");
+        // Send the dump as the first chunk (exactly how tui_bridge's first TAG_DATA arrives).
+        data_tx.send(dump).expect("send dump");
+        wake_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("offthread must publish snapshot after dump");
+        let mut remote_pane = leaf(2, "opencode-remote-offthread");
+        remote_pane.offthread = Some(handle);
+        // Main VTerm is idle, but snapshot must have the mode.
+        assert!(
+            !remote_pane.vterm.wants_mouse(),
+            "offthread main VTerm is idle"
+        );
+        assert!(
+            remote_pane.wants_mouse() && remote_pane.mouse_sgr(),
+            "remote pane via snapshot must have wants_mouse+mouse_sgr true (offthread ON)"
+        );
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("single".to_string(), remote_pane));
+        layout.active = 0;
+        layout.tabs[0].focus_id = 2;
+        layout.tabs[0].pane_rects.insert(2, (0, 0, 80, 24));
+        let mouse = scroll_up_at(10, 5);
+        assert!(
+            super::pane_for_mouse_forward(&layout, &mouse).is_some(),
+            "offthread remote pane must route wheel"
+        );
+    }
+
+    /// #3500: alt-screen (1049h) must also be carried by the dump so a REMOTE
+    /// attach to an alt-screen opencode does not get a local scroll that should be SGR-forwarded.
+    #[test]
+    fn remote_pane_alt_screen_after_dump_has_no_local_scroll() {
+        let mut daemon_vt = VTerm::new(80, 24);
+        daemon_vt.process(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+        let dump = daemon_vt.dump_screen();
+        let mut remote_pane = leaf(3, "opencode-alt");
+        remote_pane.vterm.process(&dump);
+        assert!(
+            remote_pane.wants_mouse() && remote_pane.mouse_sgr(),
+            "alt-screen remote must still have mouse"
+        );
+        // In alt-screen, max_scroll is 0, so local scroll path is disabled.
+        assert_eq!(
+            remote_pane.vterm.max_scroll(),
+            0,
+            "alt-screen must have max_scroll 0"
+        );
+        assert_eq!(
+            remote_pane.scroll_max(),
+            0,
+            "alt-screen remote pane scroll_max must be 0 (no local scroll)"
+        );
+    }
 }
