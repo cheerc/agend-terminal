@@ -590,6 +590,8 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
     let now_secs = chrono::Utc::now().timestamp();
 
     let mut out: Vec<Value> = Vec::new();
+    // t-…-67: watches on the requested filter the caller cannot see (`status_scope`).
+    let mut hidden_watches: usize = 0;
     for entry in entries.flatten() {
         let path = entry.path();
         let watch: Value = match std::fs::read_to_string(&path)
@@ -619,6 +621,7 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
         // they're a subscriber of. Anonymous calls (empty instance)
         // see everything — useful for operator triage via the CLI.
         if !instance_name.is_empty() && !subscribers.iter().any(|s| s == instance_name) {
+            hidden_watches += 1;
             continue;
         }
         let rate_limit_until = watch["rate_limit_until"].as_i64();
@@ -718,7 +721,16 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
             })
         })
         .collect();
-    let mut resp = json!({"watches": out, "pending_handoffs": pending_handoffs});
+    // t-…-67: the view names its scope and what it hid — see `status_scope`.
+    let mut resp = json!({
+        "watches": out,
+        "pending_handoffs": pending_handoffs,
+        "scope": super::status_scope::scope_label(instance_name),
+        "hidden_watches": hidden_watches,
+    });
+    if hidden_watches > 0 {
+        resp["hint"] = json!(super::status_scope::hidden_hint(hidden_watches));
+    }
     if let Some(w) = crate::daemon::ci_watch::github_token_warning_from_env() {
         resp["setup_warning"] = json!(w);
     }
