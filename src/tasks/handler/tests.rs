@@ -3510,6 +3510,39 @@ fn s1_fixture(name: &str, mode: &str) -> (std::path::PathBuf, String, std::path:
                 &expected_head,
             )
             .expect("typed review lease");
+            // The lease names an assignment; until #F6 nothing checked that the
+            // assignment existed, so this fixture never planted one. It has to
+            // now, or the legitimate reviewer is refused for the same reason the
+            // dead-assignment case is — which would make the allow-test pass on
+            // a lie. `-dead-assignment` deliberately keeps the old shape: a
+            // well-formed id with no row behind it.
+            if mode != "review-branch-drift-dead-assignment" {
+                if let Ok(parsed) = uuid::Uuid::parse_str(&assignment_id) {
+                    let mut assignment =
+                        crate::daemon::assignment_authority::ActiveAssignment::new_pending_typed(
+                            "owner/repo",
+                            branch,
+                            "dev-agent",
+                            crate::types::InstanceId::new(),
+                            1,
+                            provisioned_head,
+                            crate::review_receipt::ReviewSlot::Primary,
+                            "test:operator",
+                            &id,
+                            crate::daemon::pr_state::ReviewClass::Single,
+                            crate::mcp::handlers::comms_gates::ReviewAuthor::External(
+                                "external-author".into(),
+                            ),
+                            "s1 fixture typed review assignment",
+                            None,
+                            None,
+                            "2026-09-05T00:00:00Z",
+                        );
+                    assignment.assignment_id = parsed;
+                    crate::daemon::assignment_authority::persist(&home, &assignment)
+                        .expect("plant the assignment the lease names");
+                }
+            }
             if mode == "review-branch-drift-bad-signature" {
                 std::fs::write(
                     crate::paths::runtime_dir(&home)
@@ -3801,6 +3834,221 @@ fn task_done_assignee_completion_controls_s1() {
     assert!(
         result.get("error").is_none(),
         "orchestrator bypass denied: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// F6 RED: the guard checks that `review_assignment_id` PARSES, never that the
+/// assignment it names is still live (src/tasks/mod.rs:122-125). A binding can
+/// therefore carry an id whose assignment row is gone — revoked, retired, or
+/// never persisted — and the typed disposable-review lease still settles the
+/// task.
+///
+/// Containment today is a neighbour, not this predicate: `revoke` and `retire`
+/// both call `cancel_review_assignment_task` first, so the task is already
+/// terminal by the time the id goes stale, and `transfer` — the one path that
+/// keeps the task alive — has no callers in src/. This test puts the predicate
+/// in exactly the state those neighbours happen to prevent: assignment absent,
+/// task live. It is deliberately NOT written by calling `revoke`, because that
+/// cancels the task and the settle would then fail for the neighbour's reason
+/// rather than the guard's.
+///
+/// The sibling path does revalidate rather than assume — pr_state/mod.rs:1740-1762
+/// re-checks under the assignment branch lock "so revoke/transfer cannot cross
+/// the final check→PR-state mutation boundary".
+#[test]
+fn task_done_refuses_a_disposable_review_lease_whose_assignment_is_not_live() {
+    let (home, id, _repo, _branch) =
+        s1_fixture("s1-dead-assignment", "review-branch-drift-dead-assignment");
+
+    let binding = crate::binding::read(&home, "dev-agent").expect("binding");
+    let assignment_id = binding["review_assignment_id"]
+        .as_str()
+        .expect("the typed lease carries an assignment id");
+    let parsed = uuid::Uuid::parse_str(assignment_id).expect("id parses — all the guard checks");
+    assert!(
+        crate::daemon::assignment_authority::lookup_by_assignment_id_strict(&home, parsed).is_err(),
+        "precondition: no assignment row answers to the id this lease carries"
+    );
+
+    let done = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action":"done","id":id}),
+    );
+
+    assert!(
+        done.get("error").is_some(),
+        "a lease naming an assignment that is not live must not settle the task: {done}"
+    );
+    assert_eq!(
+        read_task_record(&home, &id).expect("task").status,
+        crate::task_events::TaskStatus::Claimed,
+        "and the task must stay open"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Pins the reason `lease_assignment_still_authorizes` takes no assignment lock.
+///
+/// The sibling path holds the assignment branch lock across check→PR-state
+/// mutation. The completion path cannot: it runs underneath the task board, and
+/// the documented order is assignment-OUTER / pr_state-INNER, so acquiring the
+/// assignment lock here would invert it. That leaves a window — a revoke landing
+/// between the liveness lookup and the Done event — and this test shows what
+/// closes it: revoke CANCELS the review task before the row disappears, and a
+/// cancelled task cannot transition to Done. The containment is real, it just
+/// lives next door, and this pins it so the next reader does not have to take
+/// the comment's word for it.
+#[test]
+fn revoke_cancels_the_review_task_before_removing_the_row() {
+    let (home, id, _repo, branch) = s1_fixture("s1-revoke-cancels", "review-branch-drift");
+    let binding = crate::binding::read(&home, "dev-agent").expect("binding");
+    let parsed = uuid::Uuid::parse_str(
+        binding["review_assignment_id"]
+            .as_str()
+            .expect("assignment id"),
+    )
+    .expect("uuid");
+    assert!(
+        crate::daemon::assignment_authority::lookup_by_assignment_id_strict(&home, parsed).is_ok(),
+        "precondition: the assignment the lease names is live"
+    );
+
+    let revoked = crate::daemon::assignment_authority::revoke(
+        &home,
+        "owner/repo",
+        &branch,
+        "dev-agent",
+        "2026-09-05T01:00:00Z",
+    )
+    .expect("revoke");
+    assert!(revoked, "the live assignment must be revoked");
+
+    assert!(
+        crate::daemon::assignment_authority::lookup_by_assignment_id_strict(&home, parsed).is_err(),
+        "revoke removes the row, so the id keeps its shape but loses its authority"
+    );
+    let status = read_task_record(&home, &id).expect("task").status;
+    assert!(
+        status.is_terminal(),
+        "revoke cancels the review task before the row goes — that is what closes \
+         the unlocked window, not the guard: {status:?}"
+    );
+
+    let done = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action":"done","id":id}),
+    );
+    assert!(
+        done.get("error").is_some(),
+        "and a settle after revoke is refused: {done}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Where a non-assignee's authority to settle actually comes from.
+///
+/// `CompletionGate::NotApplicable(NotTheAssignee)` is not a permit — it says the
+/// guard had no opinion. The permission is granted upstream by
+/// `can_mutate_record`, which admits `is_orchestrator_of` and the owner's team
+/// orchestrator. This pins that the ACL is the decider, so anyone reading the
+/// guard and concluding "only the assignee can settle a branch-carrying task"
+/// is corrected by a test rather than by an incident.
+///
+/// This is deliberately NOT a proposal to change the permission. The fleet uses
+/// it: an orchestrator closes a review task for a reviewer who cannot settle its
+/// own. Whether it SHOULD survive is a separate question, deferred on the ticket.
+#[test]
+fn a_team_orchestrator_settles_a_non_owned_branch_task_by_the_acl_not_the_guard() {
+    let home = tmp_home("acl-decides-not-the-guard");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "teams:\n  dev:\n    members: [dev-lead, dev-impl-2]\n    \
+         orchestrator: dev-lead\n    created_at: \"2026-04-27T00:00:00Z\"\n",
+    )
+    .expect("write fleet.yaml");
+    let created = handle(
+        &home,
+        "dev-lead",
+        &serde_json::json!({
+            "action": "create",
+            "title": "branch-carrying work",
+            "assignee": "dev-impl-2",
+            "branch": "feat/owned-by-someone-else",
+        }),
+    );
+    let id = created["id"].as_str().expect("task id").to_string();
+    handle(
+        &home,
+        "dev-impl-2",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+
+    // dev-lead holds no binding for this task and is not its assignee. The guard
+    // returns NotApplicable(NotTheAssignee); the ACL is what lets this through.
+    let done = handle(
+        &home,
+        "dev-lead",
+        &serde_json::json!({"action": "done", "id": id, "result": "settled by the orchestrator"}),
+    );
+    assert!(
+        done.get("error").is_none(),
+        "the team orchestrator settles by the ACL, with no binding of its own: {done}"
+    );
+    assert_eq!(
+        read_task_record(&home, &id).expect("task").status,
+        crate::task_events::TaskStatus::Done
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The ownerless row, pinned as it behaves today rather than as it reads.
+///
+/// A branch-retention obligation is raised with `owner: None` whenever neither
+/// the branch opener nor the origin task's creator is live
+/// (`worktree_pool::branch_cleanup`, pinned by
+/// `retention_obligation_is_orphan_tagged_when_neither_owner_nor_orchestrator_live`).
+/// Any caller can complete such a row, and the reason is upstream of this guard:
+/// `can_mutate_record` returns `true` for `owner: None` before the guard is ever
+/// consulted (acl.rs), and the guard itself only reaches
+/// `NotApplicable(Branchless)` because retention rows are deliberately branchless.
+///
+/// This is current behaviour, deliberately unchanged here: tightening it means
+/// changing `can_mutate_record`'s membership, which is out of this ticket's
+/// scope and is deferred as its own permission question. The test exists so the
+/// next reader finds the fact stated instead of inferring containment.
+#[test]
+fn an_ownerless_row_is_completable_by_any_caller_because_the_acl_admits_everyone() {
+    let home = tmp_home("ownerless-row-any-caller");
+    let created = handle(
+        &home,
+        "system:branch-retention",
+        &serde_json::json!({
+            "action": "create",
+            "title": "branch-retention: confirm 'feat/orphaned' is still needed",
+        }),
+    );
+    let id = created["id"].as_str().expect("task id").to_string();
+    let record = read_task_record(&home, &id).expect("task");
+    assert!(
+        record.owner.is_none(),
+        "precondition: the row is ownerless, the shape branch_cleanup projects"
+    );
+    assert!(
+        record.branch.is_none(),
+        "precondition: retention rows are branchless by design"
+    );
+
+    let done = handle(
+        &home,
+        "an-unrelated-agent",
+        &serde_json::json!({"action": "done", "id": id, "result": "delete: not mine"}),
+    );
+    assert!(
+        done.get("error").is_none(),
+        "current behaviour: an unrelated caller completes an ownerless row: {done}"
     );
     std::fs::remove_dir_all(&home).ok();
 }

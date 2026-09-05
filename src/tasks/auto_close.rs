@@ -101,8 +101,23 @@ fn auto_close_on_report_with_mode(
         None
     } else {
         match super::assignee_completion_guard(home, correlation_id, reporter, record) {
-            Ok(receipt) => receipt,
-            Err(reason) => return Err(anyhow::anyhow!(reason)),
+            super::CompletionGate::Permit(receipt) => receipt,
+            super::CompletionGate::Deny(reason) => return Err(anyhow::anyhow!(reason)),
+            // This caller does NOT share handler.rs's reading, and the
+            // difference is deliberate rather than an oversight to resolve.
+            // `NotTheAssignee` is unreachable here: the assignee check at the
+            // top of this function returned before the guard was ever called,
+            // so no non-assignee reaches this line. `Branchless` is reachable
+            // and is a permit — a task with no branch has no binding to prove,
+            // and refusing it would break auto-close for every branchless task.
+            super::CompletionGate::NotApplicable(super::GateInapplicable::Branchless) => None,
+            super::CompletionGate::NotApplicable(super::GateInapplicable::NotTheAssignee) => {
+                debug_assert!(
+                    false,
+                    "auto_close refuses non-assignees before calling the guard"
+                );
+                return Ok(false);
+            }
         }
     };
     let summary = if report_text.chars().count() > 200 {
@@ -946,6 +961,45 @@ mod tests {
             task_result(&home, "t-f1-guard").as_deref(),
             Some("explicit operator result"),
             "F1 guard: ReportAutoClose must not overwrite an explicit result"
+        );
+    }
+
+    /// The half of `CompletionGate::NotApplicable` this caller never sees.
+    ///
+    /// `auto_close_on_report` refuses a non-assignee itself, before the guard is
+    /// ever called, so `NotTheAssignee` is unreachable from here — the
+    /// `debug_assert` in the match arm says so and this test is the evidence.
+    /// handler.rs makes the opposite choice and lets the ACL decide. Both
+    /// callers are consistent with themselves; they are not consistent with each
+    /// other, and that disagreement is the ambiguity the three-state type makes
+    /// visible rather than hides.
+    ///
+    /// The sibling arm, `Branchless`, IS reachable here and is a permit — pinned
+    /// by `assignee_terminal_report_auto_closes_claimed_task`, whose task is
+    /// seeded with `branch: None`.
+    #[test]
+    fn a_non_assignee_report_never_reaches_the_completion_guard() {
+        let home = tmp_home("non_assignee_never_reaches_guard");
+        seed_claimed_task(&home, "t-guard-unreachable", "dev-agent");
+
+        let closed = auto_close_on_report(
+            &home,
+            "report",
+            "t-guard-unreachable",
+            "someone-else",
+            "not my task to close",
+            true,
+        )
+        .expect("auto close must not error for a non-assignee");
+
+        assert!(
+            !closed,
+            "a non-assignee's terminal report must not auto-close"
+        );
+        assert_eq!(
+            task_status(&home, "t-guard-unreachable"),
+            Some(crate::task_events::TaskStatus::Claimed),
+            "the task stays claimed; the assignee check returned before the guard ran"
         );
     }
 }
