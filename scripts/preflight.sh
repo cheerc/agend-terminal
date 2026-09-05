@@ -10,11 +10,13 @@
 # Runs, in order — the fmt/clippy surface MATCHES CI's `check` job (task83/d-46):
 #   1. scripts/fmt-owned.sh --check   (owned *.rs, vendor/ excluded — CI's exact surface)
 #   2. cargo clippy <owned targets + agentic-git wrapper> --features tray -- -D warnings  (CI's exact targets)
-#   3. cargo test --tests --features tray   (unit + integration + invariants)
-#      NOTE: CI runs these via `nextest`, not `cargo test` — the test SELECTION
-#      matches but the runner differs, and a floating stable toolchain is not
-#      byte-exact over time. "Green here" is a strong pre-check, not a byte-exact
-#      guarantee of CI.
+#   3. cargo nextest run --features tray   (unit + integration + invariants)
+#      This is CI's runner AND selection (unit tests + every tests/*.rs target).
+#      Without cargo-nextest it falls back to `cargo test --tests --features tray`
+#      — same selection, but a binary's tests then share one process, so tests
+#      that touch process-global state can race (CI never runs that form). A
+#      floating stable toolchain is not byte-exact over time either. "Green here"
+#      is a strong pre-check, not a byte-exact guarantee of CI.
 #   4. Windows cross-check (x86_64-pc-windows-msvc)   <- the keystone
 #
 # Step 4 catches the class that hurts most: Windows-only code
@@ -74,6 +76,19 @@ fi
 # Run from repo root so cargo finds the manifest regardless of CWD.
 cd "$(dirname "$0")/.." || exit 2
 
+# Daemon-managed agent shells: tests that scope AGEND_HOME to a temp dir and
+# then spawn `git` reach the agentic-git shim on PATH. The shim derives its own
+# directory from AGENTIC_GIT_HOME (legacy fallback: AGEND_HOME) to exclude
+# itself from the PATH it hands the real git; under the scoped value it resolves
+# git to itself and trips its recursion guard (#1504) — ~40 deterministic
+# failures in instructions / usage_limit_takeover / agent_resolve that CI (no
+# shim on PATH) never sees. Pinning the PRIMARY name to the real home keeps the
+# shim fully in force (same agent identity, same policy) while the tests scope
+# only the crate's own home. No-op outside a daemon-managed shell.
+if [[ -z "${AGENTIC_GIT_HOME:-}" && -n "${AGEND_HOME:-}" ]]; then
+    export AGENTIC_GIT_HOME="$AGEND_HOME"
+fi
+
 passed=()
 failed=()
 skipped=()
@@ -102,8 +117,16 @@ step "fmt --check (owned surface)" \
     scripts/fmt-owned.sh --check
 step "clippy (owned targets --features tray -D warnings)" \
     cargo clippy --lib --bin agend-terminal --bin agend-git --bin agend-mcp-bridge --bin agentic-git --tests --examples --features tray -- -D warnings
-step "test (--tests --features tray: unit + integration + invariants)" \
-    cargo test --tests --features tray
+if cargo nextest --version >/dev/null 2>&1; then
+    step "test (nextest --features tray: unit + integration + invariants — CI's runner)" \
+        cargo nextest run --features tray
+else
+    echo "[$SCRIPT_NAME] cargo-nextest not installed — falling back to 'cargo test --tests'" >&2
+    echo "  (same selection; a binary's tests share one process, so parallel tests may race)" >&2
+    echo "  install CI's runner: cargo install cargo-nextest --locked" >&2
+    step "test (--tests --features tray: unit + integration + invariants — cargo-nextest fallback)" \
+        cargo test --tests --features tray
+fi
 
 # ── Step 4: Windows cross-check ──────────────────────────────────────────
 windows_check() {
