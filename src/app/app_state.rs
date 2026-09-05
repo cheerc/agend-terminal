@@ -61,12 +61,15 @@ fn reconcile_remote_roster_candidates(
 /// shell) would otherwise spam `attach failed` warns once per sync.
 ///
 /// Pure rule so unit tests pin it without sockets: attempts 1–2 retry
-/// immediately, attempt 3+ is deferred. A deferred pass RE-AGES the
-/// counter (r1 F1: a frozen counter would cap at 3 and strand the pane);
-/// at `STALE_HINT_AFTER` the caller emits the stale hint once, past it
-/// the counter resets into the retry window so attempts resume — defer +
-/// eventual hint + recovery, never abandon. A success (or gone) resets
-/// the count to zero.
+/// immediately, attempt 3+ is deferred on a FIXED skip cycle (no
+/// exponential delay exists — each deferred pass simply skips one 2s
+/// sync). A deferred pass RE-AGES the counter (r1 F1: a frozen counter
+/// would cap at 3 and strand the pane); at `STALE_HINT_AFTER` the caller
+/// emits the stale hint (periodically — once per hint cycle, not once
+/// ever), past it the counter resets into the retry window so attempts
+/// resume — defer + eventual hint + recovery, never abandon. A success
+/// (or gone) resets the count to zero. Counters are retained against the
+/// CURRENT roster (a re-appeared name keeps its history; gone clears it).
 pub(super) const ATTACH_FAIL_FAST_RETRIES: u32 = 2;
 pub(super) const STALE_HINT_AFTER: u32 = 5;
 
@@ -76,9 +79,31 @@ fn attach_retry_due(consecutive_failures: u32) -> bool {
     consecutive_failures <= ATTACH_FAIL_FAST_RETRIES
 }
 
+/// #3505 r2 B2: the deferred-pass transition, shared by the
+/// `reconcile_remote_roster` skip branch and its tests. Takes the stored
+/// failure count, returns `(next_counter, emit_hint)`. Re-ages the counter
+/// so the stale hint stays reachable; at `STALE_HINT_AFTER` the caller
+/// emits the hint once; past it the counter resets into the retry window
+/// so attempts resume — never abandon.
+fn advance_deferred(fails: u32) -> (u32, bool) {
+    let aged = fails + 1;
+    if aged == STALE_HINT_AFTER {
+        (aged, true)
+    } else if aged > STALE_HINT_AFTER {
+        (ATTACH_FAIL_FAST_RETRIES, false)
+    } else {
+        (aged, false)
+    }
+}
+
 #[cfg(test)]
 fn attach_retry_due_for_test(consecutive_failures: u32) -> bool {
     attach_retry_due(consecutive_failures)
+}
+
+#[cfg(test)]
+fn advance_deferred_for_test(fails: u32) -> (u32, bool) {
+    advance_deferred(fails)
 }
 use crate::channel::TelegramStatus;
 
@@ -1076,21 +1101,18 @@ impl AppState {
             // — defer + eventual hint + recovery, never abandon.
             let fails = self.remote_attach_failures.get(name).copied().unwrap_or(0);
             if !attach_retry_due(fails) {
-                let aged = fails + 1;
-                if aged == STALE_HINT_AFTER {
+                // r2 B2: the transition lives in `advance_deferred`, shared
+                // with the tests — the branch must not carry its own copy.
+                let (next, emit_hint) = advance_deferred(fails);
+                if emit_hint {
                     tracing::warn!(
                         agent = %name,
-                        fails = aged,
+                        fails = next,
                         "remote pane attach repeatedly failing — stale registry entry or port shell? \
                          check `agend-terminal doctor` (daemon restart / .port cleanup reconciles)",
                     );
-                    self.remote_attach_failures.insert(name.clone(), aged);
-                } else if aged > STALE_HINT_AFTER {
-                    self.remote_attach_failures
-                        .insert(name.clone(), ATTACH_FAIL_FAST_RETRIES);
-                } else {
-                    self.remote_attach_failures.insert(name.clone(), aged);
                 }
+                self.remote_attach_failures.insert(name.clone(), next);
                 continue;
             }
             let (dc, dr) = crossterm::terminal::size().unwrap_or((120, 40));
@@ -1361,8 +1383,8 @@ mod attach_backoff_3505_tests {
     /// #3505 P0(b) RED: repeated attach failures for the same agent must be
     /// bounded with backoff, not retried at full 2s cadence forever. The
     /// pure backoff rule: after N consecutive failures, the next attempt is
-    /// deferred by an exponentially growing delay (capped), and the agent
-    /// is flagged stale so the operator gets an actionable hint.
+    /// deferred on a fixed skip cycle, and the agent is flagged stale so
+    /// the operator gets an actionable hint.
     #[test]
     fn attach_backoff_defers_retry_after_repeated_failures_3505() {
         // Attempt due immediately on first failure.
@@ -1371,11 +1393,13 @@ mod attach_backoff_3505_tests {
         assert!(!super::attach_retry_due_for_test(5));
     }
 
-    /// #3505 r1 F1 RED: a deferred (skipped) pass must RE-AGE the failure
-    /// counter so the stale hint stays reachable and attempts eventually
-    /// resume — never abandon the pane. Simulates the skip branch N times
-    /// from a fresh counter and asserts: (1) the hint fires exactly at
-    /// `STALE_HINT_AFTER`, (2) a later pass attempts again (recovery).
+    /// #3505 r2 B2: the deferred-pass transition is pinned through the
+    /// SHARED `advance_deferred` (the same fn the skip branch calls) — an
+    /// inline copy in either place would let them drift. Author mutations
+    /// (drop the re-age; drop the reset) must go red here.
+    /// Drives 12 consecutive failing passes from a fresh counter and
+    /// asserts: (1) the hint fires exactly at `STALE_HINT_AFTER`,
+    /// (2) a later pass attempts again (recovery, never abandon).
     #[test]
     fn attach_backoff_reages_on_skip_hint_fires_attempts_resume_3505() {
         let mut fails = 0u32;
@@ -1390,25 +1414,72 @@ mod attach_backoff_3505_tests {
                 }
                 fails += 1;
             } else {
-                // Skip branch: must re-age (F1 fix) + fire hint at threshold.
-                fails += 1;
-                if fails == super::STALE_HINT_AFTER && hint_at.is_none() {
-                    hint_at = Some(fails);
+                // Skip branch MUST go through the shared transition.
+                let (next, emit_hint) = super::advance_deferred_for_test(fails);
+                if emit_hint && hint_at.is_none() {
+                    hint_at = Some(next);
                 }
-                if fails > super::STALE_HINT_AFTER {
-                    // Recovery: reset into the retry window, never abandon.
-                    fails = super::ATTACH_FAIL_FAST_RETRIES;
-                }
+                fails = next;
             }
         }
         assert_eq!(
             hint_at,
             Some(super::STALE_HINT_AFTER),
-            "the stale hint must fire (F1: skip must re-age the counter)"
+            "the stale hint must fire (skip must re-age the counter)"
         );
         assert!(
             resumed,
-            "attempts must resume after the hint cycle (F1: never abandon)"
+            "attempts must resume after the hint cycle (never abandon)"
+        );
+    }
+
+    /// #3505 r2 B2: `advance_deferred` step table — re-age below the
+    /// threshold, hint exactly at it, reset past it.
+    #[test]
+    fn advance_deferred_step_table_3505() {
+        // Below threshold: re-age, no hint.
+        assert_eq!(super::advance_deferred_for_test(3), (4, false));
+        assert_eq!(super::advance_deferred_for_test(4), (5, true));
+        // Exactly at threshold input (5): aged to 6 > threshold → reset.
+        assert_eq!(
+            super::advance_deferred_for_test(5),
+            (super::ATTACH_FAIL_FAST_RETRIES, false)
+        );
+    }
+
+    /// #3505 r2 B2: `attach_retry_due` boundary — pins `<=` vs `<`.
+    /// 0,1,2 attempt; 3 defers.
+    #[test]
+    fn attach_retry_due_boundary_3505() {
+        assert!(super::attach_retry_due_for_test(0));
+        assert!(super::attach_retry_due_for_test(1));
+        assert!(super::attach_retry_due_for_test(2));
+        assert!(!super::attach_retry_due_for_test(3));
+    }
+
+    /// #3505 r2 B2 structural: the `reconcile_remote_roster` skip branch
+    /// must route through the SHARED `advance_deferred` — an inline copy
+    /// of the transition in the branch would let the two drift (the exact
+    /// failure the author flagged: tests pinning a copy, not production).
+    /// Reintroducing inline arithmetic here must go red.
+    #[test]
+    fn skip_branch_routes_through_shared_advance_deferred_3505() {
+        let src = include_str!("app_state.rs");
+        let reconcile_at = src
+            .find("fn reconcile_remote_roster(")
+            .expect("reconcile_remote_roster must exist");
+        let region = &src[reconcile_at..];
+        let end = region
+            .find("fn reconcile_pending_remote_roster(")
+            .expect("region end must exist");
+        let body = &region[..end];
+        assert!(
+            body.contains("advance_deferred(fails)"),
+            "skip branch must call the shared advance_deferred(fails)"
+        );
+        assert!(
+            !body.contains("fails + 1"),
+            "skip branch must not carry inline counter arithmetic"
         );
     }
 }

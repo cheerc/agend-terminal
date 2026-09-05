@@ -715,4 +715,17 @@ mod drift_detect_3505_tests {
             "port-only names must surface: {drift:?}"
         );
     }
+
+    /// #3505 r2 B1 false-positive guard: a name present in BOTH sources is
+    /// consistent and must yield empty drift — no line, no hint.
+    #[test]
+    fn detect_registry_port_drift_empty_when_sources_agree_3505() {
+        let live: HashSet<String> = HashSet::from(["alive-a".to_string(), "alive-b".to_string()]);
+        let ports = vec!["alive-a".to_string(), "alive-b".to_string()];
+        let drift = super::detect_registry_port_drift(&live, &ports);
+        assert!(
+            drift.is_empty(),
+            "agreeing sources must yield empty drift: {drift:?}"
+        );
+    }
 }
