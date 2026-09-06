@@ -381,6 +381,8 @@ pub struct BackendPreset {
     pub redraw_after_resize: bool,
 }
 
+/// #3541: effort-capability types re-exported from their anti-monolith home.
+pub use crate::backend_effort::{EffortCapability, EffortInjectionKind};
 /// #2744: model-capability types re-exported from their anti-monolith home.
 pub use crate::backend_model::{ModelCapability, ModelFlagHit};
 
@@ -861,6 +863,77 @@ impl Backend {
         let at = args.iter().position(|a| a == "--").unwrap_or(args.len());
         args.insert(at, cap.long_flag.to_string());
         args.insert(at + 1, model_val);
+    }
+
+    /// #3541: the DECLARED backend's effort grammar — table and types live
+    /// in [`crate::backend_effort`] (same anti-monolith split as #2744).
+    /// Never key off a command string.
+    pub fn effort_capability(&self) -> Option<&'static EffortCapability> {
+        crate::backend_effort::capability_for(self)
+    }
+
+    /// #3541: apply the fleet-resolved effort intent to a spawn argv,
+    /// gated on the DECLARED backend's [`EffortCapability`].
+    ///
+    /// Double Fallback Drop (fail-soft, never crashes the CLI):
+    /// - No capability (KiroCli/OpenCode/Grok/Shell/Raw) → warn + skip:
+    ///   there is no proven effort syntax to inject.
+    /// - Value outside this backend's `allowed_values` (e.g. a fleet-wide
+    ///   `defaults.effort: max` reaching Codex, or a hand-written typo) →
+    ///   warn + skip: injecting an unproven value risks a CLI error.
+    /// - Hand-written effort setting already in args wins (caller args >
+    ///   fleet intent, #2038 precedence): skip with a warning, never inject
+    ///   a duplicate.
+    /// - The pair is inserted BEFORE the first bare `--` — everything after
+    ///   the delimiter is payload, not flag territory. Empty effort is a
+    ///   no-op.
+    pub fn push_effort_arg(args: &mut Vec<String>, backend: &Backend, effort: &str) {
+        if effort.is_empty() {
+            return;
+        }
+        let Some(cap) = backend.effort_capability() else {
+            tracing::warn!(
+                backend = %backend.name(),
+                effort = %effort,
+                "effort intent configured for a backend with no declared effort \
+                 capability — fallback dropping effort argument (#3541)"
+            );
+            return;
+        };
+        if !cap.allowed_values.contains(&effort) {
+            tracing::warn!(
+                backend = %backend.name(),
+                effort = %effort,
+                allowed = ?cap.allowed_values,
+                "effort value outside this backend's allowed values — fallback \
+                 dropping effort argument (#3541)"
+            );
+            return;
+        }
+        if let Some(hit) = crate::backend_effort::scan_effort_conflict(backend, args) {
+            tracing::warn!(
+                backend = %backend.name(),
+                token = %hit,
+                effort = %effort,
+                "explicit effort setting already present in args — skipping \
+                 fleet effort injection (#3541)"
+            );
+            return;
+        }
+        let at = args.iter().position(|a| a == "--").unwrap_or(args.len());
+        match cap.injection {
+            EffortInjectionKind::CliFlag => {
+                args.insert(at, crate::backend_effort::EFFORT_LONG_FLAG.to_string());
+                args.insert(at + 1, effort.to_string());
+            }
+            EffortInjectionKind::CodexConfig => {
+                args.insert(at, "-c".to_string());
+                args.insert(
+                    at + 1,
+                    format!("{}=\"{}\"", crate::backend_effort::CODEX_EFFORT_KEY, effort),
+                );
+            }
+        }
     }
 
     /// Display name matching the CLI command. For [`Backend::Raw`] returns the
@@ -2167,6 +2240,95 @@ mod tests {
         let mut args = vec!["--continue".to_string()];
         Backend::push_model_arg(&mut args, &Backend::ClaudeCode, "");
         assert_eq!(args, vec!["--continue"]);
+    }
+
+    /// #3541: `push_effort_arg` injects the right pair per backend and
+    /// inserts BEFORE the first bare `--` (payload territory).
+    #[test]
+    fn push_effort_arg_injects_per_backend_before_delimiter_3541() {
+        // Claude: --effort <val>.
+        let mut args = vec!["--continue".to_string()];
+        Backend::push_effort_arg(&mut args, &Backend::ClaudeCode, "high");
+        assert_eq!(args, vec!["--continue", "--effort", "high"]);
+
+        // Agy: same CliFlag shape.
+        let mut args = Vec::new();
+        Backend::push_effort_arg(&mut args, &Backend::Agy, "low");
+        assert_eq!(args, vec!["--effort", "low"]);
+
+        // Codex: -c model_reasoning_effort="<val>".
+        let mut args: Vec<String> = Vec::new();
+        Backend::push_effort_arg(&mut args, &Backend::Codex, "medium");
+        assert_eq!(args, vec!["-c", "model_reasoning_effort=\"medium\""]);
+
+        // Insert position: before `--`, payload untouched.
+        let mut args = vec![
+            "--continue".to_string(),
+            "--".to_string(),
+            "--effort".to_string(),
+        ];
+        Backend::push_effort_arg(&mut args, &Backend::ClaudeCode, "low");
+        assert_eq!(
+            args,
+            vec!["--continue", "--effort", "low", "--", "--effort"]
+        );
+
+        // Empty effort is a no-op.
+        let mut args = vec!["--continue".to_string()];
+        Backend::push_effort_arg(&mut args, &Backend::ClaudeCode, "");
+        assert_eq!(args, vec!["--continue"]);
+    }
+
+    /// #3541: double Fallback Drop — unsupported backends AND out-of-range
+    /// values (fleet-wide defaults reaching a narrower backend, or typos)
+    /// leave argv untouched instead of crashing the CLI.
+    #[test]
+    fn push_effort_arg_fallback_drops_unsupported_and_invalid_3541() {
+        // Unsupported backends: drop, argv unchanged.
+        for backend in [
+            Backend::KiroCli,
+            Backend::OpenCode,
+            Backend::Grok,
+            Backend::Shell,
+            Backend::Raw("/opt/custom/agent-bin".into()),
+        ] {
+            let mut args: Vec<String> = Vec::new();
+            Backend::push_effort_arg(&mut args, &backend, "high");
+            assert!(
+                args.is_empty(),
+                "backend {backend:?} must not receive effort, got {args:?}"
+            );
+        }
+
+        // Fleet-wide `defaults.effort: max` reaching Codex/Agy: drop.
+        for backend in [Backend::Codex, Backend::Agy] {
+            let mut args: Vec<String> = Vec::new();
+            Backend::push_effort_arg(&mut args, &backend, "max");
+            assert!(
+                args.is_empty(),
+                "backend {backend:?} must drop out-of-range 'max', got {args:?}"
+            );
+        }
+
+        // Hand-written typo: drop.
+        let mut args = vec!["--continue".to_string()];
+        Backend::push_effort_arg(&mut args, &Backend::ClaudeCode, "ultra");
+        assert_eq!(args, vec!["--continue"]);
+    }
+
+    /// #3541: hand-written effort in args wins — no duplicate injection.
+    #[test]
+    fn push_effort_arg_skips_on_hand_written_conflict_3541() {
+        let mut args = vec!["--effort".to_string(), "low".to_string()];
+        Backend::push_effort_arg(&mut args, &Backend::ClaudeCode, "high");
+        assert_eq!(args, vec!["--effort", "low"]);
+
+        let mut args = vec![
+            "-c".to_string(),
+            "model_reasoning_effort=\"low\"".to_string(),
+        ];
+        Backend::push_effort_arg(&mut args, &Backend::Codex, "high");
+        assert_eq!(args, vec!["-c", "model_reasoning_effort=\"low\""]);
     }
 
     /// #2744 PR-A: Shell/Raw (any command without a declared model

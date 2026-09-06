@@ -18,6 +18,7 @@ mod api_activity_probe;
 mod app;
 mod auth_cookie;
 mod backend;
+mod backend_effort;
 mod backend_harness;
 mod backend_model;
 mod backend_profile;
