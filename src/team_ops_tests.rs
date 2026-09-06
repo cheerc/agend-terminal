@@ -18,7 +18,7 @@ fn write_fleet(dir: &std::path::Path, yaml: &str) {
 #[test]
 fn team_member_inherits_defaults_effort_3541() {
     let dir = std::env::temp_dir().join(format!(
-        "agend-team-effort-{}-{}",
+        "agend-team-effort-keep-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

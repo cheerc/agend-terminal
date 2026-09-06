@@ -2507,7 +2507,7 @@ instances:
 #[test]
 fn resolve_effort_precedence_and_empty_normalization_3541() {
     let dir = std::env::temp_dir().join(format!(
-        "agend-fleet-effort-{}-{}",
+        "agend-fleet-effort-main-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
