@@ -1548,3 +1548,109 @@ fn spawn_fails_closed_when_worktree_creation_fails_no_launch_no_persist() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// #3538: a `mode=resume` restart on a managed Codex instance with no thread
+/// must fail closed BEFORE any destructive step — `resume_unavailable`,
+/// `spawned:false`, live instance untouched.
+///
+/// PR #3544 R1 (B1): "untouched" is pinned by the ESCALATION store, not by
+/// fleet.yaml. The runtime DELETE needs a daemon this harness has no way to
+/// reach, so the fleet entry survives whatever the gate does — that assertion
+/// cannot fail and cannot detect a misplaced gate. `clear_failed_escalated`
+/// (`mod.rs`, right after the gate) is the FIRST step on the restart path that
+/// mutates state a unit test can observe, and only when the store already
+/// exists (`escalation_persist::clear_failed_escalated` returns early with no
+/// store). Seeding one is what makes this test go red if the gate is ever
+/// moved below it.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn resume_restart_without_codex_thread_fails_closed_3538() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-3538-gate-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  cx:\n    backend: codex\n",
+    )
+    .unwrap();
+    // Seed the first observable mutation's target: the gate must return before
+    // `clear_failed_escalated` flips this latch back to false.
+    crate::daemon::escalation_persist::persist(
+        &home,
+        "cx",
+        &crate::health::PersistedEscalation {
+            total_crashes: 0,
+            crash_times_epoch_ms: vec![],
+            last_crash_notification_epoch_ms: None,
+            last_hung_notification_epoch_ms: None,
+            hung_since_epoch_ms: None,
+            failed_escalated: true,
+        },
+    );
+    // No locator file under home → thread-less → gate must fire.
+    let r = handle_restart_instance(
+        &home,
+        &serde_json::json!({"instance": "cx", "mode": "resume", "reason": "probe"}),
+    );
+    assert_eq!(r["code"], "resume_unavailable", "got: {r}");
+    assert_eq!(r["spawned"], false, "got: {r}");
+    let fleet_text =
+        std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).unwrap_or_default();
+    assert!(
+        fleet_text.contains("cx:"),
+        "the refused restart must not have rewritten fleet.yaml: {fleet_text}"
+    );
+    let escalation = crate::daemon::escalation_persist::load_for(&home, "cx")
+        .expect("the seeded escalation record must survive a refused restart");
+    assert!(
+        escalation.failed_escalated,
+        "a REFUSED resume restart must not have cleared escalation state"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3538: `set_model` with `restart:true` on a thread-less Codex instance
+/// persists the intent but reports the resume failure explicitly —
+/// `persisted:true, restart_ok:false` (existing split contract), never a
+/// silent `restart_ok:true` fresh session.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn set_model_restart_without_codex_thread_reports_split_outcome_3538() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-3538-setmodel-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  cx:\n    backend: codex\n",
+    )
+    .unwrap();
+    let r = super::set_model::handle_set_model(
+        &home,
+        &serde_json::json!({"instance": "cx", "model": "o3", "restart": true}),
+        &None,
+    );
+    assert_eq!(r["persisted"], true, "intent must persist: {r}");
+    assert_eq!(
+        r["restart_ok"], false,
+        "resume-unavailable restart must not claim success: {r}"
+    );
+    assert!(
+        r["restart_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("resume")),
+        "error must name the resume failure: {r}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

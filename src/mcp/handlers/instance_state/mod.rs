@@ -547,6 +547,15 @@ pub(super) fn handle_restart_instance_with_runtime(
         }
     };
 
+    // #3538: resume-availability gate — must stay HERE: after `resolve_instance`
+    // (it needs the DECLARED backend) and before EVERY destructive or mutating
+    // step below. Body lives in `restart_prep` (same 750-LOC split as #3414).
+    let codex_thread =
+        match restart_prep::resume_availability_gate(home, name, reason, mode, &resolved.backend) {
+            restart_prep::ResumeGate::Proceed { codex_thread } => codex_thread,
+            restart_prep::ResumeGate::Refused { response } => return response,
+        };
+
     // #1744-PR-B (latch-scope): operator-initiated recovery resets the terminal
     // self-orch once-off latch, so a fresh terminal death after this restart re-pages.
     // Keep this AFTER typed session preflight: a refused fresh restart must not
@@ -650,7 +659,12 @@ pub(super) fn handle_restart_instance_with_runtime(
         .unwrap_or(false);
 
     tracing::info!(%name, %reason, %mode, %spawned, "restart_instance");
-    json!({"name": name, "reason": reason, "mode": mode, "spawned": spawned})
+    let mut resp = json!({"name": name, "reason": reason, "mode": mode, "spawned": spawned});
+    // #3538: exact-thread resume signal (boolean only — never leaks the id).
+    if codex_thread {
+        resp["resumed_thread"] = json!(true);
+    }
+    resp
 }
 
 /// #t-777-3: daemon-autonomic self-heal entry — the respawn-stuck watchdog's
