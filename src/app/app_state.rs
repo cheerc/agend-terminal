@@ -1220,11 +1220,19 @@ impl AppState {
                         }
                         self.needs_resize = true;
                     }
-                    Err(e) => tracing::warn!(
-                        agent = %name,
-                        error = %e,
-                        "remote pane attach failed during sync",
-                    ),
+                    // #3505 backoff accounting mirrors the standalone arm below:
+                    // without the increment a failing team member never enters
+                    // backoff and the stale hint never fires for it.
+                    Err(e) => {
+                        let fails = self.remote_attach_failures.get(name).copied().unwrap_or(0) + 1;
+                        self.remote_attach_failures.insert(name.clone(), fails);
+                        tracing::warn!(
+                            agent = %name,
+                            error = %e,
+                            fails,
+                            "remote pane attach failed during sync",
+                        );
+                    }
                 }
             }
         }
@@ -1577,6 +1585,73 @@ mod tests {
             .find(|tab| tab.name == "solo")
             .expect("standalone tab named solo");
         assert_eq!(solo_tab.root().agent_names(), vec!["solo"]);
+
+        // F1 (#3505 backoff for team members): a failing team member must
+        // increment the same failure counter as the standalone arm — without
+        // it the member never enters backoff and the stale hint never fires.
+        // svc-b already has a pane; the builder fails first so the Err arm
+        // runs before any retained-pane check.
+        let mut failing_builder = |name: &str, layout: &mut Layout| -> anyhow::Result<Pane> {
+            if name == "svc-b" {
+                Err(anyhow::anyhow!("boom"))
+            } else {
+                test_remote_pane(layout, name)
+            }
+        };
+        state.place_remote_team_grouped(&["svc-b".to_string()], &home, &mut failing_builder);
+        assert_eq!(
+            state.remote_attach_failures.get("svc-b"),
+            Some(&1),
+            "one failed team tick must record fails=1"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// N1 (tab-name collision, pinned): a team whose name collides with an
+    /// existing tab does NOT open a second same-named tab — members split
+    /// into the existing one. Recorded here so a future grouping change
+    /// must consciously alter this behavior, not drift into it.
+    #[test]
+    fn hot_reload_team_name_collision_reuses_existing_tab() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-test-hot-reload-collide-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  m1:\n    backend: shell\n  solo:\n    backend: shell\n",
+        )
+        .expect("write fleet.yaml");
+        let res = crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "solo", "members": ["m1"], "orchestrator": "m1"}),
+        );
+        assert_eq!(
+            res["status"],
+            serde_json::Value::String("created".to_string()),
+            "create team failed: {res}"
+        );
+
+        let mut state = AppState::new();
+        let mut pane_builder = |name: &str, layout: &mut Layout| test_remote_pane(layout, name);
+        // Standalone first: opens a tab named "solo".
+        state.place_remote_team_grouped(&["solo".to_string()], &home, &mut pane_builder);
+        assert_eq!(state.ui.layout.tabs.len(), 1);
+        // Team "solo" member arrives: must reuse, not duplicate.
+        state.place_remote_team_grouped(&["m1".to_string()], &home, &mut pane_builder);
+        assert_eq!(
+            state.ui.layout.tabs.len(),
+            1,
+            "colliding team name must not open a second tab"
+        );
+        let tab = &state.ui.layout.tabs[0];
+        assert_eq!(tab.name, "solo");
+        assert_eq!(tab.root().pane_count(), 2);
         std::fs::remove_dir_all(&home).ok();
     }
 }
