@@ -1548,3 +1548,79 @@ fn spawn_fails_closed_when_worktree_creation_fails_no_launch_no_persist() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// #3538: a `mode=resume` restart on a managed Codex instance with no thread
+/// must fail closed BEFORE any destructive step — `resume_unavailable`,
+/// `spawned:false`, live instance untouched (still in fleet.yaml).
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn resume_restart_without_codex_thread_fails_closed_3538() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-3538-gate-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  cx:\n    backend: codex\n",
+    )
+    .unwrap();
+    // No locator file under home → thread-less → gate must fire.
+    let r = handle_restart_instance(
+        &home,
+        &serde_json::json!({"instance": "cx", "mode": "resume", "reason": "probe"}),
+    );
+    assert_eq!(r["code"], "resume_unavailable", "got: {r}");
+    assert_eq!(r["spawned"], false, "got: {r}");
+    let fleet_text =
+        std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).unwrap_or_default();
+    assert!(
+        fleet_text.contains("cx:"),
+        "gate fires before DELETE — the live entry must survive: {fleet_text}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3538: `set_model` with `restart:true` on a thread-less Codex instance
+/// persists the intent but reports the resume failure explicitly —
+/// `persisted:true, restart_ok:false` (existing split contract), never a
+/// silent `restart_ok:true` fresh session.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn set_model_restart_without_codex_thread_reports_split_outcome_3538() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-3538-setmodel-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  cx:\n    backend: codex\n",
+    )
+    .unwrap();
+    let r = super::set_model::handle_set_model(
+        &home,
+        &serde_json::json!({"instance": "cx", "model": "o3", "restart": true}),
+        &None,
+    );
+    assert_eq!(r["persisted"], true, "intent must persist: {r}");
+    assert_eq!(
+        r["restart_ok"], false,
+        "resume-unavailable restart must not claim success: {r}"
+    );
+    assert!(
+        r["restart_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("resume")),
+        "error must name the resume failure: {r}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

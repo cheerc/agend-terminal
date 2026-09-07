@@ -359,6 +359,24 @@ pub(crate) fn codex_thread_for_spawn(
     }
 }
 
+/// #3538: can a `mode=resume` restart of this instance actually resume its
+/// managed Codex conversation? True iff the NativeShared locator loads AND
+/// carries a non-empty `thread_id`. Every other shape (missing file,
+/// unreadable locator, empty id) is `false` — fail-closed: an unknown resume
+/// state must never be reported as a successful resume, and the gate caller
+/// (restart path) refuses to DELETE before checking this.
+pub(crate) fn codex_resume_available(home: &Path, instance: &str) -> bool {
+    locator_for_instance(
+        home,
+        instance,
+        Some(&Backend::Codex),
+        TransportMode::NativeShared,
+    )
+    .ok()
+    .and_then(|locator| codex_thread_for_spawn(&locator, crate::backend::SpawnMode::Resume))
+    .is_some()
+}
+
 pub(crate) fn opencode_attach_args(locator: &SessionLocator) -> anyhow::Result<Vec<String>> {
     OpenCodeNativeShared::attach_args(locator)
 }
@@ -1120,5 +1138,41 @@ mod session_contract_3414_tests {
             vec!["--model".to_string(), "gpt".to_string()],
             "layer 2: a caller `resume` pin must not survive a fresh restart"
         );
+    }
+
+    /// #3538: resume availability is exactly thread-presence. Missing file,
+    /// empty id, and present id are three distinct inputs with two outcomes
+    /// (fail-closed: only a non-empty thread resumes).
+    #[test]
+    fn codex_resume_available_tracks_thread_presence_3538() {
+        let home = scratch_home("resume-avail");
+        // No locator file at all → unavailable.
+        assert!(
+            !codex_resume_available(&home, "ghost"),
+            "missing locator must not resume"
+        );
+        // Locator without a thread → unavailable.
+        let mut locator = default_codex_locator(&home, "bare");
+        locator.thread_id = None;
+        save_session_locator(&home, "bare", &locator).expect("save bare locator");
+        assert!(
+            !codex_resume_available(&home, "bare"),
+            "thread-less locator must not resume"
+        );
+        // Empty-string thread → unavailable.
+        locator.thread_id = Some(String::new());
+        save_session_locator(&home, "empty", &locator).expect("save empty locator");
+        assert!(
+            !codex_resume_available(&home, "empty"),
+            "empty thread_id must not resume"
+        );
+        // Non-empty thread → available.
+        locator.thread_id = Some("thread-1".to_string());
+        save_session_locator(&home, "live", &locator).expect("save live locator");
+        assert!(
+            codex_resume_available(&home, "live"),
+            "thread-carrying locator must resume"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }

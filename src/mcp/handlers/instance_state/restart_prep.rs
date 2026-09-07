@@ -44,6 +44,66 @@ pub(super) fn restart_spawn_params(
     spawn_params
 }
 
+/// #3538: resume-availability gate outcome for a `mode=resume` restart.
+/// `Refused` carries the already-rendered fail-closed response; `Proceed`
+/// carries whether an exact Codex thread was confirmed (for the
+/// `resumed_thread` success signal — boolean only, never the id).
+pub(super) enum ResumeGate {
+    Proceed { codex_thread: bool },
+    Refused { response: Value },
+}
+
+/// #3538: refuse a `mode=resume` restart that cannot resume, BEFORE any
+/// destructive or mutating step (caller must invoke this right after
+/// `resolve_instance`, before escalation-clear/draft-wait/DELETE). A resume
+/// restart on a managed Codex instance whose locator has no thread_id would
+/// silently start a FRESH session while reporting `spawned:true` — fail
+/// closed with the live instance untouched. Instance-scoped only: no global
+/// `resume --last` fallback (#3396/#3398).
+pub(super) fn resume_availability_gate(
+    home: &Path,
+    name: &str,
+    reason: &str,
+    mode: &str,
+    backend: &crate::backend::Backend,
+) -> ResumeGate {
+    if mode != "resume" || *backend != crate::backend::Backend::Codex {
+        return ResumeGate::Proceed {
+            codex_thread: false,
+        };
+    }
+    if crate::transport::codex_resume_available(home, name) {
+        return ResumeGate::Proceed { codex_thread: true };
+    }
+    tracing::warn!(
+        agent = %name,
+        "refusing resume restart: managed Codex locator has no thread_id — \
+         resume is unavailable (a spawn now would silently start a fresh session)"
+    );
+    crate::event_log::log(
+        home,
+        "restart_instance",
+        name,
+        "resume_unavailable backend=codex thread_id=missing",
+    );
+    ResumeGate::Refused {
+        response: json!({
+            "name": name,
+            "reason": reason,
+            "mode": mode,
+            "spawned": false,
+            "code": "resume_unavailable",
+            "error": format!(
+                "refusing resume restart for '{name}': no exact Codex thread is \
+                 available for this instance (managed locator has no thread_id), \
+                 so resume would silently start a fresh session. The running \
+                 instance was left untouched — restart with mode=fresh for an \
+                 explicit fresh session."
+            ),
+        }),
+    }
+}
+
 /// Grace ceiling for [`await_unsent_draft_or_grace`]: even while the operator
 /// keeps typing, force the restart after this long so a context-full / stuck
 /// agent can't be deferred indefinitely. The primary release is the operator
