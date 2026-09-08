@@ -1580,6 +1580,14 @@ mod tests {
         endpoint: &Path,
         loaded_threads: Vec<String>,
     ) -> thread::JoinHandle<()> {
+        run_fake_codex_with_loaded_threads_and_reads(endpoint, loaded_threads, Vec::new())
+    }
+
+    fn run_fake_codex_with_loaded_threads_and_reads(
+        endpoint: &Path,
+        loaded_threads: Vec<String>,
+        thread_reads: Vec<(String, bool, String)>,
+    ) -> thread::JoinHandle<()> {
         let listener = UnixListener::bind(endpoint).expect("bind fake Codex socket");
         // fire-and-forget: the fake app-server owns the socket until the client drains events.
         thread::spawn(move || {
@@ -1652,6 +1660,30 @@ mod tests {
                         write_server_frame(
                             &mut stream,
                             json!({"id": id, "result": {"data": data}}),
+                        );
+                    }
+                    "thread/read" => {
+                        let thread_id = request
+                            .pointer("/params/threadId")
+                            .and_then(Value::as_str)
+                            .expect("thread/read threadId");
+                        let (ephemeral, source) = thread_reads
+                            .iter()
+                            .find(|(id, _, _)| id == thread_id)
+                            .map(|(_, ephemeral, source)| (*ephemeral, source.as_str()))
+                            .unwrap_or((false, "user"));
+                        write_server_frame(
+                            &mut stream,
+                            json!({
+                                "id": id,
+                                "result": {
+                                    "thread": {
+                                        "id": thread_id,
+                                        "ephemeral": ephemeral,
+                                        "threadSource": source,
+                                    }
+                                }
+                            }),
                         );
                     }
                     "thread/start" => {
@@ -2221,6 +2253,84 @@ mod tests {
             "platformOs": "macos"
         });
         assert!(validate_initialize_response(&null_platform).is_err());
+    }
+
+    /// #3571 RED: an ephemeral/system loaded thread must not make discovery
+    /// reject the one real user thread. The test drives the real delivery path
+    /// and exposes the thread/read metadata only after the loaded-list response.
+    #[test]
+    fn ephemeral_system_thread_is_filtered_from_tui_discovery_3571() {
+        let home = std::env::temp_dir().join(format!("agend-codex-ephemeral-{}", Uuid::new_v4()));
+        let endpoint = std::env::temp_dir().join(format!("a-{}.sock", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("home");
+        let server = run_fake_codex_with_loaded_threads_and_reads(
+            &endpoint,
+            vec!["thread-system".to_string(), "thread-user".to_string()],
+            vec![
+                ("thread-system".to_string(), true, "system".to_string()),
+                ("thread-user".to_string(), false, "user".to_string()),
+            ],
+        );
+        let locator = SessionLocator::codex(endpoint.clone(), None);
+        let mut adapter = CodexNativeShared::new(&home, "codex-agent");
+        let envelope = DeliveryEnvelope::new(
+            "codex-agent",
+            locator,
+            DeliveryKind::Prompt,
+            "hello",
+            Some("corr-ephemeral".to_string()),
+        );
+
+        let accepted = adapter
+            .deliver_blocking(envelope)
+            .expect("the real user thread must be selected");
+        assert_eq!(accepted.state, DeliveryState::ProtocolAccepted);
+        let persisted = super::super::registry::load_session_locator(&home, "codex-agent")
+            .expect("discovery must persist the selected thread");
+        assert_eq!(persisted.thread_id.as_deref(), Some("thread-user"));
+
+        server.join().expect("fake server");
+        let _ = std::fs::remove_file(endpoint);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// #3571 negative control: two real user threads remain ambiguous and must
+    /// keep the fail-closed refusal boundary.
+    #[test]
+    fn two_real_user_threads_remain_ambiguous_3571() {
+        let home = std::env::temp_dir().join(format!("agend-codex-two-users-{}", Uuid::new_v4()));
+        let endpoint = std::env::temp_dir().join(format!("a-{}.sock", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("home");
+        let server = run_fake_codex_with_loaded_threads_and_reads(
+            &endpoint,
+            vec!["thread-user-a".to_string(), "thread-user-b".to_string()],
+            vec![
+                ("thread-user-a".to_string(), false, "user".to_string()),
+                ("thread-user-b".to_string(), false, "user".to_string()),
+            ],
+        );
+        let locator = SessionLocator::codex(endpoint.clone(), None);
+        let mut adapter = CodexNativeShared::new(&home, "codex-agent");
+        let envelope = DeliveryEnvelope::new(
+            "codex-agent",
+            locator,
+            DeliveryKind::Prompt,
+            "hello",
+            Some("corr-two-users".to_string()),
+        );
+
+        let error = adapter
+            .deliver_blocking(envelope)
+            .expect_err("two real user threads must remain refused");
+        assert!(
+            error.to_string().contains("2 loaded threads"),
+            "ambiguity count must survive filtering: {error}"
+        );
+
+        drop(adapter);
+        server.join().expect("fake server");
+        let _ = std::fs::remove_file(endpoint);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     /// #3535: the ambiguous-delivery refusal must carry truncated thread ids
