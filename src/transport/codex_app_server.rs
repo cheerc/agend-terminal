@@ -431,9 +431,15 @@ impl CodexNativeShared {
         let deadline = std::time::Instant::now() + IO_TIMEOUT;
         loop {
             let response = self.send_request("thread/loaded/list", json!({}))?;
-            let thread_ids = loaded_thread_ids(&response);
-            match thread_ids.as_slice() {
-                [thread_id] => return Ok(thread_id.clone()),
+            let loaded_threads = loaded_threads(&response);
+            match loaded_threads.as_slice() {
+                [thread] if !thread.is_known_non_user() => return Ok(thread.id.clone()),
+                [thread] => {
+                    return Err(anyhow::anyhow!(
+                        "Codex app-server has no real user TUI thread (loaded {})",
+                        thread.id
+                    ));
+                }
                 [] if std::time::Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(25));
                 }
@@ -443,14 +449,50 @@ impl CodexNativeShared {
                     ));
                 }
                 _ => {
-                    return Err(anyhow::anyhow!(
-                        "Codex app-server has {} loaded threads ({}); refusing ambiguous TUI delivery",
-                        thread_ids.len(),
-                        ambiguous_thread_ids_preview(&thread_ids)
-                    ));
+                    let real_user_ids = self.real_user_loaded_thread_ids(loaded_threads)?;
+                    match real_user_ids.as_slice() {
+                        [thread_id] => return Ok(thread_id.clone()),
+                        [] => {
+                            return Err(anyhow::anyhow!(
+                                "Codex app-server has no real user TUI thread among loaded threads"
+                            ));
+                        }
+                        _ => {
+                            return Err(anyhow::anyhow!(
+                                "Codex app-server has {} loaded threads ({}); refusing ambiguous TUI delivery",
+                                real_user_ids.len(),
+                                ambiguous_thread_ids_preview(&real_user_ids)
+                            ));
+                        }
+                    }
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn real_user_loaded_thread_ids(
+        &mut self,
+        loaded_threads: Vec<LoadedThread>,
+    ) -> anyhow::Result<Vec<String>> {
+        loaded_threads
+            .into_iter()
+            .filter_map(|thread| {
+                if thread.is_known_non_user() {
+                    return None;
+                }
+                if thread.is_known_user() {
+                    return Some(Ok(thread.id));
+                }
+                let thread_id = thread.id.clone();
+                let response = self.send_request("thread/read", json!({"threadId": thread_id}));
+                match response {
+                    Ok(response) if thread_read_is_real_user(&response) => Some(Ok(thread.id)),
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect()
     }
 
     #[cfg(unix)]
@@ -848,24 +890,67 @@ fn ambiguous_thread_ids_preview(thread_ids: &[String]) -> String {
 }
 
 #[cfg(unix)]
-fn loaded_thread_ids(response: &Value) -> Vec<String> {
-    let mut thread_ids = Vec::new();
+#[derive(Debug)]
+struct LoadedThread {
+    id: String,
+    ephemeral: Option<bool>,
+    source: Option<String>,
+}
+
+#[cfg(unix)]
+impl LoadedThread {
+    fn is_known_non_user(&self) -> bool {
+        self.ephemeral == Some(true) || self.source.as_deref() == Some("system")
+    }
+
+    fn is_known_user(&self) -> bool {
+        self.ephemeral == Some(false) && self.source.as_deref() == Some("user")
+    }
+}
+
+#[cfg(unix)]
+fn loaded_threads(response: &Value) -> Vec<LoadedThread> {
+    let mut loaded_threads = Vec::new();
     for item in response
         .get("data")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
     {
-        let thread_id = item
+        let Some(thread_id) = item
             .as_str()
-            .or_else(|| item.get("id").and_then(Value::as_str));
-        if let Some(thread_id) = thread_id.filter(|thread_id| !thread_id.is_empty()) {
-            if !thread_ids.iter().any(|loaded| loaded == thread_id) {
-                thread_ids.push(thread_id.to_string());
-            }
+            .or_else(|| item.get("id").and_then(Value::as_str))
+            .filter(|thread_id| !thread_id.is_empty())
+        else {
+            continue;
+        };
+        if !loaded_threads
+            .iter()
+            .any(|loaded: &LoadedThread| loaded.id == thread_id)
+        {
+            loaded_threads.push(LoadedThread {
+                id: thread_id.to_string(),
+                ephemeral: item.get("ephemeral").and_then(Value::as_bool),
+                source: item
+                    .get("threadSource")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            });
         }
     }
-    thread_ids
+    loaded_threads
+}
+
+#[cfg(unix)]
+fn thread_read_is_real_user(response: &Value) -> bool {
+    let Some(thread) = response
+        .pointer("/result/thread")
+        .or_else(|| response.get("thread"))
+    else {
+        return false;
+    };
+    thread.get("ephemeral").and_then(Value::as_bool) == Some(false)
+        && thread.get("threadSource").and_then(Value::as_str) == Some("user")
 }
 
 #[cfg(unix)]
