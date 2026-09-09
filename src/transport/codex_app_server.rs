@@ -948,12 +948,9 @@ fn loaded_threads(response: &Value) -> Vec<LoadedThread> {
 
 #[cfg(unix)]
 fn thread_read_user_classification(response: &Value) -> Option<bool> {
-    let Some(thread) = response
+    let thread = response
         .pointer("/result/thread")
-        .or_else(|| response.get("thread"))
-    else {
-        return None;
-    };
+        .or_else(|| response.get("thread"))?;
     let loaded = LoadedThread {
         id: String::new(),
         ephemeral: thread.get("ephemeral").and_then(Value::as_bool),
