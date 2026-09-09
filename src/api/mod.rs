@@ -948,7 +948,17 @@ pub fn call_at(
     Ok(serde_json::from_str(&line)?)
 }
 
+#[cfg(test)]
+pub(crate) static FORBID_LOOPBACK_3573: parking_lot::Mutex<Option<std::path::PathBuf>> =
+    parking_lot::Mutex::new(None);
+
 pub fn call(home: &Path, request: &Value) -> anyhow::Result<Value> {
+    #[cfg(test)]
+    assert_ne!(
+        FORBID_LOOPBACK_3573.lock().as_deref(),
+        Some(home),
+        "unexpected loopback in runtime restart"
+    );
     // #1492: self-IPC over the loopback socket. If the caller holds the
     // registry lock, the API handler servicing this call needs the same lock →
     // deadlock. #1492-L2: the guard is always-on and fail-fast — on a violation
@@ -1033,6 +1043,9 @@ fn api_call_read_timeout() -> std::time::Duration {
 mod readiness_tests;
 
 #[cfg(test)]
+mod working_directory_smoke_tests;
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
@@ -1111,7 +1124,7 @@ mod tests {
         assert_eq!(cached["n"], 1, "the retry observed the cached response");
     }
 
-    fn tmp_home(name: &str) -> std::path::PathBuf {
+    pub(super) fn tmp_home(name: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1123,28 +1136,6 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
-    }
-
-    #[test]
-    fn validate_work_dir_rejects_parent_dir() {
-        let home = tmp_home("validate_parent");
-        let bad = home.join("..").join("escape");
-        let err = validate_working_directory(&bad, &home).unwrap_err();
-        assert!(
-            format!("{err}").contains(".."),
-            "expected parent-dir rejection, got: {err}"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn validate_work_dir_allows_normal_path() {
-        let home = tmp_home("validate_normal");
-        let ok = crate::paths::workspace_dir(&home).join("agent");
-        std::fs::create_dir_all(&ok).expect("create dir");
-        let resolved = validate_working_directory(&ok, &home).expect("normal path must validate");
-        assert!(resolved.ends_with("agent"));
-        std::fs::remove_dir_all(&home).ok();
     }
 
     /// Windows-only #893 regression: the path returned by
