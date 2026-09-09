@@ -218,7 +218,7 @@ fn run_fake_codex_with_loaded_threads(
 fn run_fake_codex_with_loaded_threads_and_reads(
     endpoint: &Path,
     loaded_threads: Vec<String>,
-    thread_reads: Vec<(String, bool, String)>,
+    thread_reads: Vec<(String, Option<bool>, Option<String>)>,
 ) -> thread::JoinHandle<()> {
     let listener = UnixListener::bind(endpoint).expect("bind fake Codex socket");
     // fire-and-forget: the fake app-server owns the socket until the client drains events.
@@ -299,19 +299,20 @@ fn run_fake_codex_with_loaded_threads_and_reads(
                     let (ephemeral, source) = thread_reads
                         .iter()
                         .find(|(id, _, _)| id == thread_id)
-                        .map(|(_, ephemeral, source)| (*ephemeral, source.as_str()))
-                        .unwrap_or((false, "user"));
+                        .map(|(_, ephemeral, source)| (*ephemeral, source.as_deref()))
+                        .unwrap_or((Some(false), Some("user")));
+                    let mut thread = json!({"id": thread_id});
+                    if let Some(ephemeral) = ephemeral {
+                        thread["ephemeral"] = Value::Bool(ephemeral);
+                    }
+                    if let Some(source) = source {
+                        thread["threadSource"] = Value::String(source.to_string());
+                    }
                     write_server_frame(
                         &mut stream,
                         json!({
                             "id": id,
-                            "result": {
-                                "thread": {
-                                    "id": thread_id,
-                                    "ephemeral": ephemeral,
-                                    "threadSource": source,
-                                }
-                            }
+                            "result": {"thread": thread}
                         }),
                     );
                 }
@@ -895,8 +896,16 @@ fn ephemeral_system_thread_is_filtered_from_tui_discovery_3571() {
         &endpoint,
         vec!["thread-system".to_string(), "thread-user".to_string()],
         vec![
-            ("thread-system".to_string(), true, "system".to_string()),
-            ("thread-user".to_string(), false, "user".to_string()),
+            (
+                "thread-system".to_string(),
+                Some(true),
+                Some("system".to_string()),
+            ),
+            (
+                "thread-user".to_string(),
+                Some(false),
+                Some("user".to_string()),
+            ),
         ],
     );
     let locator = SessionLocator::codex(endpoint.clone(), None);
@@ -933,8 +942,16 @@ fn two_real_user_threads_remain_ambiguous_3571() {
         &endpoint,
         vec!["thread-user-a".to_string(), "thread-user-b".to_string()],
         vec![
-            ("thread-user-a".to_string(), false, "user".to_string()),
-            ("thread-user-b".to_string(), false, "user".to_string()),
+            (
+                "thread-user-a".to_string(),
+                Some(false),
+                Some("user".to_string()),
+            ),
+            (
+                "thread-user-b".to_string(),
+                Some(false),
+                Some("user".to_string()),
+            ),
         ],
     );
     let locator = SessionLocator::codex(endpoint.clone(), None);
@@ -953,6 +970,50 @@ fn two_real_user_threads_remain_ambiguous_3571() {
     assert!(
         error.to_string().contains("2 loaded threads"),
         "ambiguity count must survive filtering: {error}"
+    );
+
+    drop(adapter);
+    server.join().expect("fake server");
+    let _ = std::fs::remove_file(endpoint);
+    let _ = std::fs::remove_dir_all(home);
+}
+
+/// PR #3581 correction RED: successful `thread/read` without classification
+/// metadata remains an unresolved candidate, so it must keep discovery closed
+/// even when another candidate is positively identified as the user thread.
+#[test]
+fn unknown_thread_read_metadata_keeps_tui_discovery_fail_closed_3581() {
+    let home = std::env::temp_dir().join(format!("agend-codex-unknown-{}", Uuid::new_v4()));
+    let endpoint = std::env::temp_dir().join(format!("a-{}.sock", Uuid::new_v4()));
+    std::fs::create_dir_all(&home).expect("home");
+    let server = run_fake_codex_with_loaded_threads_and_reads(
+        &endpoint,
+        vec!["thread-user".to_string(), "thread-unknown".to_string()],
+        vec![
+            (
+                "thread-user".to_string(),
+                Some(false),
+                Some("user".to_string()),
+            ),
+            ("thread-unknown".to_string(), None, None),
+        ],
+    );
+    let locator = SessionLocator::codex(endpoint.clone(), None);
+    let mut adapter = CodexNativeShared::new(&home, "codex-agent");
+    let envelope = DeliveryEnvelope::new(
+        "codex-agent",
+        locator,
+        DeliveryKind::Prompt,
+        "hello",
+        Some("corr-unknown".to_string()),
+    );
+
+    let error = adapter
+        .deliver_blocking(envelope)
+        .expect_err("unresolved thread metadata must keep discovery fail-closed");
+    assert!(
+        error.to_string().contains("metadata"),
+        "refusal must identify the unresolved metadata: {error}"
     );
 
     drop(adapter);
