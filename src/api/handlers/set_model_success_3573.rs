@@ -35,6 +35,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn set_model_real_mcp_success_one_owned_successor_3573() {
         use std::os::unix::fs::PermissionsExt;
         let _serial = crate::mcp::handlers::fleet_test_guard();
