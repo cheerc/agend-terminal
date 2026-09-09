@@ -487,8 +487,13 @@ impl CodexNativeShared {
                 let thread_id = thread.id.clone();
                 let response = self.send_request("thread/read", json!({"threadId": thread_id}));
                 match response {
-                    Ok(response) if thread_read_is_real_user(&response) => Some(Ok(thread.id)),
-                    Ok(_) => None,
+                    Ok(response) => match thread_read_user_classification(&response) {
+                        Some(true) => Some(Ok(thread.id)),
+                        Some(false) => None,
+                        None => Some(Err(anyhow::anyhow!(
+                            "Codex app-server thread/read for {thread_id} omitted or returned unrecognized thread classification metadata"
+                        ))),
+                    },
                     Err(error) => Some(Err(error)),
                 }
             })
@@ -942,15 +947,28 @@ fn loaded_threads(response: &Value) -> Vec<LoadedThread> {
 }
 
 #[cfg(unix)]
-fn thread_read_is_real_user(response: &Value) -> bool {
+fn thread_read_user_classification(response: &Value) -> Option<bool> {
     let Some(thread) = response
         .pointer("/result/thread")
         .or_else(|| response.get("thread"))
     else {
-        return false;
+        return None;
     };
-    thread.get("ephemeral").and_then(Value::as_bool) == Some(false)
-        && thread.get("threadSource").and_then(Value::as_str) == Some("user")
+    let loaded = LoadedThread {
+        id: String::new(),
+        ephemeral: thread.get("ephemeral").and_then(Value::as_bool),
+        source: thread
+            .get("threadSource")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    };
+    if loaded.is_known_user() {
+        Some(true)
+    } else if loaded.is_known_non_user() {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 #[cfg(unix)]
