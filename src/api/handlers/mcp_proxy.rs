@@ -406,6 +406,10 @@ fn role_kind_for_instance(
     }
 }
 
+#[cfg(all(test, unix))]
+#[path = "set_model_success_3573.rs"]
+mod set_model_success_3573;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -948,7 +948,17 @@ pub fn call_at(
     Ok(serde_json::from_str(&line)?)
 }
 
+#[cfg(test)]
+pub(crate) static FORBID_LOOPBACK_3573: parking_lot::Mutex<Option<std::path::PathBuf>> =
+    parking_lot::Mutex::new(None);
+
 pub fn call(home: &Path, request: &Value) -> anyhow::Result<Value> {
+    #[cfg(test)]
+    assert_ne!(
+        FORBID_LOOPBACK_3573.lock().as_deref(),
+        Some(home),
+        "unexpected loopback in runtime restart"
+    );
     // #1492: self-IPC over the loopback socket. If the caller holds the
     // registry lock, the API handler servicing this call needs the same lock →
     // deadlock. #1492-L2: the guard is always-on and fail-fast — on a violation
