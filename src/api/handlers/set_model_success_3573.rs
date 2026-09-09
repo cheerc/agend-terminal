@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use super::tests::invoke_runtime_mcp_tool;
 use serde_json::json;
 use std::path::PathBuf;

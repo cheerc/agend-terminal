@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use super::{tests::tmp_home, validate_working_directory};
 
 #[test]
