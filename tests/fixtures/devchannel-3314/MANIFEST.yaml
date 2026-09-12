@@ -17,7 +17,7 @@
 
 captured_from_cli_version: "2.1.237"
 recorded_on: "2026-08-20"
-validated_against_cli_versions: ["2.1.238", "2.1.240", "2.1.241"]
+validated_against_cli_versions: ["2.1.238", "2.1.240", "2.1.241", "2.1.269"]
 validation_method: >
   Every static line the recognizer depends on was confirmed byte-present in the
   2.1.238 and 2.1.240 binaries. The 2.1.240 binary SHA-256 was
@@ -29,6 +29,15 @@ validation_method: >
   1495eb7c42d3b4451f5f1cd38b6d498d22a4a38c802bc2be5c1cf1795e64820d;
   its rendered frame was captured from the preserved archfix-opus-3
   production startup pane on 2026-08-23.
+  The 2.1.269 RAW capture (live_modal_2_1_269.raw, SHA-256
+  0b098a333d845c17d5277b149204879a0fd49588515a5c9042ef1744b4be034f)
+  was taken from a live `claude --version` = 2.1.269 PTY at 229x40 on
+  2026-09-13, fed with `--dangerously-load-development-channels
+  server:agend-claude-channel` in a trust-approved workspace. 2.1.269 lays
+  words with CHA cursor-addressing (`ESC[{n}G`) plus truecolor SGR instead of
+  space characters, but the repo VTerm normalizes both to the same grid text:
+  the rendered .txt is byte-identical to the 2.1.241 fixture apart from the
+  top rule length (229 vs 120 columns).
 
 fixtures:
   - file: live_modal.txt
@@ -42,6 +51,11 @@ fixtures:
     scenario: Claude 2.1.241 production spawn, modal LIVE before operator confirmation
     full_static_fingerprint: true
     capture_sha256: 2bd9fb4a890d95d7054efa7185166c14ed519b31062a087cf8947bd3ffa633eb
+  - file: live_modal_2_1_269.txt
+    scenario: Claude 2.1.269 local PTY spawn at 229 columns, modal LIVE before operator confirmation
+    full_static_fingerprint: true
+    capture_sha256: 0b098a333d845c17d5277b149204879a0fd49588515a5c9042ef1744b4be034f
+    note: raw PTY bytes kept alongside as live_modal_2_1_269.raw; the .txt is the repo VTerm rendering of that raw
   - file: replay.txt
     scenario: --continue restart; the modal was already answered, the marker is present only as REPLAYED transcript
     full_static_fingerprint: true

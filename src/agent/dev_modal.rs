@@ -469,6 +469,12 @@ pub(crate) enum Refused {
     NoCompleteModal,
     /// Past the startup window: anything carrying this text now is transcript.
     WindowExpired,
+    /// t-20260912171012286674-51827-9: the settled-scope complete path saw a
+    /// COMPETING answerable prompt beside the modal text. A CR here would land
+    /// on that prompt, not on the modal — the #3561 R1 footgun, extended from
+    /// the relaxed anchor to the complete fingerprint for the settled scope
+    /// (where the startup-era time context no longer discriminates).
+    SettledCompetitor,
 }
 
 impl Refused {
@@ -478,6 +484,7 @@ impl Refused {
             Refused::Spent => "Spent",
             Refused::NoCompleteModal => "NoCompleteModal",
             Refused::WindowExpired => "WindowExpired",
+            Refused::SettledCompetitor => "SettledCompetitor",
         }
     }
 }
@@ -504,6 +511,7 @@ pub(crate) struct RefuseTally {
     spent: AtomicU64,
     no_complete_modal: AtomicU64,
     window_expired: AtomicU64,
+    settled_competitor: AtomicU64,
     answered: AtomicU64,
     relaxed_answers: AtomicU64,
     /// 0 = nothing refused yet; otherwise a [`Refused`] discriminant + 1.
@@ -517,6 +525,7 @@ impl RefuseTally {
             Refused::Spent => (&self.spent, 2),
             Refused::NoCompleteModal => (&self.no_complete_modal, 3),
             Refused::WindowExpired => (&self.window_expired, 4),
+            Refused::SettledCompetitor => (&self.settled_competitor, 5),
         };
         counter.fetch_add(1, Ordering::Relaxed);
         self.last.store(tag, Ordering::Relaxed);
@@ -535,6 +544,7 @@ impl RefuseTally {
             2 => Some(Refused::Spent),
             3 => Some(Refused::NoCompleteModal),
             4 => Some(Refused::WindowExpired),
+            5 => Some(Refused::SettledCompetitor),
             _ => None,
         }
     }
@@ -542,7 +552,7 @@ impl RefuseTally {
     /// One line, safe to paste into a stalled-pane capture.
     pub(crate) fn summary_line(&self) -> String {
         format!(
-            "dev_modal: armed={} answered={} (relaxed={}) last_refuse={}              refuses{{NotArmed:{},Spent:{},NoCompleteModal:{},WindowExpired:{}}}",
+            "dev_modal: armed={} answered={} (relaxed={}) last_refuse={}              refuses{{NotArmed:{},Spent:{},NoCompleteModal:{},WindowExpired:{},SettledCompetitor:{}}}",
             self.armed.load(Ordering::Relaxed),
             self.answered.load(Ordering::Relaxed),
             self.relaxed_answers.load(Ordering::Relaxed),
@@ -551,6 +561,7 @@ impl RefuseTally {
             self.spent.load(Ordering::Relaxed),
             self.no_complete_modal.load(Ordering::Relaxed),
             self.window_expired.load(Ordering::Relaxed),
+            self.settled_competitor.load(Ordering::Relaxed),
         )
     }
 }
@@ -643,6 +654,13 @@ pub(crate) struct DevModalGate {
     /// the pane, never which thing. When something else on screen is answerable,
     /// a CR aimed at a merely-quoted warning would land on that instead.
     other_prompt_on_screen: bool,
+    /// t-20260912171012286674-51827-9: is this frame scanned under the settled
+    /// scope (latch closed AND the agent has visited Idle)? Injected by the read
+    /// loop from the scope it computed, like `prompt_blocked`. While set, only
+    /// the complete fingerprint may answer (the relaxed anchor's precision leans
+    /// on startup-era time context that no longer holds), and even the complete
+    /// path refuses when `other_prompt_on_screen` names a live competitor.
+    settled: bool,
     /// #3547: observability sink. Never read by the decision path.
     tally: Arc<RefuseTally>,
     /// #3547 P0-near Task2: per-generation first-Refuse flag. Owned by the PTY
@@ -686,6 +704,7 @@ impl DevModalGate {
             consecutive_no_complete: 0,
             prompt_blocked: false,
             other_prompt_on_screen: false,
+            settled: false,
             tally,
             first_refuse_logged: false,
         }
@@ -703,6 +722,13 @@ impl DevModalGate {
     /// the gate still reads nothing but injected facts.
     pub(crate) fn set_other_prompt_on_screen(&mut self, other_prompt_on_screen: bool) {
         self.other_prompt_on_screen = other_prompt_on_screen;
+    }
+
+    /// t-20260912171012286674-51827-9: record whether this frame is scanned
+    /// under the settled scope. Same injection shape as `set_prompt_blocked`:
+    /// the read loop owns the scope computation, the gate only reads the fact.
+    pub(crate) fn set_settled(&mut self, settled: bool) {
+        self.settled = settled;
     }
 
     /// #3547 P0-near Task2: claim the per-generation first-Refuse log slot.
@@ -758,7 +784,15 @@ impl DevModalGate {
     ///
     /// Every condition here is a fact the daemon owns or has already computed —
     /// none of it is read off the frame beyond the anchor match itself.
+    ///
+    /// t-20260912171012286674-51827-9: never under the settled scope. The anchor
+    /// subset's precision leans on startup-era time context (a pane too short or
+    /// still painting, moments after spawn); past Idle that context no longer
+    /// holds and a quoted warning beside live text would satisfy it.
     fn relaxed_digest(&self, screen: &str) -> Option<u64> {
+        if self.settled {
+            return None;
+        }
         if !self.prompt_blocked || self.consecutive_no_complete < RELAXED_AFTER_INCOMPLETE_FRAMES {
             return None;
         }
@@ -802,6 +836,13 @@ impl DevModalGate {
         }
         let (digest, relaxed) = match complete_modal_digest(screen) {
             Some(digest) => {
+                // t-20260912171012286674-51827-9: under the settled scope a live
+                // competitor beside the modal text vetoes the complete path too —
+                // the CR would land on that prompt, not on the modal (#3561 R1).
+                if self.settled && self.other_prompt_on_screen {
+                    self.candidate = None;
+                    return self.refuse(Refused::SettledCompetitor);
+                }
                 self.consecutive_no_complete = 0;
                 (digest, false)
             }

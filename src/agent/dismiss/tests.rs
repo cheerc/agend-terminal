@@ -740,30 +740,69 @@ fn dev_channel_marker_over_a_live_modal_is_not_dismissed_when_settled_3314() {
     );
 }
 
-/// #3314: the BOUND itself. The very same real modal that must be dismissed
-/// pre-Idle must NOT be dismissed once the agent has settled — otherwise the
-/// pre-Idle scope would be indistinguishable from listing the hint as
-/// trust-class, which is the unsafe fix this design rejects.
+/// t-20260912171012286674-51827-9: the BOUND, re-sited. #3314's original bound
+/// ("a settled agent's re-arm must not fire the dev-channel pattern") assumed
+/// the settled scope had no means to separate a live modal from transcript —
+/// and under that assumption admitting the pattern WAS indistinguishable from
+/// the unsafe trust-class listing. 2.1.269 broke the assumption's premise from
+/// the other side: a transient Idle BEFORE the modal paints strands the pane
+/// with the gate never consulted again.
+///
+/// The bound therefore moves INTO the gate: under `RearmSettled` the dev
+/// pattern is eligible, but the gate answers on the complete fingerprint only
+/// (no relaxed anchor) and vetoes beside a live competitor
+/// (`SettledCompetitor`). Quoted/competitor protection is covered by
+/// `dev_channel_marker_over_a_live_modal_is_not_dismissed_when_settled_3314`
+/// and `settled_complete_modal_beside_a_live_prompt_is_refused_269` —
+///
+/// so this test now asserts the new semantic: the very same real modal IS
+/// dismissed when settled, provided no competitor shares the frame.
 #[test]
 fn dev_channel_modal_is_not_dismissed_after_the_agent_has_settled_3314() {
+    let _inline = InlineWrite::arm();
     let prepared = claude_prepared_patterns_3314();
     let (writer, written) = recording_writer_3314();
+    let mut gate = DevModalGate::new(true);
+    gate.set_prompt_blocked(true);
+    gate.set_settled(true);
+    let mut spent = false;
+    // First sighting schedules; the second, past the stability window, writes.
     assert!(
-        !try_prepared_dismiss_dialog(
+        !try_prepared_dismiss_dialog_once_per_spawn(
             "claude-3314-bound",
             DEV_CHANNEL_STARTUP_MODAL_3314,
             &writer,
             &prepared,
             DismissScanScope::RearmSettled,
-            &mut ungated_3314().0,
-            LogicalMs(crate::agent::dev_modal::MIN_STABLE_MS),
+            &mut gate,
+            LogicalMs(0),
+            &mut spent,
         ),
-        "#3314: a settled agent's re-arm must not fire the dev-channel pattern — after Idle \
-         this text is transcript, and the modal that may be live is the operator's"
+        "first sighting must only schedule, never write"
     );
-    assert!(written.lock().is_empty());
-    // ... and the pattern is genuinely reachable, so the assertion above is
-    // the SCOPE refusing it rather than a regex that never matched.
+    assert!(
+        try_prepared_dismiss_dialog_once_per_spawn(
+            "claude-3314-bound",
+            DEV_CHANNEL_STARTUP_MODAL_3314,
+            &writer,
+            &prepared,
+            DismissScanScope::RearmSettled,
+            &mut gate,
+            LogicalMs(crate::agent::dev_modal::MIN_STABLE_MS),
+            &mut spent,
+        ),
+        "t-20260912171012286674-51827-9: a settled complete live modal with no \
+         competitor must still be answered — the gate (complete-only + \
+         SettledCompetitor veto + daemon-owned facts) now carries the bound \
+         the scope alone used to carry"
+    );
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r",
+        "the dismissal sends exactly one Enter"
+    );
+    // ... and the Startup control still fires, so the pattern's reachability
+    // is unchanged — only the settled scope's verdict moved.
     let (writer, written) = recording_writer_3314();
     assert!(
         try_prepared_dismiss_dialog(
@@ -2507,4 +2546,113 @@ fn issue_468_kiro_real_spawn_dismiss_smoke() {
              reported operator screenshot."
         );
     }
+}
+
+/// t-20260912171012286674-51827-9 RED: a LIVE complete dev-channel modal on a
+/// prompt-blocked pane must still be answerable after the startup latch closed
+/// AND the agent transiently visited Idle before the modal painted (2.1.269
+/// startup behavior: the state machine lands on Idle mid-startup, setting
+/// `ever_idle`, so the scan scope degrades to `RearmSettled` — under which the
+/// dev pattern is not eligible and the gate is never consulted again).
+///
+/// Production shape (daemon.2026-09-12.log + stalled-captures): the generation
+/// consults the gate exactly once (`NoCompleteModal:1`, the half-painted first
+/// frame), then stalls with the complete modal on screen and zero
+/// `dialog dismiss submitted`.
+#[test]
+fn live_dev_modal_after_transient_idle_is_still_answered_269() {
+    let _inline = InlineWrite::arm();
+    let screen = include_str!("../../../tests/fixtures/devchannel-3314/live_modal_2_1_269.txt");
+    assert!(
+        crate::agent::dev_modal::complete_modal_digest(screen).is_some(),
+        "fixture must carry the complete modal or this proves nothing"
+    );
+    let patterns = claude_prepared_patterns_3314();
+    let (writer, bytes) = recording_writer_3314();
+    let mut gate = DevModalGate::new(true);
+    gate.set_prompt_blocked(true);
+    let mut spent = false;
+    // Latch closed + transient Idle visited before the modal painted:
+    // the exact scope the read loop computes for every post-paint frame.
+    let scope = dismiss_scan_scope(false, true);
+    assert_eq!(scope, DismissScanScope::RearmSettled);
+    // Mirror the read loop: the gate learns the settled fact from the scope.
+    gate.set_settled(scope == DismissScanScope::RearmSettled);
+    // First sighting schedules the candidate; the second, past the stability
+    // window, enqueues the single CR (same two-call shape production takes
+    // across two PTY frames — see `ungated_stable_3314`).
+    let first = try_prepared_dismiss_dialog_once_per_spawn(
+        "dev-modal-269-settled",
+        screen,
+        &writer,
+        &patterns,
+        scope,
+        &mut gate,
+        LogicalMs(0),
+        &mut spent,
+    );
+    assert!(
+        !first,
+        "the first sighting must only schedule, never write: {first}"
+    );
+    let fired = try_prepared_dismiss_dialog_once_per_spawn(
+        "dev-modal-269-settled",
+        screen,
+        &writer,
+        &patterns,
+        scope,
+        &mut gate,
+        LogicalMs(crate::agent::dev_modal::MIN_STABLE_MS),
+        &mut spent,
+    );
+    assert!(
+        fired,
+        "a complete live modal on a blocked pane must be answered even after latch+transient-Idle"
+    );
+    assert_eq!(*bytes.lock(), b"\r", "the answer must be a single CR");
+}
+
+/// t-20260912171012286674-51827-9 reverse: under the settled scope a COMPLETE
+/// modal beside a LIVE competing prompt must NOT be answered — the CR would
+/// land on the competitor (#3561 R1 footgun, extended to the complete path).
+/// The trust hint below is settled-eligible (`rearm_past_latch`), so the
+/// competitor fact is really set; the gate must veto with `SettledCompetitor`.
+#[test]
+fn settled_complete_modal_beside_a_live_prompt_is_refused_269() {
+    let _inline = InlineWrite::arm();
+    let live = include_str!("../../../tests/fixtures/devchannel-3314/live_modal.txt");
+    // A complete modal transcript above a live trust prompt holding the pane.
+    let screen =
+        format!("{live}\n  Do you trust the contents of this directory?\n  ❯ Yes, I trust\n");
+    assert!(
+        crate::agent::dev_modal::complete_modal_digest(&screen).is_some(),
+        "the frame must carry the complete modal or this proves nothing"
+    );
+    let patterns = claude_prepared_patterns_3314();
+    let (writer, bytes) = recording_writer_3314();
+    let mut gate = DevModalGate::new(true);
+    gate.set_prompt_blocked(true);
+    gate.set_settled(true);
+    let mut spent = false;
+    for frame in 0..30u64 {
+        let fired = try_prepared_dismiss_dialog_once_per_spawn(
+            "dev-modal-269-competitor",
+            &screen,
+            &writer,
+            &patterns,
+            DismissScanScope::RearmSettled,
+            &mut gate,
+            LogicalMs(frame * 400),
+            &mut spent,
+        );
+        assert!(
+            !fired,
+            "frame {frame}: a settled complete modal beside a live prompt must never be answered"
+        );
+    }
+    assert!(
+        bytes.lock().is_empty(),
+        "no keystroke may reach the competitor prompt: {:?}",
+        *bytes.lock()
+    );
 }

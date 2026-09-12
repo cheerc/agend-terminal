@@ -2124,6 +2124,15 @@ fn pty_read_loop(
                     && !dismiss_agent_ever_idle
                     && agent_state != crate::state::AgentState::AwaitingOperator;
                 dev_modal_gate.set_prompt_blocked(dev_modal_prompt_blocked);
+                // t-20260912171012286674-51827-9: hand the gate the settled-scope
+                // fact it needs to bound itself (complete-only, competitor veto).
+                // Computed from the same scope below: `pre_idle` forces
+                // `RearmPreIdle`, which is never settled by construction.
+                dev_modal_gate.set_settled(
+                    !pre_idle_dev_modal_visible
+                        && dismiss_scan_scope(dismiss_scan_enabled, dismiss_agent_ever_idle)
+                            == dismiss::DismissScanScope::RearmSettled,
+                );
                 if dismiss_scan_armed(
                     dismiss_scan_enabled,
                     prompt_blocked,

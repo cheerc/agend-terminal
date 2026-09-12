@@ -380,7 +380,17 @@ impl PreparedDismissPattern {
         match scope {
             DismissScanScope::Startup => true,
             DismissScanScope::RearmPreIdle => self.rearm_past_latch || self.rearm_pre_idle,
-            DismissScanScope::RearmSettled => self.rearm_past_latch,
+            // t-20260912171012286674-51827-9: the daemon-caused dev-channel modal
+            // stays eligible past Idle. Its safety never came from the scope —
+            // it comes from the generation gate's daemon-owned facts
+            // (argv flag, epoch, one-shot, 120s window, stability) — and 2.1.269
+            // provokes a transient Idle before the modal paints, which would
+            // otherwise strand the pane (gate never consulted again). Only the
+            // gate-routed (`dev_gated`) class is admitted here, never the
+            // backend-caused startup hints; the gate itself answers a settled
+            // frame on the complete fingerprint only, and refuses beside a live
+            // competitor (`SettledCompetitor`).
+            DismissScanScope::RearmSettled => self.rearm_past_latch || self.dev_gated,
         }
     }
 
