@@ -56,6 +56,11 @@ fixtures:
     full_static_fingerprint: true
     capture_sha256: 0b098a333d845c17d5277b149204879a0fd49588515a5c9042ef1744b4be034f
     note: raw PTY bytes kept alongside as live_modal_2_1_269.raw; the .txt is the repo VTerm rendering of that raw
+  - file: live_modal_2_1_269_80col.raw
+    scenario: Claude 2.1.269 local PTY spawn at 80 columns, modal LIVE; true read() edges preserved ([13,6,24,1024,55,12] bytes)
+    full_static_fingerprint: true
+    capture_sha256: f8040705303e7ffe40bb806e68d45ff6500e6a9b7fcde2e6b684993db1a16774
+    note: byte-slice harness input for the tail-repaint worker-cancellation RED (t-20260913052851207170-74631-0); not a text rendering
   - file: replay.txt
     scenario: --continue restart; the modal was already answered, the marker is present only as REPLAYED transcript
     full_static_fingerprint: true

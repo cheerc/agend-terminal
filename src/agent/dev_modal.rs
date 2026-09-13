@@ -731,6 +731,22 @@ impl DevModalGate {
         self.settled = settled;
     }
 
+    /// t-20260913052851207170-74631-0 (vii): re-anchor the in-flight candidate
+    /// to the current epoch. Called by the read loop when a frame arrives whose
+    /// screen is byte-identical to the previous one (dedup hit) yet still
+    /// carries the complete modal: the epoch moved on repaint noise alone, and
+    /// a waiting writer must not read that as "the modal is gone". Deliberately
+    /// NOT a consult: it changes no verdict, spends nothing, and never opens a
+    /// worker — it only keeps the already-scheduled writer's barrier valid.
+    /// Operator input always changes the screen, so it always misses the
+    /// dedup-hit precondition and can never refresh past a real edit.
+    pub(crate) fn refresh_candidate_epoch(&mut self) {
+        if self.candidate.is_some() {
+            self.candidate_epoch
+                .store(self.epoch.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
+    }
+
     /// #3547 P0-near Task2: claim the per-generation first-Refuse log slot.
     /// Returns true exactly once per generation; observability only, the gate
     /// decision never consults it.

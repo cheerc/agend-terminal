@@ -6629,3 +6629,42 @@ fn assert_scheduled_job_exit_retains_child(exit_code: i32, phase: &str) {
         "Job PTY exit must retain the original child; no shell replacement or registry removal"
     );
 }
+
+/// t-20260913052851207170-74631-0 (vii) RED: a cursor/query repaint tail must
+/// not silently cancel the scheduled dismiss with no retry.
+///
+/// True 2.1.269 read() edges at 80 columns (`live_modal_2_1_269_80col.raw`):
+/// head 1067B paints most of the modal (digest incomplete, state trips Idle),
+/// body 55B completes it (Schedule opens the detached writer), tail 12B is a
+/// screen-identical repaint (`\x1b[>0q\x1b[?u\x1b[c`) that only bumps the epoch.
+/// The tail frame never consults (dedup: screen unchanged, pre-Idle dead after
+/// the transient Idle), so no second worker opens — and the first worker wakes
+/// to candidate_epoch != current and cancels. The trailing 5s-delayed pad only
+/// holds PTY EOF past the worker's verdict so the death is (1) epoch, not (2)
+/// generation-over.
+#[test]
+fn pty_read_loop_survives_cursor_tail_after_schedule_269() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let raw = include_bytes!("../../tests/fixtures/devchannel-3314/live_modal_2_1_269_80col.raw");
+    assert_eq!(raw.len(), 1134, "fixture edges are byte-exact");
+    assert_eq!(
+        &raw[1122..],
+        b"\x1b[>0q\x1b[?u\x1b[c",
+        "tail packet is screen-identical repaint"
+    );
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![
+        (&raw[..1067], std::time::Duration::ZERO),
+        (&raw[1067..1122], std::time::Duration::from_millis(50)),
+        (&raw[1122..], std::time::Duration::from_millis(100)),
+        (&[0x1b], std::time::Duration::from_secs(5)),
+    ]);
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r",
+        "t-20260913052851207170-74631-0: the repaint tail must refresh the candidate, not kill the only writer"
+    );
+}

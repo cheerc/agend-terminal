@@ -2133,6 +2133,16 @@ fn pty_read_loop(
                         && dismiss_scan_scope(dismiss_scan_enabled, dismiss_agent_ever_idle)
                             == dismiss::DismissScanScope::RearmSettled,
                 );
+                // t-20260913052851207170-74631-0 (vii): a repaint-no-op frame
+                // (dedup hit, screen byte-identical) that still carries the
+                // complete modal re-anchors the waiting writer instead of
+                // letting repaint noise cancel it with no retry. Deliberately
+                // outside `dismiss_scan_armed`: no consult, no verdict, no
+                // worker — just the epoch refresh, and only while the modal
+                // is still fully on screen.
+                if !state_changed && dev_modal::complete_modal_digest(&screen).is_some() {
+                    dev_modal_gate.refresh_candidate_epoch();
+                }
                 if dismiss_scan_armed(
                     dismiss_scan_enabled,
                     prompt_blocked,
