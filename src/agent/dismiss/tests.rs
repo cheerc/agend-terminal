@@ -2763,6 +2763,62 @@ fn settled_replay_beside_bullet_prefixed_live_prompt_is_refused_3616() {
     );
 }
 
+/// PR #3616 rework F1-footer-prefix RED: a complete dev-channel modal in transcript
+/// followed by an UNKNOWN prompt carrying legitimate footer remainder as prefix
+/// (e.g. `· Esc to cancel — Custom operator question? [y/N]`) must NOT be dismissed when settled.
+///
+/// Reviewer F1-footer-prefix (Generation 3 verdict):
+/// "complete_modal_reaches_bottom 用 starts_with('· Esc to cancel')/starts_with('Esc to cancel')，
+/// 帶合法前綴的未知 prompt（如 `· Esc to cancel — Custom operator question? [y/N]` 或 `Esc to cancel; confirm?`）
+/// 可繞 veto 誤送 CR。
+/// 要求：尾端只接受 exact `· Esc to cancel`、exact `Esc to cancel`（可先 trim）或空白行；
+/// 前綴後附加任何非空字元一律拒絕。"
+#[test]
+fn settled_replay_beside_footer_prefixed_live_prompt_is_refused_3616() {
+    let _inline = InlineWrite::arm();
+    let live = include_str!("../../../tests/fixtures/devchannel-3314/live_modal.txt");
+    // Replace the legitimate footer remainder with an unknown prompt carrying the footer as prefix:
+    let screen = live.replace(
+        "· Esc to cancel",
+        "· Esc to cancel — Custom operator question? [y/N]: ",
+    );
+    assert!(
+        crate::agent::dev_modal::complete_modal_digest(&screen).is_some(),
+        "frame satisfies complete_modal_digest"
+    );
+    let patterns = claude_prepared_patterns_3314();
+    let (writer, bytes) = recording_writer_3314();
+    let mut gate = DevModalGate::new(true);
+    gate.set_prompt_blocked(true);
+    gate.set_settled(true);
+    let mut spent = false;
+
+    let scope = dismiss_scan_scope(false, true);
+    assert_eq!(scope, DismissScanScope::RearmSettled);
+
+    for frame in 0..10u64 {
+        let fired = try_prepared_dismiss_dialog_once_per_spawn(
+            "dev-modal-f1-footer-prefix-unknown",
+            &screen,
+            &writer,
+            &patterns,
+            scope,
+            &mut gate,
+            LogicalMs(frame * 400),
+            &mut spent,
+        );
+        assert!(
+            !fired,
+            "frame {frame}: footer-prefixed unknown prompt must NEVER be dismissed in settled scope"
+        );
+    }
+    assert!(
+        bytes.lock().is_empty(),
+        "F1-footer-prefix: no keystroke may be routed to a footer-prefixed unknown prompt: {:?}",
+        *bytes.lock()
+    );
+}
+
 /// t-20260913064200432164-24626-4 RED:
 /// 首包純 SGR + modal 包不變 state 分類 → 未修前零 consult。
 ///
