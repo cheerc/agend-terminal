@@ -2657,6 +2657,60 @@ fn settled_complete_modal_beside_a_live_prompt_is_refused_269() {
     );
 }
 
+/// PR #3616 rework F1 RED: a replayed or quoted complete dev-channel modal in transcript
+/// alongside an UNKNOWN live prompt must NOT be dismissed when settled.
+///
+/// Reviewer F1:
+/// "settled 下完整 replay/quoted + 未知 live prompt 同屏 → SettledCompetitor 僅認已知 pattern
+/// → CR 誤發。修法前 settled 是拒絕的。要求：settled 下 replay/quoted 不得路由 CR 到未知 prompt；
+/// fingerprint 只作 precision。"
+///
+/// Under settled scope, `self.dev_gated` must NOT be admissible on `RearmSettled`,
+/// so that replay/quoted dev modal text in scrollback cannot trigger dismiss when an unknown
+/// live prompt is holding input.
+#[test]
+fn settled_replay_beside_unknown_live_prompt_is_refused_3616() {
+    let _inline = InlineWrite::arm();
+    let replay = include_str!("../../../tests/fixtures/devchannel-3314/replay.txt");
+    assert!(
+        crate::agent::dev_modal::complete_modal_digest(replay).is_some(),
+        "replay.txt satisfies complete_modal_digest"
+    );
+    // An unknown interactive prompt not recognized by any preset regex:
+    let screen = format!("{replay}\nCustom operator question? [y/N]: \n");
+    let patterns = claude_prepared_patterns_3314();
+    let (writer, bytes) = recording_writer_3314();
+    let mut gate = DevModalGate::new(true);
+    gate.set_prompt_blocked(true);
+    gate.set_settled(true);
+    let mut spent = false;
+
+    let scope = dismiss_scan_scope(false, true);
+    assert_eq!(scope, DismissScanScope::RearmSettled);
+
+    for frame in 0..10u64 {
+        let fired = try_prepared_dismiss_dialog_once_per_spawn(
+            "dev-modal-f1-replay-unknown",
+            &screen,
+            &writer,
+            &patterns,
+            scope,
+            &mut gate,
+            LogicalMs(frame * 400),
+            &mut spent,
+        );
+        assert!(
+            !fired,
+            "frame {frame}: replay beside unknown live prompt must NEVER be dismissed in settled scope"
+        );
+    }
+    assert!(
+        bytes.lock().is_empty(),
+        "F1: no keystroke may be routed to an unknown prompt: {:?}",
+        *bytes.lock()
+    );
+}
+
 /// t-20260913064200432164-24626-4 RED:
 /// 首包純 SGR + modal 包不變 state 分類 → 未修前零 consult。
 ///

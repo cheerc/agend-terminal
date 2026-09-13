@@ -6842,3 +6842,53 @@ fn pty_read_loop_dev_modal_consult_retains_seen_hint_when_unresolved_269() {
         "t-20260913083736497384-27902-0: dev-modal consult 必須記住 hint 見過且未解，在後續完整幀成功 dismiss"
     );
 }
+
+/// PR #3616 rework F2 RED:
+/// When an earlier dismiss (such as trust prompt) has set dismiss_cooldown_until,
+/// and the dev-channel modal arrives within the 10s cooldown while ever_idle has become true,
+/// the read loop must not permanently drop the modal if no subsequent PTY packet arrives.
+///
+/// Under unfixed code, because `dev_modal_visible && !dismiss_agent_ever_idle` requires `!ever_idle`,
+/// the cooldown bypass is inactive. If no more PTY bytes arrive, the pane strands in modal forever.
+///
+/// The fix must ensure that the dev modal either safely bypasses cooldown or retries so that
+/// it auto-dismisses and emits Enter (\r).
+#[test]
+fn pty_read_loop_dev_modal_dismissed_even_if_in_cooldown_after_idle_3616() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let trust = b"\x1b[2J\x1b[H Accessing workspace:\r\n\r\n /private/tmp/claude-test\r\n\r\n Quick safety check: Is this a project you created or one you trust?\r\n\r\n \xe2\x9d\xaf 1. Yes, I trust this folder\r\n   2. No, exit\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
+    let idle = b"\x1b[2J\x1b[H bypass permissions on\r\n \xe2\x9d\xaf ";
+    let modal = include_bytes!("../../tests/fixtures/devchannel-3314/live_modal_2_1_241.txt");
+
+    // Set cooldown to 3s for this test
+    dismiss::set_dismiss_cooldown_for_test(Some(std::time::Duration::from_millis(3_000)));
+    struct ResetCooldown;
+    impl Drop for ResetCooldown {
+        fn drop(&mut self) {
+            dismiss::set_dismiss_cooldown_for_test(None);
+        }
+    }
+    let _reset = ResetCooldown;
+
+    // Chunk 1: trust dialog at 0ms (dismissed, arms 3s cooldown until 3,000ms)
+    // Chunk 2: idle at 2,500ms (sets ever_idle=true via hysteresis)
+    // Chunk 3: complete dev modal at 2,850ms (inside the 3s cooldown!)
+    // Chunk 4: delayed empty read / 1s sleep after cooldown expiry (at 3,850ms, cooldown expired at 3,000ms)
+    // Under unfixed code: no PTY bytes arrive after 2,850ms, so modal is never dismissed (written is b"\r").
+    // Under F2 fix: modal in cooldown past idle is retried upon cooldown expiry, emitting second CR (written is b"\r\r").
+    let written = run_dev_modal_pty_read_loop_3333(vec![
+        (trust, std::time::Duration::ZERO),
+        (idle, std::time::Duration::from_millis(2_500)),
+        (modal, std::time::Duration::from_millis(350)),
+        (b"", std::time::Duration::from_millis(1_000)),
+    ]);
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r\r",
+        "PR #3616 F2: dev modal arriving in cooldown past idle must retry upon cooldown expiry even without subsequent PTY output"
+    );
+}
