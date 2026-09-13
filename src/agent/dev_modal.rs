@@ -440,10 +440,7 @@ fn complete_modal_reaches_bottom(screen: &str, end: usize) -> bool {
     let mut lines = tail.lines();
     if let Some(first_line) = lines.next() {
         let trimmed = first_line.trim();
-        if !trimmed.is_empty()
-            && !trimmed.starts_with("· Esc to cancel")
-            && !trimmed.starts_with("Esc to cancel")
-        {
+        if !trimmed.is_empty() && trimmed != "· Esc to cancel" && trimmed != "Esc to cancel" {
             return false;
         }
     }
