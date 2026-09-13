@@ -740,30 +740,69 @@ fn dev_channel_marker_over_a_live_modal_is_not_dismissed_when_settled_3314() {
     );
 }
 
-/// #3314: the BOUND itself. The very same real modal that must be dismissed
-/// pre-Idle must NOT be dismissed once the agent has settled — otherwise the
-/// pre-Idle scope would be indistinguishable from listing the hint as
-/// trust-class, which is the unsafe fix this design rejects.
+/// t-20260912171012286674-51827-9: the BOUND, re-sited. #3314's original bound
+/// ("a settled agent's re-arm must not fire the dev-channel pattern") assumed
+/// the settled scope had no means to separate a live modal from transcript —
+/// and under that assumption admitting the pattern WAS indistinguishable from
+/// the unsafe trust-class listing. 2.1.269 broke the assumption's premise from
+/// the other side: a transient Idle BEFORE the modal paints strands the pane
+/// with the gate never consulted again.
+///
+/// The bound therefore moves INTO the gate: under `RearmSettled` the dev
+/// pattern is eligible, but the gate answers on the complete fingerprint only
+/// (no relaxed anchor) and vetoes beside a live competitor
+/// (`SettledCompetitor`). Quoted/competitor protection is covered by
+/// `dev_channel_marker_over_a_live_modal_is_not_dismissed_when_settled_3314`
+/// and `settled_complete_modal_beside_a_live_prompt_is_refused_269` —
+///
+/// so this test now asserts the new semantic: the very same real modal IS
+/// dismissed when settled, provided no competitor shares the frame.
 #[test]
 fn dev_channel_modal_is_not_dismissed_after_the_agent_has_settled_3314() {
+    let _inline = InlineWrite::arm();
     let prepared = claude_prepared_patterns_3314();
     let (writer, written) = recording_writer_3314();
+    let mut gate = DevModalGate::new(true);
+    gate.set_prompt_blocked(true);
+    gate.set_settled(true);
+    let mut spent = false;
+    // First sighting schedules; the second, past the stability window, writes.
     assert!(
-        !try_prepared_dismiss_dialog(
+        !try_prepared_dismiss_dialog_once_per_spawn(
             "claude-3314-bound",
             DEV_CHANNEL_STARTUP_MODAL_3314,
             &writer,
             &prepared,
             DismissScanScope::RearmSettled,
-            &mut ungated_3314().0,
-            LogicalMs(crate::agent::dev_modal::MIN_STABLE_MS),
+            &mut gate,
+            LogicalMs(0),
+            &mut spent,
         ),
-        "#3314: a settled agent's re-arm must not fire the dev-channel pattern — after Idle \
-         this text is transcript, and the modal that may be live is the operator's"
+        "first sighting must only schedule, never write"
     );
-    assert!(written.lock().is_empty());
-    // ... and the pattern is genuinely reachable, so the assertion above is
-    // the SCOPE refusing it rather than a regex that never matched.
+    assert!(
+        try_prepared_dismiss_dialog_once_per_spawn(
+            "claude-3314-bound",
+            DEV_CHANNEL_STARTUP_MODAL_3314,
+            &writer,
+            &prepared,
+            DismissScanScope::RearmSettled,
+            &mut gate,
+            LogicalMs(crate::agent::dev_modal::MIN_STABLE_MS),
+            &mut spent,
+        ),
+        "t-20260912171012286674-51827-9: a settled complete live modal with no \
+         competitor must still be answered — the gate (complete-only + \
+         SettledCompetitor veto + daemon-owned facts) now carries the bound \
+         the scope alone used to carry"
+    );
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r",
+        "the dismissal sends exactly one Enter"
+    );
+    // ... and the Startup control still fires, so the pattern's reachability
+    // is unchanged — only the settled scope's verdict moved.
     let (writer, written) = recording_writer_3314();
     assert!(
         try_prepared_dismiss_dialog(
@@ -2507,4 +2546,312 @@ fn issue_468_kiro_real_spawn_dismiss_smoke() {
              reported operator screenshot."
         );
     }
+}
+
+/// t-20260912171012286674-51827-9 RED: a LIVE complete dev-channel modal on a
+/// prompt-blocked pane must still be answerable after the startup latch closed
+/// AND the agent transiently visited Idle before the modal painted (2.1.269
+/// startup behavior: the state machine lands on Idle mid-startup, setting
+/// `ever_idle`, so the scan scope degrades to `RearmSettled` — under which the
+/// dev pattern is not eligible and the gate is never consulted again).
+///
+/// Production shape (daemon.2026-09-12.log + stalled-captures): the generation
+/// consults the gate exactly once (`NoCompleteModal:1`, the half-painted first
+/// frame), then stalls with the complete modal on screen and zero
+/// `dialog dismiss submitted`.
+#[test]
+fn live_dev_modal_after_transient_idle_is_still_answered_269() {
+    let _inline = InlineWrite::arm();
+    let screen = include_str!("../../../tests/fixtures/devchannel-3314/live_modal_2_1_269.txt");
+    assert!(
+        crate::agent::dev_modal::complete_modal_digest(screen).is_some(),
+        "fixture must carry the complete modal or this proves nothing"
+    );
+    let patterns = claude_prepared_patterns_3314();
+    let (writer, bytes) = recording_writer_3314();
+    let mut gate = DevModalGate::new(true);
+    gate.set_prompt_blocked(true);
+    let mut spent = false;
+    // Latch closed + transient Idle visited before the modal painted:
+    // the exact scope the read loop computes for every post-paint frame.
+    let scope = dismiss_scan_scope(false, true);
+    assert_eq!(scope, DismissScanScope::RearmSettled);
+    // Mirror the read loop: the gate learns the settled fact from the scope.
+    gate.set_settled(scope == DismissScanScope::RearmSettled);
+    // First sighting schedules the candidate; the second, past the stability
+    // window, enqueues the single CR (same two-call shape production takes
+    // across two PTY frames — see `ungated_stable_3314`).
+    let first = try_prepared_dismiss_dialog_once_per_spawn(
+        "dev-modal-269-settled",
+        screen,
+        &writer,
+        &patterns,
+        scope,
+        &mut gate,
+        LogicalMs(0),
+        &mut spent,
+    );
+    assert!(
+        !first,
+        "the first sighting must only schedule, never write: {first}"
+    );
+    let fired = try_prepared_dismiss_dialog_once_per_spawn(
+        "dev-modal-269-settled",
+        screen,
+        &writer,
+        &patterns,
+        scope,
+        &mut gate,
+        LogicalMs(crate::agent::dev_modal::MIN_STABLE_MS),
+        &mut spent,
+    );
+    assert!(
+        fired,
+        "a complete live modal on a blocked pane must be answered even after latch+transient-Idle"
+    );
+    assert_eq!(*bytes.lock(), b"\r", "the answer must be a single CR");
+}
+
+/// t-20260912171012286674-51827-9 reverse: under the settled scope a COMPLETE
+/// modal beside a LIVE competing prompt must NOT be answered — the CR would
+/// land on the competitor (#3561 R1 footgun, extended to the complete path).
+/// The trust hint below is settled-eligible (`rearm_past_latch`), so the
+/// competitor fact is really set; the gate must veto with `SettledCompetitor`.
+#[test]
+fn settled_complete_modal_beside_a_live_prompt_is_refused_269() {
+    let _inline = InlineWrite::arm();
+    let live = include_str!("../../../tests/fixtures/devchannel-3314/live_modal.txt");
+    // A complete modal transcript above a live trust prompt holding the pane.
+    let screen =
+        format!("{live}\n  Do you trust the contents of this directory?\n  ❯ Yes, I trust\n");
+    assert!(
+        crate::agent::dev_modal::complete_modal_digest(&screen).is_some(),
+        "the frame must carry the complete modal or this proves nothing"
+    );
+    let patterns = claude_prepared_patterns_3314();
+    let (writer, bytes) = recording_writer_3314();
+    let mut gate = DevModalGate::new(true);
+    gate.set_prompt_blocked(true);
+    gate.set_settled(true);
+    let mut spent = false;
+    for frame in 0..30u64 {
+        let fired = try_prepared_dismiss_dialog_once_per_spawn(
+            "dev-modal-269-competitor",
+            &screen,
+            &writer,
+            &patterns,
+            DismissScanScope::RearmSettled,
+            &mut gate,
+            LogicalMs(frame * 400),
+            &mut spent,
+        );
+        assert!(
+            !fired,
+            "frame {frame}: a settled complete modal beside a live prompt must never be answered"
+        );
+    }
+    assert!(
+        bytes.lock().is_empty(),
+        "no keystroke may reach the competitor prompt: {:?}",
+        *bytes.lock()
+    );
+}
+
+/// PR #3616 rework F1 RED: a replayed or quoted complete dev-channel modal in transcript
+/// alongside an UNKNOWN live prompt must NOT be dismissed when settled.
+///
+/// Reviewer F1:
+/// "settled 下完整 replay/quoted + 未知 live prompt 同屏 → SettledCompetitor 僅認已知 pattern
+/// → CR 誤發。修法前 settled 是拒絕的。要求：settled 下 replay/quoted 不得路由 CR 到未知 prompt；
+/// fingerprint 只作 precision。"
+///
+/// Under settled scope, `self.dev_gated` must NOT be admissible on `RearmSettled`,
+/// so that replay/quoted dev modal text in scrollback cannot trigger dismiss when an unknown
+/// live prompt is holding input.
+#[test]
+fn settled_replay_beside_unknown_live_prompt_is_refused_3616() {
+    let _inline = InlineWrite::arm();
+    let replay = include_str!("../../../tests/fixtures/devchannel-3314/replay.txt");
+    assert!(
+        crate::agent::dev_modal::complete_modal_digest(replay).is_some(),
+        "replay.txt satisfies complete_modal_digest"
+    );
+    // An unknown interactive prompt not recognized by any preset regex:
+    let screen = format!("{replay}\nCustom operator question? [y/N]: \n");
+    let patterns = claude_prepared_patterns_3314();
+    let (writer, bytes) = recording_writer_3314();
+    let mut gate = DevModalGate::new(true);
+    gate.set_prompt_blocked(true);
+    gate.set_settled(true);
+    let mut spent = false;
+
+    let scope = dismiss_scan_scope(false, true);
+    assert_eq!(scope, DismissScanScope::RearmSettled);
+
+    for frame in 0..10u64 {
+        let fired = try_prepared_dismiss_dialog_once_per_spawn(
+            "dev-modal-f1-replay-unknown",
+            &screen,
+            &writer,
+            &patterns,
+            scope,
+            &mut gate,
+            LogicalMs(frame * 400),
+            &mut spent,
+        );
+        assert!(
+            !fired,
+            "frame {frame}: replay beside unknown live prompt must NEVER be dismissed in settled scope"
+        );
+    }
+    assert!(
+        bytes.lock().is_empty(),
+        "F1: no keystroke may be routed to an unknown prompt: {:?}",
+        *bytes.lock()
+    );
+}
+
+/// PR #3616 rework F1-residual RED: a complete dev-channel modal in transcript
+/// followed by an UNKNOWN bullet-prefixed prompt (e.g. `· Custom operator question? [y/N]`)
+/// must NOT be dismissed when settled.
+///
+/// Reviewer F1-residual:
+/// "settled bottom-reach guard 對任意 `·` 尾端行放行（dev_modal.rs:433-457 starts_with('·')），
+/// replay/quoted 後接 `· Custom operator question? [y/N]` 類 bullet 未知 prompt 可誤送 CR。
+/// 要求：settled complete 尾端只接受實際 footer remainder（exact `· Esc to cancel`）與空白行，
+/// 其餘一切非空行一律拒絕。"
+#[test]
+fn settled_replay_beside_bullet_prefixed_live_prompt_is_refused_3616() {
+    let _inline = InlineWrite::arm();
+    let live = include_str!("../../../tests/fixtures/devchannel-3314/live_modal.txt");
+    // Replace the legitimate footer remainder with an unknown bullet-prefixed interactive prompt:
+    let screen = live.replace("· Esc to cancel", "· Custom operator question? [y/N]: ");
+    assert!(
+        crate::agent::dev_modal::complete_modal_digest(&screen).is_some(),
+        "frame satisfies complete_modal_digest"
+    );
+    let patterns = claude_prepared_patterns_3314();
+    let (writer, bytes) = recording_writer_3314();
+    let mut gate = DevModalGate::new(true);
+    gate.set_prompt_blocked(true);
+    gate.set_settled(true);
+    let mut spent = false;
+
+    let scope = dismiss_scan_scope(false, true);
+    assert_eq!(scope, DismissScanScope::RearmSettled);
+
+    for frame in 0..10u64 {
+        let fired = try_prepared_dismiss_dialog_once_per_spawn(
+            "dev-modal-f1-bullet-unknown",
+            &screen,
+            &writer,
+            &patterns,
+            scope,
+            &mut gate,
+            LogicalMs(frame * 400),
+            &mut spent,
+        );
+        assert!(
+            !fired,
+            "frame {frame}: bullet-prefixed unknown prompt must NEVER be dismissed in settled scope"
+        );
+    }
+    assert!(
+        bytes.lock().is_empty(),
+        "F1-residual: no keystroke may be routed to a bullet-prefixed unknown prompt: {:?}",
+        *bytes.lock()
+    );
+}
+
+/// PR #3616 rework F1-footer-prefix RED: a complete dev-channel modal in transcript
+/// followed by an UNKNOWN prompt carrying legitimate footer remainder as prefix
+/// (e.g. `· Esc to cancel — Custom operator question? [y/N]`) must NOT be dismissed when settled.
+///
+/// Reviewer F1-footer-prefix (Generation 3 verdict):
+/// "complete_modal_reaches_bottom 用 starts_with('· Esc to cancel')/starts_with('Esc to cancel')，
+/// 帶合法前綴的未知 prompt（如 `· Esc to cancel — Custom operator question? [y/N]` 或 `Esc to cancel; confirm?`）
+/// 可繞 veto 誤送 CR。
+/// 要求：尾端只接受 exact `· Esc to cancel`、exact `Esc to cancel`（可先 trim）或空白行；
+/// 前綴後附加任何非空字元一律拒絕。"
+#[test]
+fn settled_replay_beside_footer_prefixed_live_prompt_is_refused_3616() {
+    let _inline = InlineWrite::arm();
+    let live = include_str!("../../../tests/fixtures/devchannel-3314/live_modal.txt");
+    // Replace the legitimate footer remainder with an unknown prompt carrying the footer as prefix:
+    let screen = live.replace(
+        "· Esc to cancel",
+        "· Esc to cancel — Custom operator question? [y/N]: ",
+    );
+    assert!(
+        crate::agent::dev_modal::complete_modal_digest(&screen).is_some(),
+        "frame satisfies complete_modal_digest"
+    );
+    let patterns = claude_prepared_patterns_3314();
+    let (writer, bytes) = recording_writer_3314();
+    let mut gate = DevModalGate::new(true);
+    gate.set_prompt_blocked(true);
+    gate.set_settled(true);
+    let mut spent = false;
+
+    let scope = dismiss_scan_scope(false, true);
+    assert_eq!(scope, DismissScanScope::RearmSettled);
+
+    for frame in 0..10u64 {
+        let fired = try_prepared_dismiss_dialog_once_per_spawn(
+            "dev-modal-f1-footer-prefix-unknown",
+            &screen,
+            &writer,
+            &patterns,
+            scope,
+            &mut gate,
+            LogicalMs(frame * 400),
+            &mut spent,
+        );
+        assert!(
+            !fired,
+            "frame {frame}: footer-prefixed unknown prompt must NEVER be dismissed in settled scope"
+        );
+    }
+    assert!(
+        bytes.lock().is_empty(),
+        "F1-footer-prefix: no keystroke may be routed to a footer-prefixed unknown prompt: {:?}",
+        *bytes.lock()
+    );
+}
+
+/// t-20260913064200432164-24626-4 RED:
+/// 首包純 SGR + modal 包不變 state 分類 → 未修前零 consult。
+///
+/// 根因：在 latch 已關閉 (scan_enabled=false) 且 modal 包未被分類為 PermissionPrompt
+/// (prompt_blocked=false) 時，舊邏輯因 pre_idle_dev_modal_visible 在 ever_idle 後失效，
+/// 導致 dismiss_scan_armed 恆為 false，dev-modal 永遠零 consult。
+///
+/// 修法：dev-gated 首 consult 不依賴 state_changed 或 prompt_blocked —— WARNING hint
+/// 出現 (dev_modal_visible=true) 即 consult，精度與安全性由 gate 內 stability/epoch/one-shot 承接。
+#[test]
+fn dev_modal_consult_arms_on_warning_hint_without_state_changed_269() {
+    assert!(
+        !dismiss_scan_armed(
+            /* scan_enabled */ false, /* prompt_blocked */ false,
+            /* state_changed */ true, /* dev_modal_visible */ false,
+        ),
+        "control: without dev_modal_visible, an unblocked frame past latch never arms"
+    );
+
+    assert!(
+        dismiss_scan_armed(
+            /* scan_enabled */ false, /* prompt_blocked */ false,
+            /* state_changed */ false, /* dev_modal_visible */ true,
+        ),
+        "dev-modal WARNING hint must arm dismiss scan even when state_changed is false"
+    );
+    assert!(
+        dismiss_scan_armed(
+            /* scan_enabled */ false,
+            /* prompt_blocked */ false,
+            /* state_changed */ true,
+            /* dev_modal_visible */ true,
+        ),
+        "dev-modal WARNING hint must arm dismiss scan even when modal did not transition prompt state"
+    );
 }

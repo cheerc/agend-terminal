@@ -23,7 +23,7 @@ pub use dismiss::try_dismiss_dialog;
 pub(crate) mod crash_disposition;
 use dismiss::{
     dismiss_scan_armed, dismiss_scan_scope, is_dismissible_prompt_state, prepare_dismiss_patterns,
-    try_prepared_dismiss_dialog_once_per_spawn, PreparedDismissPattern,
+    try_prepared_dismiss_dialog_with_cooldown, PreparedDismissPattern,
 };
 
 pub mod deleting;
@@ -2001,6 +2001,9 @@ fn pty_read_loop(
     // forfeited for this spawn: the pane stays prompt-blocked and visible to
     // the stuck watchdog rather than looping keystrokes into the child.
     let mut backend_startup_hint_spent = false;
+    // t-20260913083736497384-27902-0: remember if the dev-modal WARNING hint was seen
+    // in this generation, so consult stays armed while the modal remains unresolved.
+    let mut dev_modal_hint_seen = false;
     // #t-23: debug-only seam — verbose per-read PTY logging (read counts / byte
     // totals). Off by default; enable with `AGEND_DEBUG_PTY_READ=1`. Tightened
     // from presence-based (`is_ok()`: any value, even `=0`, enabled it) to the
@@ -2115,9 +2118,17 @@ fn pty_read_loop(
                     .map(|t| std::time::Instant::now() < t)
                     .unwrap_or(false);
                 // #3314: a complete pre-Idle dev modal bypasses cooldown and state dedup.
-                let pre_idle_dev_modal_visible = *dev_modal_armed
-                    && !dismiss_agent_ever_idle
-                    && dev_modal::complete_modal_digest(&screen).is_some();
+                // t-20260913064200432164-24626-4 / t-20260913083736497384-27902-0: dev-gated
+                // consult must not depend on `state_changed` or state classification, nor can it
+                // only test the current screen's ephemeral contains() — if the hint was seen in
+                // this spawn generation and remains unresolved, the consult condition stays armed.
+                if *dev_modal_armed && screen.contains("WARNING: Loading development channels") {
+                    dev_modal_hint_seen = true;
+                }
+                let dev_modal_unresolved = dev_modal_hint_seen && !dev_modal_gate.is_answered();
+                let dev_modal_visible = *dev_modal_armed
+                    && (screen.contains("WARNING: Loading development channels")
+                        || dev_modal_unresolved);
                 // #3547 D(ii): hand the gate this frame's prompt-state fact before
                 // it is consulted. It is what distinguishes "the modal is still
                 // painting" from "this pane is blocked on a prompt and the modal
@@ -2131,20 +2142,40 @@ fn pty_read_loop(
                     && !dismiss_agent_ever_idle
                     && agent_state != crate::state::AgentState::AwaitingOperator;
                 dev_modal_gate.set_prompt_blocked(dev_modal_prompt_blocked);
+                // t-20260912171012286674-51827-9: hand the gate the settled-scope
+                // fact it needs to bound itself (complete-only, competitor veto).
+                dev_modal_gate.set_settled(dismiss_agent_ever_idle);
+                // t-20260913052851207170-74631-0 (vii): a repaint-no-op frame
+                // (dedup hit, screen byte-identical) that still carries the
+                // complete modal re-anchors the waiting writer instead of
+                // letting repaint noise cancel it with no retry. Deliberately
+                // outside `dismiss_scan_armed`: no consult, no verdict, no
+                // worker — just the epoch refresh, and only while the modal
+                // is still fully on screen.
+                if !state_changed && dev_modal::complete_modal_digest(&screen).is_some() {
+                    dev_modal_gate.refresh_candidate_epoch();
+                }
+                let dev_modal_cooldown_retry = dev_modal_visible
+                    && in_cooldown
+                    && dismiss_agent_ever_idle
+                    && !dev_modal_gate.is_answered();
+                let admits_dismiss = !in_cooldown
+                    || (dev_modal_visible && !dismiss_agent_ever_idle)
+                    || dev_modal_cooldown_retry;
                 if dismiss_scan_armed(
                     dismiss_scan_enabled,
                     prompt_blocked,
                     state_changed,
-                    pre_idle_dev_modal_visible,
-                ) && (!in_cooldown || pre_idle_dev_modal_visible)
-                    && try_prepared_dismiss_dialog_once_per_spawn(
+                    dev_modal_visible,
+                ) && admits_dismiss
+                    && try_prepared_dismiss_dialog_with_cooldown(
                         name,
                         &screen,
                         pty_writer,
                         dismiss_patterns,
                         // #3314: the cooldown bypass admits only the daemon-caused
                         // startup modal, never runtime approval patterns.
-                        if pre_idle_dev_modal_visible {
+                        if dev_modal_visible && !dismiss_agent_ever_idle {
                             dismiss::DismissScanScope::RearmPreIdle
                         } else {
                             dismiss_scan_scope(dismiss_scan_enabled, dismiss_agent_ever_idle)
@@ -2152,7 +2183,13 @@ fn pty_read_loop(
                         &mut dev_modal_gate,
                         dev_modal::LogicalMs(dev_modal_clock.elapsed().as_millis() as u64),
                         &mut backend_startup_hint_spent,
+                        if dev_modal_cooldown_retry {
+                            dismiss_cooldown_until
+                        } else {
+                            None
+                        },
                     )
+                    && !dev_modal_cooldown_retry
                 {
                     dismiss_cooldown_until =
                         Some(std::time::Instant::now() + dismiss::dismiss_cooldown());

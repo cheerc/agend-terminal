@@ -380,7 +380,17 @@ impl PreparedDismissPattern {
         match scope {
             DismissScanScope::Startup => true,
             DismissScanScope::RearmPreIdle => self.rearm_past_latch || self.rearm_pre_idle,
-            DismissScanScope::RearmSettled => self.rearm_past_latch,
+            // t-20260912171012286674-51827-9: the daemon-caused dev-channel modal
+            // stays eligible past Idle. Its safety never came from the scope —
+            // it comes from the generation gate's daemon-owned facts
+            // (argv flag, epoch, one-shot, 120s window, stability) — and 2.1.269
+            // provokes a transient Idle before the modal paints, which would
+            // otherwise strand the pane (gate never consulted again). Only the
+            // gate-routed (`dev_gated`) class is admitted here, never the
+            // backend-caused startup hints; the gate itself answers a settled
+            // frame on the complete fingerprint only, and refuses beside a live
+            // competitor (`SettledCompetitor`).
+            DismissScanScope::RearmSettled => self.rearm_past_latch || self.dev_gated,
         }
     }
 
@@ -507,6 +517,31 @@ pub fn try_prepared_dismiss_dialog_once_per_spawn(
     now: LogicalMs,
     backend_startup_hint_spent: &mut bool,
 ) -> bool {
+    try_prepared_dismiss_dialog_with_cooldown(
+        name,
+        screen,
+        pty_writer,
+        dismiss_patterns,
+        scope,
+        dev_gate,
+        now,
+        backend_startup_hint_spent,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn try_prepared_dismiss_dialog_with_cooldown(
+    name: &str,
+    screen: &str,
+    pty_writer: &PtyWriter,
+    dismiss_patterns: &[PreparedDismissPattern],
+    scope: DismissScanScope,
+    dev_gate: &mut DevModalGate,
+    now: LogicalMs,
+    backend_startup_hint_spent: &mut bool,
+    cooldown_until: Option<std::time::Instant>,
+) -> bool {
     #[cfg(test)]
     DISMISS_SCAN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
@@ -515,6 +550,11 @@ pub fn try_prepared_dismiss_dialog_once_per_spawn(
     }
 
     for pattern in dismiss_patterns {
+        // When retrying specifically across cooldown, only dev-gated patterns
+        // (with their generation write barriers) are eligible.
+        if cooldown_until.is_some() && !pattern.dev_gated {
+            continue;
+        }
         // #2473/#3314: on a post-latch re-arm, skip everything the scope does
         // not admit — never fire runtime-approval (`Yes, proceed`) off the latch,
         // and admit a daemon-caused startup modal only before the agent settles.
@@ -663,6 +703,8 @@ pub fn try_prepared_dismiss_dialog_once_per_spawn(
                 return true;
             }
             let worker_flight_key = flight_key.clone();
+            let remaining_cooldown = cooldown_until
+                .and_then(|until| until.checked_duration_since(std::time::Instant::now()));
             // fire-and-forget: dialog-dismiss keystroke writer is bounded by the
             // startup eligibility window. It normally waits 300ms; complete
             // repaints restart that stability wait inside this SAME worker. H2:
@@ -677,9 +719,14 @@ pub fn try_prepared_dismiss_dialog_once_per_spawn(
                     let stable_for = std::time::Duration::from_millis(
                         crate::agent::dev_modal::MIN_STABLE_MS,
                     );
+                    let wait_time = if let Some(remaining) = remaining_cooldown {
+                        stable_for.max(remaining)
+                    } else {
+                        stable_for
+                    };
                     if let Some(barrier) = barrier.as_ref() {
                         if !barrier.wait_until_stable(
-                            stable_for,
+                            wait_time,
                             std::time::Duration::from_millis(
                                 crate::agent::dev_modal::ELIGIBILITY_EXPIRY_MS
                                     .saturating_sub(now.0),
@@ -692,7 +739,7 @@ pub fn try_prepared_dismiss_dialog_once_per_spawn(
                             return;
                         }
                     } else {
-                        std::thread::sleep(stable_for);
+                        std::thread::sleep(wait_time);
                     }
                     // #3314 W3: re-check as late as we can. This closes the wide
                     // decide-then-sleep-then-write window, but a check and a
@@ -819,13 +866,18 @@ pub(crate) fn is_dismissible_prompt_state(state: crate::state::AgentState) -> bo
 /// latch. This is false-positive-safe: ordinary conversation that quotes the
 /// phrase does not put the agent into PermissionPrompt/InteractivePrompt, and the
 /// keystroke only fires when the anchored backend regex ALSO matches the frame.
+///
+/// t-20260913064200432164-24626-4: dev-gated consult does not depend on
+/// `state_changed` — WARNING hint visibility (`dev_modal_visible`) arms the gate
+/// directly. Precision, stability, and replay safety are upheld by the generation
+/// gate (daemon-owned argv flag, epoch, 300ms stability window, one-shot receipt).
 pub(crate) fn dismiss_scan_armed(
     scan_enabled: bool,
     prompt_blocked: bool,
     state_changed: bool,
-    pre_idle_dev_modal_visible: bool,
+    dev_modal_visible: bool,
 ) -> bool {
-    pre_idle_dev_modal_visible || (state_changed && (scan_enabled || prompt_blocked))
+    dev_modal_visible || (state_changed && (scan_enabled || prompt_blocked))
 }
 
 #[cfg(test)]
