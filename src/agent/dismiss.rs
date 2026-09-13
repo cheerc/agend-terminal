@@ -517,6 +517,31 @@ pub fn try_prepared_dismiss_dialog_once_per_spawn(
     now: LogicalMs,
     backend_startup_hint_spent: &mut bool,
 ) -> bool {
+    try_prepared_dismiss_dialog_with_cooldown(
+        name,
+        screen,
+        pty_writer,
+        dismiss_patterns,
+        scope,
+        dev_gate,
+        now,
+        backend_startup_hint_spent,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn try_prepared_dismiss_dialog_with_cooldown(
+    name: &str,
+    screen: &str,
+    pty_writer: &PtyWriter,
+    dismiss_patterns: &[PreparedDismissPattern],
+    scope: DismissScanScope,
+    dev_gate: &mut DevModalGate,
+    now: LogicalMs,
+    backend_startup_hint_spent: &mut bool,
+    cooldown_until: Option<std::time::Instant>,
+) -> bool {
     #[cfg(test)]
     DISMISS_SCAN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
@@ -525,6 +550,11 @@ pub fn try_prepared_dismiss_dialog_once_per_spawn(
     }
 
     for pattern in dismiss_patterns {
+        // When retrying specifically across cooldown, only dev-gated patterns
+        // (with their generation write barriers) are eligible.
+        if cooldown_until.is_some() && !pattern.dev_gated {
+            continue;
+        }
         // #2473/#3314: on a post-latch re-arm, skip everything the scope does
         // not admit — never fire runtime-approval (`Yes, proceed`) off the latch,
         // and admit a daemon-caused startup modal only before the agent settles.
@@ -673,6 +703,8 @@ pub fn try_prepared_dismiss_dialog_once_per_spawn(
                 return true;
             }
             let worker_flight_key = flight_key.clone();
+            let remaining_cooldown = cooldown_until
+                .and_then(|until| until.checked_duration_since(std::time::Instant::now()));
             // fire-and-forget: dialog-dismiss keystroke writer is bounded by the
             // startup eligibility window. It normally waits 300ms; complete
             // repaints restart that stability wait inside this SAME worker. H2:
@@ -687,9 +719,14 @@ pub fn try_prepared_dismiss_dialog_once_per_spawn(
                     let stable_for = std::time::Duration::from_millis(
                         crate::agent::dev_modal::MIN_STABLE_MS,
                     );
+                    let wait_time = if let Some(remaining) = remaining_cooldown {
+                        stable_for.max(remaining)
+                    } else {
+                        stable_for
+                    };
                     if let Some(barrier) = barrier.as_ref() {
                         if !barrier.wait_until_stable(
-                            stable_for,
+                            wait_time,
                             std::time::Duration::from_millis(
                                 crate::agent::dev_modal::ELIGIBILITY_EXPIRY_MS
                                     .saturating_sub(now.0),
@@ -702,7 +739,7 @@ pub fn try_prepared_dismiss_dialog_once_per_spawn(
                             return;
                         }
                     } else {
-                        std::thread::sleep(stable_for);
+                        std::thread::sleep(wait_time);
                     }
                     // #3314 W3: re-check as late as we can. This closes the wide
                     // decide-then-sleep-then-write window, but a check and a

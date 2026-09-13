@@ -318,12 +318,16 @@ impl WriteBarrier {
         let deadline = std::time::Instant::now() + max_wait;
         let mut observed_epoch = self.epoch.load(Ordering::SeqCst);
         loop {
-            std::thread::sleep(stable_for);
-            if self.generation_over.load(Ordering::SeqCst)
-                || self.deleted.load(Ordering::SeqCst)
-                || std::time::Instant::now() >= deadline
-            {
-                return false;
+            let step_deadline = std::time::Instant::now() + stable_for;
+            while std::time::Instant::now() < step_deadline {
+                let remaining = step_deadline.saturating_duration_since(std::time::Instant::now());
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(25)));
+                if self.generation_over.load(Ordering::SeqCst)
+                    || self.deleted.load(Ordering::SeqCst)
+                    || std::time::Instant::now() >= deadline
+                {
+                    return false;
+                }
             }
             let current_epoch = self.epoch.load(Ordering::SeqCst);
             if current_epoch != observed_epoch {
@@ -358,6 +362,11 @@ pub(crate) struct LogicalMs(pub u64);
 /// carry the whole modal — a bare marker line is not a modal.
 pub(crate) fn complete_modal_digest(screen: &str) -> Option<u64> {
     digest_of_lines(screen, MODAL_STATIC_LINES)
+}
+
+pub(crate) fn complete_modal_digest_and_end(screen: &str) -> Option<(u64, usize)> {
+    let (digest, _, end) = digest_and_end_of_lines(screen, MODAL_STATIC_LINES)?;
+    Some((digest, end))
 }
 
 /// The relaxed fingerprint: [`MODAL_ANCHOR_LINES`] present, in order.
@@ -419,6 +428,32 @@ fn anchor_reaches_bottom(screen: &str, end: usize) -> bool {
     let expected =
         "❯ 1. I am using this for local development 2. Exit Enter to confirm · Esc to cancel";
     expected.starts_with(&options)
+}
+
+/// Complete modal must reach the bottom of the visible screen text.
+/// The static lines end with "Enter to confirm". After it, only the remainder
+/// of the footer ("· Esc to cancel") and trailing blank lines are permitted.
+/// Any trailing non-blank line indicates that this modal text is embedded in
+/// scrollback/replay transcript or preceded an active competitor prompt.
+fn complete_modal_reaches_bottom(screen: &str, end: usize) -> bool {
+    let tail = &screen[end..];
+    let mut lines = tail.lines();
+    if let Some(first_line) = lines.next() {
+        let trimmed = first_line.trim();
+        if !trimmed.is_empty()
+            && !trimmed.starts_with("· Esc to cancel")
+            && !trimmed.starts_with("Esc to cancel")
+            && !trimmed.starts_with('·')
+        {
+            return false;
+        }
+    }
+    for subsequent_line in lines {
+        if !subsequent_line.trim().is_empty() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Find an ASCII literal while tolerating terminal-induced wrapping inside its
@@ -857,12 +892,16 @@ impl DevModalGate {
             self.candidate = None;
             return self.refuse(Refused::WindowExpired);
         }
-        let (digest, relaxed) = match complete_modal_digest(screen) {
-            Some(digest) => {
-                // t-20260912171012286674-51827-9: under the settled scope a live
-                // competitor beside the modal text vetoes the complete path too —
-                // the CR would land on that prompt, not on the modal (#3561 R1).
-                if self.settled && self.other_prompt_on_screen {
+        let (digest, relaxed) = match complete_modal_digest_and_end(screen) {
+            Some((digest, end)) => {
+                // t-20260912171012286674-51827-9 / PR #3616 F1: under the settled scope
+                // a live competitor beside the modal text, or trailing content indicating
+                // that the modal is in scrollback/replay transcript and not holding the
+                // bottom active prompt, vetoes the complete path too. A CR here would land
+                // on an unclassified operator/live prompt, not on the modal (#3561 R1).
+                if self.settled
+                    && (self.other_prompt_on_screen || !complete_modal_reaches_bottom(screen, end))
+                {
                     self.candidate = None;
                     return self.refuse(Refused::SettledCompetitor);
                 }

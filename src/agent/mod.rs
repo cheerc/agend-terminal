@@ -23,7 +23,7 @@ pub use dismiss::try_dismiss_dialog;
 pub(crate) mod crash_disposition;
 use dismiss::{
     dismiss_scan_armed, dismiss_scan_scope, is_dismissible_prompt_state, prepare_dismiss_patterns,
-    try_prepared_dismiss_dialog_once_per_spawn, PreparedDismissPattern,
+    try_prepared_dismiss_dialog_with_cooldown, PreparedDismissPattern,
 };
 
 pub mod deleting;
@@ -2148,13 +2148,20 @@ fn pty_read_loop(
                 if !state_changed && dev_modal::complete_modal_digest(&screen).is_some() {
                     dev_modal_gate.refresh_candidate_epoch();
                 }
+                let dev_modal_cooldown_retry = dev_modal_visible
+                    && in_cooldown
+                    && dismiss_agent_ever_idle
+                    && !dev_modal_gate.is_answered();
+                let admits_dismiss = !in_cooldown
+                    || (dev_modal_visible && !dismiss_agent_ever_idle)
+                    || dev_modal_cooldown_retry;
                 if dismiss_scan_armed(
                     dismiss_scan_enabled,
                     prompt_blocked,
                     state_changed,
                     dev_modal_visible,
-                ) && (!in_cooldown || (dev_modal_visible && !dismiss_agent_ever_idle))
-                    && try_prepared_dismiss_dialog_once_per_spawn(
+                ) && admits_dismiss
+                    && try_prepared_dismiss_dialog_with_cooldown(
                         name,
                         &screen,
                         pty_writer,
@@ -2169,7 +2176,13 @@ fn pty_read_loop(
                         &mut dev_modal_gate,
                         dev_modal::LogicalMs(dev_modal_clock.elapsed().as_millis() as u64),
                         &mut backend_startup_hint_spent,
+                        if dev_modal_cooldown_retry {
+                            dismiss_cooldown_until
+                        } else {
+                            None
+                        },
                     )
+                    && !dev_modal_cooldown_retry
                 {
                     dismiss_cooldown_until =
                         Some(std::time::Instant::now() + dismiss::dismiss_cooldown());
