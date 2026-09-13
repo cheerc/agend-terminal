@@ -443,7 +443,6 @@ fn complete_modal_reaches_bottom(screen: &str, end: usize) -> bool {
         if !trimmed.is_empty()
             && !trimmed.starts_with("· Esc to cancel")
             && !trimmed.starts_with("Esc to cancel")
-            && !trimmed.starts_with('·')
         {
             return false;
         }
