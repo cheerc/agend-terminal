@@ -1994,6 +1994,9 @@ fn pty_read_loop(
     // forfeited for this spawn: the pane stays prompt-blocked and visible to
     // the stuck watchdog rather than looping keystrokes into the child.
     let mut backend_startup_hint_spent = false;
+    // t-20260913083736497384-27902-0: remember if the dev-modal WARNING hint was seen
+    // in this generation, so consult stays armed while the modal remains unresolved.
+    let mut dev_modal_hint_seen = false;
     // #t-23: debug-only seam — verbose per-read PTY logging (read counts / byte
     // totals). Off by default; enable with `AGEND_DEBUG_PTY_READ=1`. Tightened
     // from presence-based (`is_ok()`: any value, even `=0`, enabled it) to the
@@ -2108,13 +2111,17 @@ fn pty_read_loop(
                     .map(|t| std::time::Instant::now() < t)
                     .unwrap_or(false);
                 // #3314: a complete pre-Idle dev modal bypasses cooldown and state dedup.
-                // t-20260913064200432164-24626-4: dev-gated consult must not depend on
-                // `state_changed` or state classification — the WARNING hint appearing on an
-                // armed generation triggers gate consult directly. Precision, stability, and
-                // replay safety are upheld by the generation gate (argv flag, epoch, stability,
-                // one-shot receipt).
-                let dev_modal_visible =
-                    *dev_modal_armed && screen.contains("WARNING: Loading development channels");
+                // t-20260913064200432164-24626-4 / t-20260913083736497384-27902-0: dev-gated
+                // consult must not depend on `state_changed` or state classification, nor can it
+                // only test the current screen's ephemeral contains() — if the hint was seen in
+                // this spawn generation and remains unresolved, the consult condition stays armed.
+                if *dev_modal_armed && screen.contains("WARNING: Loading development channels") {
+                    dev_modal_hint_seen = true;
+                }
+                let dev_modal_unresolved = dev_modal_hint_seen && !dev_modal_gate.is_answered();
+                let dev_modal_visible = *dev_modal_armed
+                    && (screen.contains("WARNING: Loading development channels")
+                        || dev_modal_unresolved);
                 // #3547 D(ii): hand the gate this frame's prompt-state fact before
                 // it is consulted. It is what distinguishes "the modal is still
                 // painting" from "this pane is blocked on a prompt and the modal

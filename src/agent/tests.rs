@@ -6733,3 +6733,112 @@ fn pty_read_loop_dev_modal_consult_on_warning_hint_without_state_change_269() {
         "dev modal must be dismissed when warning hint appears even if preceded by transient idle and state classification does not transition to PermissionPrompt"
     );
 }
+
+/// t-20260913083736497384-27902-0: Harness 複刻假說 (2) —
+/// Chunk 1 包含 WARNING（半幀），Chunk 2 輸出很多行將 WARNING 頂出 tail 視區。
+/// 在舊代碼（53504fa2）下，screen.contains("WARNING") 變為 false，gate 永不再 consult，
+/// 最終 written 為空，tally 凍結在 NoCompleteModal: 1，完整複刻生產 stall 現象。
+#[test]
+fn pty_read_loop_repro_warning_scrolled_out_of_tail_269() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let chunk1 = b"\x1b[2J\x1b[H  WARNING: Loading development channels\r\n";
+    // 輸出 45 行滾動行將 WARNING 頂出 40 行的 tail 視區，然後輸出 modal 剩餘行
+    let mut chunk2 = Vec::new();
+    for _ in 0..45 {
+        chunk2.extend_from_slice(b"some scrollback noise line\r\n");
+    }
+    chunk2.extend_from_slice(
+        b"\
+  --dangerously-load-development-channels is for local channel development\r\n\
+  only. Do not use this option to run channels you have downloaded off the\r\n\
+  internet.\r\n\
+\r\n\
+  Please use --channels to run a list of approved channels.\r\n\
+\r\n\
+  Channels:   server:agend-claude-channel\r\n\
+\r\n\
+  \xe2\x9d\xaf 1. I am using this for local development\r\n\
+  2. Exit\r\n\
+\r\n\
+  Enter to confirm\r\n",
+    );
+
+    let chunk2: &'static [u8] = Box::leak(chunk2.into_boxed_slice());
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![
+        (chunk1, std::time::Duration::ZERO),
+        (chunk2, std::time::Duration::from_millis(50)),
+        (&[0x1b], std::time::Duration::from_secs(5)),
+    ]);
+
+    assert!(
+        written.lock().is_empty(),
+        "t-20260913083736497384-27902-0 假說 (2) 複刻：WARNING 被頂出 tail 視區後，在舊邏輯下 gate 再無 consult，written 為空且 stall"
+    );
+    let summary =
+        crate::agent::dev_modal::refuse_summary("dev-modal-3333").expect("tally must exist");
+    assert!(summary.contains("answered=0"), "tally must have answered=0");
+    assert!(
+        summary.contains("NoCompleteModal:1"),
+        "tally must reflect exactly one refuse from chunk1"
+    );
+}
+
+/// t-20260913083736497384-27902-0 RED:
+/// 首包半幀（只有 WARNING），中間幀暫時缺少 WARNING（例如中間滾動或噪聲），
+/// 後續幀完整重繪 modal 但處於無狀態轉移幀（state_changed = false）。
+///
+/// 舊代碼缺陷：consult 條件只看當前屏的 contains("WARNING: Loading development channels")，
+/// 一旦中間幀缺少 WARNING，consult 閘門即刻關閉，後續無狀態轉移重繪幀無法觸發 consult，
+/// 導致 modal 停留屏上卻永遠零響應。
+///
+/// 修法：consult 條件不能只看當前屏 —— 記住 hint 見過 (dev_modal_hint_seen) 且 modal 未解
+/// (!dev_modal_gate.is_answered())，在後續完整 modal 出現時持續維持 consult 閘門開啟，
+/// 成功 auto-dismiss 並寫入 Enter (\r)。
+#[test]
+fn pty_read_loop_dev_modal_consult_retains_seen_hint_when_unresolved_269() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    // Chunk 1: 首包半幀（只含 WARNING）
+    let chunk1 = b"\x1b[2J\x1b[H  WARNING: Loading development channels\r\n";
+
+    // Chunk 2: 中間幀（暫時無 WARNING，模擬中間狀態或滾動），且觸發 latch off
+    let chunk2 = b"\x1b[2J\x1b[H\xe2\x9d\xaf some intermediate output without warning\r\n";
+
+    // Chunk 3: 完整 modal 重新繪製（包含 WARNING，採樣自 sub-helper 實際快照）
+    const SNAPSHOT_MODAL: &[u8] = b"\x1b[2J\x1b[H\
+\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\r\n\
+\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\r\n\
+  WARNING: Loading development channels\r\n\
+\r\n\
+  --dangerously-load-development-channels is for local channel development only. Do not use this option to run\r\n\
+  channels you have downloaded off the internet.\r\n\
+\r\n\
+  Please use --channels to run a list of approved channels.\r\n\
+\r\n\
+  Channels: server:agend-claude-channel\r\n\
+\r\n\
+  \xe2\x9d\xaf 1. I am using this for local development\r\n\
+    2. Exit\r\n\
+\r\n\
+  Enter to confirm \xc2\xb7 Esc to cancel\r\n";
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![
+        (chunk1, std::time::Duration::ZERO),
+        (chunk2, std::time::Duration::from_millis(50)),
+        (SNAPSHOT_MODAL, std::time::Duration::from_millis(100)),
+        (b"\x1b[?25h", std::time::Duration::from_millis(150)),
+        (&[0x1b], std::time::Duration::from_secs(5)),
+    ]);
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r",
+        "t-20260913083736497384-27902-0: dev-modal consult 必須記住 hint 見過且未解，在後續完整幀成功 dismiss"
+    );
+}

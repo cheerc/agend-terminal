@@ -747,6 +747,13 @@ impl DevModalGate {
         }
     }
 
+    /// Has this generation answered the dev-channel modal at least once?
+    /// Used by the read loop's consult gate so the consult condition can remember
+    /// that the hint was seen in this spawn while the modal remains unresolved.
+    pub(crate) fn is_answered(&self) -> bool {
+        self.answered.lock().count > 0
+    }
+
     /// #3547 P0-near Task2: claim the per-generation first-Refuse log slot.
     /// Returns true exactly once per generation; observability only, the gate
     /// decision never consults it.
