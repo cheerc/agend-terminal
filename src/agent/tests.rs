@@ -6668,3 +6668,68 @@ fn pty_read_loop_survives_cursor_tail_after_schedule_269() {
         "t-20260913052851207170-74631-0: the repaint tail must refresh the candidate, not kill the only writer"
     );
 }
+
+#[test]
+fn pty_read_loop_dev_modal_after_sgr_and_partial_modal_269() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let raw = include_bytes!("../../tests/fixtures/devchannel-3314/live_modal_2_1_269_80col.raw");
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![
+        (&raw[..43], std::time::Duration::ZERO),
+        (&raw[43..1067], std::time::Duration::from_millis(50)),
+        (&raw[1067..1122], std::time::Duration::from_millis(100)),
+        (&raw[1122..], std::time::Duration::from_millis(150)),
+        (&[0x1b], std::time::Duration::from_secs(5)),
+    ]);
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r",
+        "dev modal must still be dismissed when preceded by pure SGR chunk and partial modal chunk"
+    );
+}
+
+#[test]
+fn pty_read_loop_dev_modal_consult_on_warning_hint_without_state_change_269() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    const DEV_MODAL_WITHOUT_ESC_FOOTER: &[u8] = b"\
+\x1b[2J\x1b[H\
+\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\r\n\
+  WARNING: Loading development channels\r\n\
+\r\n\
+  --dangerously-load-development-channels is for local channel development\r\n\
+  only. Do not use this option to run channels you have downloaded off the\r\n\
+  internet.\r\n\
+\r\n\
+  Please use --channels to run a list of approved channels.\r\n\
+\r\n\
+  Channels:   server:agend-claude-channel\r\n\
+\r\n\
+  \xe2\x9d\xaf 1. I am using this for local development\r\n\
+  2. Exit\r\n\
+\r\n\
+  Enter to confirm\r\n";
+
+    // Chunk 1: transient idle prompt that closes startup latch and sets ever_idle=true
+    // Chunk 2: complete modal but state stays Idle (does not transition to PermissionPrompt)
+    let written = run_dev_modal_pty_read_loop_3333(vec![
+        (b"\x1b[2J\x1b[H\xe2\x9d\xaf ", std::time::Duration::ZERO),
+        (
+            DEV_MODAL_WITHOUT_ESC_FOOTER,
+            std::time::Duration::from_millis(50),
+        ),
+        (b"\x1b[?25h", std::time::Duration::from_millis(100)),
+        (&[0x1b], std::time::Duration::from_secs(5)),
+    ]);
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r",
+        "dev modal must be dismissed when warning hint appears even if preceded by transient idle and state classification does not transition to PermissionPrompt"
+    );
+}

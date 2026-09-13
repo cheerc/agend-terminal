@@ -829,13 +829,18 @@ pub(crate) fn is_dismissible_prompt_state(state: crate::state::AgentState) -> bo
 /// latch. This is false-positive-safe: ordinary conversation that quotes the
 /// phrase does not put the agent into PermissionPrompt/InteractivePrompt, and the
 /// keystroke only fires when the anchored backend regex ALSO matches the frame.
+///
+/// t-20260913064200432164-24626-4: dev-gated consult does not depend on
+/// `state_changed` — WARNING hint visibility (`dev_modal_visible`) arms the gate
+/// directly. Precision, stability, and replay safety are upheld by the generation
+/// gate (daemon-owned argv flag, epoch, 300ms stability window, one-shot receipt).
 pub(crate) fn dismiss_scan_armed(
     scan_enabled: bool,
     prompt_blocked: bool,
     state_changed: bool,
-    pre_idle_dev_modal_visible: bool,
+    dev_modal_visible: bool,
 ) -> bool {
-    pre_idle_dev_modal_visible || (state_changed && (scan_enabled || prompt_blocked))
+    dev_modal_visible || (state_changed && (scan_enabled || prompt_blocked))
 }
 
 #[cfg(test)]

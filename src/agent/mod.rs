@@ -2108,9 +2108,13 @@ fn pty_read_loop(
                     .map(|t| std::time::Instant::now() < t)
                     .unwrap_or(false);
                 // #3314: a complete pre-Idle dev modal bypasses cooldown and state dedup.
-                let pre_idle_dev_modal_visible = *dev_modal_armed
-                    && !dismiss_agent_ever_idle
-                    && dev_modal::complete_modal_digest(&screen).is_some();
+                // t-20260913064200432164-24626-4: dev-gated consult must not depend on
+                // `state_changed` or state classification — the WARNING hint appearing on an
+                // armed generation triggers gate consult directly. Precision, stability, and
+                // replay safety are upheld by the generation gate (argv flag, epoch, stability,
+                // one-shot receipt).
+                let dev_modal_visible =
+                    *dev_modal_armed && screen.contains("WARNING: Loading development channels");
                 // #3547 D(ii): hand the gate this frame's prompt-state fact before
                 // it is consulted. It is what distinguishes "the modal is still
                 // painting" from "this pane is blocked on a prompt and the modal
@@ -2126,13 +2130,7 @@ fn pty_read_loop(
                 dev_modal_gate.set_prompt_blocked(dev_modal_prompt_blocked);
                 // t-20260912171012286674-51827-9: hand the gate the settled-scope
                 // fact it needs to bound itself (complete-only, competitor veto).
-                // Computed from the same scope below: `pre_idle` forces
-                // `RearmPreIdle`, which is never settled by construction.
-                dev_modal_gate.set_settled(
-                    !pre_idle_dev_modal_visible
-                        && dismiss_scan_scope(dismiss_scan_enabled, dismiss_agent_ever_idle)
-                            == dismiss::DismissScanScope::RearmSettled,
-                );
+                dev_modal_gate.set_settled(dismiss_agent_ever_idle);
                 // t-20260913052851207170-74631-0 (vii): a repaint-no-op frame
                 // (dedup hit, screen byte-identical) that still carries the
                 // complete modal re-anchors the waiting writer instead of
@@ -2147,8 +2145,8 @@ fn pty_read_loop(
                     dismiss_scan_enabled,
                     prompt_blocked,
                     state_changed,
-                    pre_idle_dev_modal_visible,
-                ) && (!in_cooldown || pre_idle_dev_modal_visible)
+                    dev_modal_visible,
+                ) && (!in_cooldown || (dev_modal_visible && !dismiss_agent_ever_idle))
                     && try_prepared_dismiss_dialog_once_per_spawn(
                         name,
                         &screen,
@@ -2156,7 +2154,7 @@ fn pty_read_loop(
                         dismiss_patterns,
                         // #3314: the cooldown bypass admits only the daemon-caused
                         // startup modal, never runtime approval patterns.
-                        if pre_idle_dev_modal_visible {
+                        if dev_modal_visible && !dismiss_agent_ever_idle {
                             dismiss::DismissScanScope::RearmPreIdle
                         } else {
                             dismiss_scan_scope(dismiss_scan_enabled, dismiss_agent_ever_idle)

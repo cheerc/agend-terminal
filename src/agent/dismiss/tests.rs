@@ -2656,3 +2656,40 @@ fn settled_complete_modal_beside_a_live_prompt_is_refused_269() {
         *bytes.lock()
     );
 }
+
+/// t-20260913064200432164-24626-4 RED:
+/// 首包純 SGR + modal 包不變 state 分類 → 未修前零 consult。
+///
+/// 根因：在 latch 已關閉 (scan_enabled=false) 且 modal 包未被分類為 PermissionPrompt
+/// (prompt_blocked=false) 時，舊邏輯因 pre_idle_dev_modal_visible 在 ever_idle 後失效，
+/// 導致 dismiss_scan_armed 恆為 false，dev-modal 永遠零 consult。
+///
+/// 修法：dev-gated 首 consult 不依賴 state_changed 或 prompt_blocked —— WARNING hint
+/// 出現 (dev_modal_visible=true) 即 consult，精度與安全性由 gate 內 stability/epoch/one-shot 承接。
+#[test]
+fn dev_modal_consult_arms_on_warning_hint_without_state_changed_269() {
+    assert!(
+        !dismiss_scan_armed(
+            /* scan_enabled */ false, /* prompt_blocked */ false,
+            /* state_changed */ true, /* dev_modal_visible */ false,
+        ),
+        "control: without dev_modal_visible, an unblocked frame past latch never arms"
+    );
+
+    assert!(
+        dismiss_scan_armed(
+            /* scan_enabled */ false, /* prompt_blocked */ false,
+            /* state_changed */ false, /* dev_modal_visible */ true,
+        ),
+        "dev-modal WARNING hint must arm dismiss scan even when state_changed is false"
+    );
+    assert!(
+        dismiss_scan_armed(
+            /* scan_enabled */ false,
+            /* prompt_blocked */ false,
+            /* state_changed */ true,
+            /* dev_modal_visible */ true,
+        ),
+        "dev-modal WARNING hint must arm dismiss scan even when modal did not transition prompt state"
+    );
+}
