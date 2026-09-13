@@ -2711,6 +2711,58 @@ fn settled_replay_beside_unknown_live_prompt_is_refused_3616() {
     );
 }
 
+/// PR #3616 rework F1-residual RED: a complete dev-channel modal in transcript
+/// followed by an UNKNOWN bullet-prefixed prompt (e.g. `· Custom operator question? [y/N]`)
+/// must NOT be dismissed when settled.
+///
+/// Reviewer F1-residual:
+/// "settled bottom-reach guard 對任意 `·` 尾端行放行（dev_modal.rs:433-457 starts_with('·')），
+/// replay/quoted 後接 `· Custom operator question? [y/N]` 類 bullet 未知 prompt 可誤送 CR。
+/// 要求：settled complete 尾端只接受實際 footer remainder（exact `· Esc to cancel`）與空白行，
+/// 其餘一切非空行一律拒絕。"
+#[test]
+fn settled_replay_beside_bullet_prefixed_live_prompt_is_refused_3616() {
+    let _inline = InlineWrite::arm();
+    let live = include_str!("../../../tests/fixtures/devchannel-3314/live_modal.txt");
+    // Replace the legitimate footer remainder with an unknown bullet-prefixed interactive prompt:
+    let screen = live.replace("· Esc to cancel", "· Custom operator question? [y/N]: ");
+    assert!(
+        crate::agent::dev_modal::complete_modal_digest(&screen).is_some(),
+        "frame satisfies complete_modal_digest"
+    );
+    let patterns = claude_prepared_patterns_3314();
+    let (writer, bytes) = recording_writer_3314();
+    let mut gate = DevModalGate::new(true);
+    gate.set_prompt_blocked(true);
+    gate.set_settled(true);
+    let mut spent = false;
+
+    let scope = dismiss_scan_scope(false, true);
+    assert_eq!(scope, DismissScanScope::RearmSettled);
+
+    for frame in 0..10u64 {
+        let fired = try_prepared_dismiss_dialog_once_per_spawn(
+            "dev-modal-f1-bullet-unknown",
+            &screen,
+            &writer,
+            &patterns,
+            scope,
+            &mut gate,
+            LogicalMs(frame * 400),
+            &mut spent,
+        );
+        assert!(
+            !fired,
+            "frame {frame}: bullet-prefixed unknown prompt must NEVER be dismissed in settled scope"
+        );
+    }
+    assert!(
+        bytes.lock().is_empty(),
+        "F1-residual: no keystroke may be routed to a bullet-prefixed unknown prompt: {:?}",
+        *bytes.lock()
+    );
+}
+
 /// t-20260913064200432164-24626-4 RED:
 /// 首包純 SGR + modal 包不變 state 分類 → 未修前零 consult。
 ///
