@@ -22,6 +22,41 @@ pub(crate) mod spawn;
 /// boundary, before the allocation and the CREATE_TEAM RPC.
 const MAX_TEAM_COUNT: usize = 64;
 
+/// Restart/TUI 交接確認 budget（秒）。App 側 2s 輪詢 + pane 重建 + 連接，
+/// 10s 寬裕；MCP SLOW timeout 60s 內，不會拖死調用方。
+const TUI_HANDOFF_BUDGET_SECS: u64 = 10;
+const TUI_HANDOFF_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(TUI_HANDOFF_BUDGET_SECS);
+
+/// 等新 generation 的 TUI listener 被 client 連上（bounded poll）。
+/// 以 spawn 時刻為 generation 邊界：只認此後連上**當前 port 文件所載 port**
+/// 的連接，舊 generation 的殘留連接不算。port 文件缺失/不可讀 → false
+///（交接未確認，不說謊）。`budget` 可注入，測試用短 budget。
+fn await_tui_handoff(home: &Path, name: &str, budget: std::time::Duration) -> bool {
+    await_tui_handoff_at(home, name, budget, std::time::Instant::now())
+}
+
+fn await_tui_handoff_at(
+    home: &Path,
+    name: &str,
+    budget: std::time::Duration,
+    since: std::time::Instant,
+) -> bool {
+    let deadline = since + budget;
+    loop {
+        let run_dir = crate::daemon::run_dir(home);
+        if let Some(port) = crate::ipc::read_port(&run_dir, name) {
+            if crate::daemon::tui_client_connected_since(port, since) {
+                return true;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 pub(super) fn handle_create_instance(
     home: &Path,
     args: &Value,
@@ -674,8 +709,19 @@ pub(super) fn handle_restart_instance_with_runtime(
         .map(|r| r["ok"].as_bool() == Some(true))
         .unwrap_or(false);
 
-    tracing::info!(%name, %reason, %mode, %spawned, "restart_instance");
-    let mut resp = json!({"name": name, "reason": reason, "mode": mode, "spawned": spawned});
+    // Restart/TUI 交接確認：spawn 成功只證明 process 層起來了（20:24 事件：
+    // daemon 側 spawned=true、新 TUI socket 就緒，但 app 側全程無接管）。
+    // 等新 generation 的 TUI listener 被 client 連上（bounded poll）才算交接；
+    // 超時則如實報 tui_handoff:false（process 事實 spawned 保留，不說謊）。
+    let tui_handoff = spawned && await_tui_handoff(home, name, TUI_HANDOFF_BUDGET);
+
+    tracing::info!(%name, %reason, %mode, %spawned, tui_handoff, "restart_instance");
+    let mut resp = json!({"name": name, "reason": reason, "mode": mode, "spawned": spawned, "tui_handoff": tui_handoff});
+    if spawned && !tui_handoff {
+        resp["tui_handoff_warning"] = json!(format!(
+            "instance '{name}' spawned but no TUI client connected to its new listener within {TUI_HANDOFF_BUDGET_SECS}s — the pane may be stale; check the TUI roster sync"
+        ));
+    }
     // #3538: exact-thread resume signal (boolean only — never leaks the id).
     if codex_thread {
         resp["resumed_thread"] = json!(true);
