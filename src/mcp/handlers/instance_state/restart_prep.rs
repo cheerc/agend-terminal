@@ -208,7 +208,7 @@ fn await_tui_handoff_at(
     loop {
         let run_dir = crate::daemon::run_dir(home);
         if let Some(port) = crate::ipc::read_port(&run_dir, name) {
-            if crate::daemon::tui_client_connected_since(port, since) {
+            if crate::daemon::tui_bridge::tui_client_connected_since(port, since) {
                 return true;
             }
         }

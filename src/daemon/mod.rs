@@ -54,7 +54,7 @@ pub(crate) mod task_progress;
 pub(crate) mod task_sweep;
 pub(crate) mod tick_stall;
 pub(crate) mod ticker;
-mod tui_bridge;
+pub(crate) mod tui_bridge;
 pub(crate) mod usage_limit;
 pub(crate) mod utils;
 pub(crate) mod waiting_on_stale;
@@ -62,9 +62,6 @@ pub(crate) mod watchdog;
 
 use crate::agent::{self, AgentRegistry};
 pub use tui_bridge::serve_agent_tui;
-// Restart/TUI 交接確認：restart 回報側讀新 generation 的 TUI 連接信號。
-// note_* 留在 tui_bridge 模組內使用，不再匯出（unused re-export 會炸 -D warnings）。
-pub(crate) use tui_bridge::tui_client_connected_since;
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
