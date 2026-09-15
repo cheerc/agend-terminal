@@ -608,6 +608,67 @@ fn dirty_worktree(tag: &str) -> std::path::PathBuf {
 }
 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
+fn marker_only_worktree(tag: &str) -> std::path::PathBuf {
+    let wt = std::env::temp_dir().join(format!(
+        "agend-3617-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&wt).unwrap();
+    let status = std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&wt)
+        .env("AGEND_GIT_BYPASS", "1")
+        .status()
+        .expect("git init");
+    assert!(status.success(), "git init failed");
+    // No .gitignore: the marker is intentionally visible as root `?? .agend-managed`.
+    std::fs::write(wt.join(crate::worktree_pool::MANAGED_MARKER), "agent=dev\n").unwrap();
+    wt
+}
+
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn tracked_marker_worktree(tag: &str) -> std::path::PathBuf {
+    let wt = std::env::temp_dir().join(format!(
+        "agend-3617-tracked-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&wt).unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&wt)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git")
+    };
+    assert!(git(&["init", "-b", "main"]).status.success());
+    std::fs::write(wt.join(crate::worktree_pool::MANAGED_MARKER), "agent=dev\n").unwrap();
+    assert!(git(&["add", crate::worktree_pool::MANAGED_MARKER])
+        .status
+        .success());
+    assert!(git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "track marker"
+    ])
+    .status
+    .success());
+    wt
+}
+
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 fn bind_worktree(home: &std::path::Path, agent: &str, wt: &std::path::Path) {
     let dir = crate::paths::runtime_dir(home).join(agent);
     std::fs::create_dir_all(&dir).unwrap();
@@ -664,6 +725,102 @@ fn fresh_restart_guards_uncommitted_worktree_2476() {
     assert_ne!(
         resumed["code"], "uncommitted_work_at_risk",
         "resume must not guard: {resumed}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&wt).ok();
+}
+
+/// #3617: a fresh restart must not mistake the daemon's regenerable marker
+/// for stranded user work when the marker is the only dirty path.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn fresh_restart_allows_marker_only_worktree_3617() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-3617-home-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    let wt = marker_only_worktree("marker-only");
+    bind_worktree(&home, "dev", &wt);
+
+    let result = handle_restart_instance(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "fresh"}),
+    );
+    assert_ne!(
+        result["code"], "uncommitted_work_at_risk",
+        "marker-only dirt must pass the fresh-restart guard: {result}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&wt).ok();
+}
+
+/// #3617: tracked marker edits are user work, even though the path matches
+/// the daemon's regenerable marker name. Cover unstaged, staged, and deleted
+/// tracked-marker states through the real fresh-restart entry point.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn fresh_restart_refuses_tracked_marker_worktree_3617() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-3617-tracked-home-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  dev:\n    backend: claude\n",
+    )
+    .unwrap();
+    let wt = tracked_marker_worktree("tracked");
+    bind_worktree(&home, "dev", &wt);
+
+    std::fs::write(wt.join(crate::worktree_pool::MANAGED_MARKER), "changed\n").unwrap();
+    let modified = handle_restart_instance(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "fresh"}),
+    );
+    assert_eq!(
+        modified["code"], "uncommitted_work_at_risk",
+        "got: {modified}"
+    );
+
+    let add = std::process::Command::new("git")
+        .args(["add", crate::worktree_pool::MANAGED_MARKER])
+        .current_dir(&wt)
+        .env("AGEND_GIT_BYPASS", "1")
+        .status()
+        .unwrap();
+    assert!(add.success(), "git add failed");
+    let staged = handle_restart_instance(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "fresh"}),
+    );
+    assert_eq!(staged["code"], "uncommitted_work_at_risk", "got: {staged}");
+
+    let deleted = std::process::Command::new("git")
+        .args(["rm", "-f", crate::worktree_pool::MANAGED_MARKER])
+        .current_dir(&wt)
+        .env("AGEND_GIT_BYPASS", "1")
+        .status()
+        .unwrap();
+    assert!(deleted.success(), "git rm failed");
+    let removed = handle_restart_instance(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "fresh"}),
+    );
+    assert_eq!(
+        removed["code"], "uncommitted_work_at_risk",
+        "got: {removed}"
     );
 
     std::fs::remove_dir_all(&home).ok();
