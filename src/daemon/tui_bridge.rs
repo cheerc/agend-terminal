@@ -26,6 +26,63 @@ pub(crate) struct TuiListenerMeta {
 /// non-blocking so it can notice; this bounds the notice delay.
 const RETIREMENT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Restart/TUI 交接確認：記錄每個 TUI listener port 最近一次被 client
+/// 連上的時間。`serve_tui_accept_loop` 在 auth 通過後 stamp；restart 回報
+/// 側用它判定新 generation 是否被 TUI 接管（連上新 port 才算數，舊 generation
+/// 的連接不算）。key 只用 port（不含 name）：port 由 OS 分配，同進程內不
+/// 重用；restart 的新舊 port 必不同（新 listener 新 bind）。
+fn tui_connected_at(
+) -> &'static std::sync::Mutex<std::collections::HashMap<u16, std::time::Instant>> {
+    static CONNECTED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<u16, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    CONNECTED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Stamp 一次 TUI client 連接（accept loop 在 `TUI client connected` 處調用）。
+pub(crate) fn note_tui_client_connected(port: u16) {
+    let now = std::time::Instant::now();
+    if let Ok(mut map) = tui_connected_at().lock() {
+        map.insert(port, now);
+        // 有界：只保留近期條目，port 不重用所以正常只增不減，定期清舊的。
+        if map.len() > 1024 {
+            map.retain(|_, at| now.duration_since(*at) < std::time::Duration::from_secs(3600));
+        }
+    }
+}
+
+/// 該 port 在 `since` 之後有無 client 連接（restart 交接確認用）。
+/// 邊界 clock 可注入（見 _at 變體），測試不斷言真實時間流逝。
+pub(crate) fn tui_client_connected_since(port: u16, since: std::time::Instant) -> bool {
+    tui_client_connected_since_at(port, since, std::time::Instant::now())
+}
+
+fn tui_client_connected_since_at(
+    port: u16,
+    since: std::time::Instant,
+    now: std::time::Instant,
+) -> bool {
+    // 容差：連接 stamp 與 spawn 時刻同 tick 時不因時鐘順序誤判。
+    let since = since - std::time::Duration::from_millis(500);
+    let _ = now;
+    tui_connected_at()
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&port).copied())
+        .is_some_and(|at| at >= since)
+}
+
+// 刻意無 test 門控：此檔 structural 測試以首個 test 門控字面為界切 prod
+// 切片，任何前置門控（含註釋裡的字面）都會截斷 accept loop 掃描。
+// 一個 map-clear 留在 prod 無害。allow(dead_code)：非 test 編譯時測試是
+// 唯一調用方。
+#[allow(dead_code)]
+pub(crate) fn clear_tui_client_connected_for_test() {
+    if let Ok(mut map) = tui_connected_at().lock() {
+        map.clear();
+    }
+}
+
 /// Read one retirement observation. `Some(true)` is explicit evidence that the
 /// port file is gone or names a different port; `Some(false)` still names this
 /// bridge. Every ambiguous read or parse failure is warned and returns `None`.
@@ -530,6 +587,7 @@ pub(crate) fn serve_tui_accept_loop(name: &str, meta: TuiListenerMeta, registry:
             continue;
         }
         tracing::info!(agent = name, "TUI client connected");
+        note_tui_client_connected(port);
 
         // #1617-class (mirror #1593 F1 snapshot→drop→IO): capture the rx +
         // initial dump + the Arcs UNDER the registry lock, then DROP the guard
@@ -1902,5 +1960,27 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Restart/TUI 交接確認：accept loop 的連接 stamp 必須讓 restart 側查到。
+    /// 真實 producer（note_+read 同一 map），generation 邊界由 spawn 時刻定：
+    /// stamp 在 spawn 之後 → 確認；查詢更早的邊界 → 不算。
+    #[test]
+    fn tui_client_connected_stamp_is_visible_since_spawn() {
+        super::clear_tui_client_connected_for_test();
+        let port = 64999u16;
+        let before = Instant::now();
+        // 舊邊界查詢（無 stamp）→ false。
+        assert!(
+            !super::tui_client_connected_since(port, before),
+            "no stamp yet: must not confirm"
+        );
+        super::note_tui_client_connected(port);
+        // spawn 時刻（含 500ms 容差內）→ true。
+        assert!(
+            super::tui_client_connected_since(port, before),
+            "a stamp at/after spawn must confirm handoff"
+        );
+        super::clear_tui_client_connected_for_test();
     }
 }

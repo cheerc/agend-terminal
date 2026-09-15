@@ -55,7 +55,7 @@ pub(crate) mod task_progress;
 pub(crate) mod task_sweep;
 pub(crate) mod tick_stall;
 pub(crate) mod ticker;
-mod tui_bridge;
+pub(crate) mod tui_bridge;
 pub(crate) mod usage_limit;
 pub(crate) mod utils;
 pub(crate) mod waiting_on_stale;
