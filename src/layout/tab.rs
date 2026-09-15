@@ -119,13 +119,56 @@ impl Tab {
     /// `render_tab_bar` (the rendered span) and `tab_bar_hit_test` (its width) so the
     /// two can never drift on the label — a render-only widener the hit-test didn't
     /// count was the #777 misaligned-click bug.
+    #[allow(dead_code)]
     pub fn tab_bar_label(&self, is_active: bool) -> String {
+        self.tab_bar_label_with_team(is_active, None)
+    }
+
+    pub fn tab_bar_label_with_team(
+        &self,
+        is_active: bool,
+        team_view: Option<&crate::team_view::TeamView>,
+    ) -> String {
         let notif_badge = if self.root().has_notification() && !is_active {
             " !"
         } else {
             ""
         };
-        format!(" {}{notif_badge} ", self.name)
+        let pane_ids = self.root().pane_ids();
+        let members: Vec<&str> = pane_ids
+            .iter()
+            .filter_map(|id| {
+                self.root()
+                    .find_pane(*id)
+                    .and_then(|pane| pane.fleet_instance_name.as_deref())
+            })
+            .collect();
+        let all_have_identity = members.len() == pane_ids.len();
+        let name = team_view
+            .filter(|_| all_have_identity)
+            .and_then(|view| view.authoritative_tab_name(members.iter().copied()))
+            .unwrap_or(self.name.as_str());
+        let lead_badge = team_view
+            .filter(|_| all_have_identity)
+            .and_then(|view| {
+                let lead = view.authoritative_lead_for_members(members.iter().copied())?;
+                let pane = pane_ids.iter().find_map(|id| {
+                    self.root()
+                        .find_pane(*id)
+                        .filter(|pane| pane.fleet_instance_name.as_deref() == Some(lead))
+                });
+                let badge = match pane {
+                    Some(pane) => view.badge(lead, pane.instance_ref.as_ref()),
+                    None => view.badge(lead, None),
+                };
+                match badge {
+                    crate::team_view::LeadBadge::Lead => Some(" [LEAD]"),
+                    crate::team_view::LeadBadge::Uncertain => Some(" [LEAD?]"),
+                    crate::team_view::LeadBadge::None => None,
+                }
+            })
+            .unwrap_or("");
+        format!(" {name}{lead_badge}{notif_badge} ")
     }
 
     pub fn focused_pane(&self) -> Option<&Pane> {
@@ -307,9 +350,19 @@ impl Tab {
     /// Title occupies columns [px+1, px+1+label_len+2) — matches the ` {label} `
     /// rendering in render_pane. Agent state suffix (` [state] `) is excluded so
     /// that clicks on it fall through to split-border resize.
+    #[allow(dead_code)]
     pub fn title_bar_at(&self, col: u16, row: u16) -> Option<usize> {
+        self.title_bar_at_with_team(col, row, None)
+    }
+
+    pub fn title_bar_at_with_team(
+        &self,
+        col: u16,
+        row: u16,
+        team_view: Option<&crate::team_view::TeamView>,
+    ) -> Option<usize> {
         use unicode_width::UnicodeWidthStr;
-        for (&id, &(px, py, _pw, _ph)) in &self.pane_rects {
+        for (&id, &(px, py, pw, _ph)) in &self.pane_rects {
             if row != py {
                 continue;
             }
@@ -320,9 +373,31 @@ impl Tab {
             // Hit area covers only the rendered ` {label} ` region starting
             // at px+1 (first col is the border glyph). Clicks outside the
             // label text fall through to border resize handling.
-            let label_w = UnicodeWidthStr::width(pane.label()) as u16;
+            let available = pw.saturating_sub(2);
+            let base_w = UnicodeWidthStr::width(pane.label()) as u16 + 1;
+            let badge_w = pane
+                .fleet_instance_name
+                .as_deref()
+                .zip(team_view)
+                .and_then(
+                    |(name, view)| match view.badge(name, pane.instance_ref.as_ref()) {
+                        crate::team_view::LeadBadge::Lead => {
+                            Some(UnicodeWidthStr::width(" [LEAD]"))
+                        }
+                        crate::team_view::LeadBadge::Uncertain => {
+                            Some(UnicodeWidthStr::width(" [LEAD?]"))
+                        }
+                        crate::team_view::LeadBadge::None => None,
+                    },
+                )
+                .map(|width| width as u16);
+            let hit_width = match badge_w {
+                Some(badge_w) if available <= badge_w => available,
+                Some(badge_w) => base_w.min(available - badge_w) + badge_w,
+                None => base_w + 1,
+            };
             let hit_start = px + 1;
-            let hit_end = hit_start + label_w + 2; // leading space + label + trailing space
+            let hit_end = hit_start + hit_width;
             if col >= hit_start && col < hit_end {
                 return Some(id);
             }
@@ -481,6 +556,52 @@ mod tests {
         for col in 1..11 {
             assert_eq!(tab.title_bar_at(col, 0), Some(1), "col {col}");
         }
+    }
+
+    #[test]
+    fn title_bar_hit_test_includes_authoritative_badge() {
+        let lead_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 1);
+        let mut pane = leaf(1, "lead");
+        pane.fleet_instance_name = Some("lead".into());
+        pane.instance_ref = Some(lead_ref);
+        let mut tab = tab_with_pane("lead", 1, (0, 0, 20, 10));
+        tab.root = Some(PaneNode::Leaf(Box::new(pane)));
+        let config: crate::fleet::FleetConfig = serde_yaml_ng::from_str(
+            "teams:\n  ops:\n    members: [lead]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+        let mut roster = std::collections::HashMap::new();
+        roster.insert("lead".to_string(), lead_ref);
+        let view = crate::team_view::TeamView::from_fleet(config, Some(roster));
+
+        assert_eq!(
+            tab.title_bar_at_with_team(11, 0, Some(&view)),
+            Some(1),
+            "clicking the rendered [LEAD] suffix must select the pane title"
+        );
+    }
+
+    #[test]
+    fn member_only_team_tab_shows_uncertain_badge_when_lead_is_offline_3629() {
+        let member_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 2);
+        let mut pane = leaf(1, "member");
+        pane.fleet_instance_name = Some("member".into());
+        pane.instance_ref = Some(member_ref);
+        let mut tab = tab_with_pane("member", 1, (0, 0, 20, 10));
+        tab.root = Some(PaneNode::Leaf(Box::new(pane)));
+        let config: crate::fleet::FleetConfig = serde_yaml_ng::from_str(
+            "teams:\n  ops:\n    members: [lead, member]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+        let mut roster = std::collections::HashMap::new();
+        roster.insert("member".to_string(), member_ref);
+        let view = crate::team_view::TeamView::from_fleet(config, Some(roster));
+
+        assert_eq!(
+            tab.tab_bar_label_with_team(true, Some(&view)),
+            " ops [LEAD?] ",
+            "a team tab without its online lead must expose uncertainty"
+        );
     }
     #[test]
     fn split_at_pane_targets_non_focused_pane() {
