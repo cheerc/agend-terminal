@@ -336,6 +336,13 @@ pub(crate) fn tab_complete(
 /// completion list) — `command_specs_match_execute_arms_bidirectional` asserts the
 /// two sets are exactly equal (both directions).
 pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
+    execute_with_restart(cmd, ctx, super::rpc::restart_instance)
+}
+
+fn execute_with_restart<F>(cmd: &str, ctx: &mut CommandCtx<'_>, restart_instance: F) -> bool
+where
+    F: Fn(&Path, &str) -> Result<(), String>,
+{
     let parts: Vec<&str> = cmd.trim().splitn(3, ' ').collect();
     if parts.is_empty() {
         return false;
@@ -459,18 +466,22 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                 // Single pass: find pane info, fleet name, and location
                 #[allow(clippy::type_complexity)]
                 let mut pane_info: Option<(
-                    String,
+                    Option<String>,
                     Option<PathBuf>,
                     Option<String>,
                     Option<String>,
+                    bool,
                 )> = None;
                 let mut pane_loc: Option<(usize, usize)> = None;
                 'outer: for (ti, tab) in ctx.layout.tabs.iter().enumerate() {
                     for id in tab.root().pane_ids() {
                         if let Some(p) = tab.root().find_pane(id) {
                             if p.agent_name.as_str() == name {
+                                let is_remote =
+                                    matches!(&p.source, crate::layout::PaneSource::Remote(_, _));
                                 let cmd = match &p.backend {
-                                    Some(b) => b.preset().command.to_string(),
+                                    Some(b) => Some(b.preset().command.to_string()),
+                                    None if is_remote => None,
                                     None => {
                                         tracing::warn!(agent = name, "cannot restart shell pane");
                                         break 'outer;
@@ -481,6 +492,7 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                                     p.working_dir.clone(),
                                     p.display_name.clone(),
                                     p.fleet_instance_name.clone(),
+                                    is_remote,
                                 ));
                                 pane_loc = Some((ti, id));
                                 break 'outer;
@@ -489,7 +501,40 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                     }
                 }
 
-                if let Some((backend_cmd, work_dir, display_name, fleet_name)) = pane_info {
+                if let Some((backend_cmd, work_dir, display_name, fleet_name, is_remote)) =
+                    pane_info
+                {
+                    if is_remote {
+                        let Some(fleet_name) = fleet_name.as_deref() else {
+                            tracing::warn!(
+                                agent = name,
+                                "cannot restart remote pane without fleet instance identity"
+                            );
+                            return false;
+                        };
+                        match restart_instance(ctx.home, fleet_name) {
+                            Ok(()) => {
+                                tracing::info!(
+                                    agent = name,
+                                    fleet_instance = fleet_name,
+                                    "requested daemon-owned remote restart"
+                                );
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    agent = name,
+                                    fleet_instance = fleet_name,
+                                    error = %error,
+                                    "daemon-owned remote restart failed"
+                                );
+                            }
+                        }
+                        return false;
+                    }
+
+                    let Some(backend_cmd) = backend_cmd else {
+                        return false;
+                    };
                     super::kill_agent(ctx.home, ctx.registry, &name);
 
                     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
@@ -751,6 +796,88 @@ mod tests {
         }
     }
 
+    fn remote_test_pane(id: usize, agent: &str, fleet_name: &str) -> (Pane, std::net::TcpStream) {
+        use std::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind((crate::ipc::LOOPBACK, 0)).expect("bind test bridge");
+        let client_stream = TcpStream::connect(listener.local_addr().expect("listener addr"))
+            .expect("connect test bridge");
+        let (server_stream, _) = listener.accept().expect("accept test bridge");
+        let client = crate::bridge_client::BridgeClient::from_stream_for_test(client_stream);
+        let mut pane = test_pane(id, agent, Some(fleet_name));
+        pane.source = PaneSource::Remote(
+            std::sync::Arc::new(parking_lot::Mutex::new(client)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        (pane, server_stream)
+    }
+
+    /// RED for #3642: the real command dispatcher must hand a daemon-owned
+    /// Remote pane to the daemon, even when the local pane has no backend.
+    #[test]
+    fn tui_restart_remote_real_command_entry_uses_daemon_authority() {
+        let registry = empty_registry();
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut layout = Layout::new();
+        let (remote, _server) = remote_test_pane(7, "agent", "fleet-agent");
+        layout.add_tab(Tab::new("agent".to_string(), remote));
+        let mut name_counter = HashMap::new();
+        let mut ctx = CommandCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: Path::new("/home"),
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+        };
+        let calls = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let calls_for_restart = std::sync::Arc::clone(&calls);
+
+        let resized = execute_with_restart("restart agent", &mut ctx, move |_home, name| {
+            calls_for_restart.lock().push(name.to_string());
+            Ok(())
+        });
+
+        assert!(
+            !resized,
+            "daemon restart does not replace the layout locally"
+        );
+        assert_eq!(&*calls.lock(), &["fleet-agent"]);
+        assert_eq!(layout.tabs.len(), 1);
+        let pane = layout.tabs[0]
+            .root()
+            .find_pane(7)
+            .expect("remote pane retained until daemon roster refresh");
+        assert!(matches!(pane.source, PaneSource::Remote(_, _)));
+    }
+
+    #[test]
+    fn tui_restart_remote_rpc_failure_keeps_existing_pane() {
+        let registry = empty_registry();
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut layout = Layout::new();
+        let (remote, _server) = remote_test_pane(8, "agent", "fleet-agent");
+        layout.add_tab(Tab::new("agent".to_string(), remote));
+        let mut name_counter = HashMap::new();
+        let mut ctx = CommandCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: Path::new("/home"),
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+        };
+
+        let resized = execute_with_restart("restart agent", &mut ctx, |_home, _name| {
+            Err("daemon unavailable".to_string())
+        });
+
+        assert!(!resized);
+        assert_eq!(layout.tabs.len(), 1);
+        assert!(layout.tabs[0].root().find_pane(8).is_some());
+        assert!(layout.tabs[0]
+            .root()
+            .find_pane(8)
+            .is_some_and(|pane| matches!(pane.source, PaneSource::Remote(_, _))));
+    }
+
     #[test]
     fn remove_agent_pane_closes_single_pane_tab() {
         let mut layout = Layout::new();
@@ -935,9 +1062,10 @@ mod tests {
     /// Source-scan, NOT live `execute` calls (`spawn`/`restart` fork real PTY
     /// processes); pure + cross-platform. Two precision measures vs a naive
     /// substring scan:
-    /// 1. Bound to the `execute` fn body (`fn execute(` → next top-level `fn`), so
-    ///    `handle_config_command`'s `Some("get")`/`Some("set")` sub-arms and the
-    ///    test module don't leak in.
+    /// 1. Bound to the command-dispatch helper's body (`fn execute_with_restart(`
+    ///    → next top-level `fn`), so the thin production entry wrapper and
+    ///    `handle_config_command`'s `Some("get")`/`Some("set")` sub-arms don't
+    ///    leak in.
     /// 2. Match a quoted keyword ONLY when immediately followed by `|` (group arm)
     ///    or `=>` (arm body). This excludes non-arm literals like
     ///    `unwrap_or(&"agent")` and `Some("get")` (both followed by `)`), which a
@@ -946,10 +1074,14 @@ mod tests {
     fn command_specs_match_execute_arms_bidirectional() {
         use std::collections::BTreeSet;
         let src = include_str!("commands.rs");
+        assert!(
+            src.contains("execute_with_restart(cmd, ctx, super::rpc::restart_instance)"),
+            "execute must delegate to the production restart authority"
+        );
         let from_execute = src
-            .split_once("fn execute(cmd:")
+            .split_once("fn execute_with_restart<")
             .map(|(_, rest)| rest)
-            .expect("execute fn must exist");
+            .expect("execute_with_restart fn must exist");
         let exec_body = from_execute
             .split_once("\nfn ")
             .map(|(body, _)| body)

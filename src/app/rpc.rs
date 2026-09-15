@@ -200,6 +200,44 @@ pub(super) fn create_instance(
     )
 }
 
+/// Restart a daemon-owned instance through the authenticated daemon API.
+pub(super) fn restart_instance(home: &Path, name: &str) -> Result<(), String> {
+    restart_instance_with(home, name, resolve_active_run_dir, call_tool_at)
+}
+
+fn restart_instance_with<R, C>(
+    home: &Path,
+    name: &str,
+    resolver: R,
+    caller: C,
+) -> Result<(), String>
+where
+    R: Fn(&Path) -> Option<PathBuf>,
+    C: Fn(&Path, &str, Value, std::time::Duration) -> Result<Value, String>,
+{
+    let Some(run_dir) = resolver(home) else {
+        return Err("no active daemon (run dir not found)".to_string());
+    };
+    let result = caller(
+        &run_dir,
+        "restart_instance",
+        serde_json::json!({
+            "instance": name,
+            "mode": "resume",
+            "reason": "manual TUI :restart",
+        }),
+        std::time::Duration::from_secs(60),
+    )?;
+    if let Some(error) = result.get("error").and_then(Value::as_str) {
+        return Err(error.to_string());
+    }
+    if result.get("spawned").and_then(Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        Err(format!("daemon restart_instance did not spawn '{name}'"))
+    }
+}
+
 fn create_instance_with<R, C>(
     home: &Path,
     name: &str,
@@ -708,6 +746,48 @@ mod tests {
                 "backend": "codex",
                 "args": "--model gpt-test",
                 "env": {"CODEX_TEST_FLAG": "1"}
+            })
+        );
+    }
+
+    #[test]
+    fn restart_instance_rpc_forwards_exact_name_and_resume_mode() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let caller = {
+            let calls = Arc::clone(&calls);
+            move |run_dir: &std::path::Path,
+                  tool: &str,
+                  arguments: Value,
+                  timeout: std::time::Duration| {
+                calls.lock().expect("calls mutex not poisoned").push((
+                    run_dir.to_path_buf(),
+                    tool.to_string(),
+                    arguments,
+                    timeout,
+                ));
+                Ok(serde_json::json!({"spawned": true, "tui_handoff": true}))
+            }
+        };
+
+        super::restart_instance_with(
+            std::path::Path::new("/home"),
+            "fleet-agent",
+            |_home| Some(std::path::PathBuf::from("/run/current")),
+            caller,
+        )
+        .expect("daemon restart_instance succeeded");
+
+        let calls = calls.lock().expect("calls mutex not poisoned");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, std::path::Path::new("/run/current"));
+        assert_eq!(calls[0].1, "restart_instance");
+        assert_eq!(calls[0].3, std::time::Duration::from_secs(60));
+        assert_eq!(
+            calls[0].2,
+            serde_json::json!({
+                "instance": "fleet-agent",
+                "mode": "resume",
+                "reason": "manual TUI :restart",
             })
         );
     }
