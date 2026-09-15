@@ -1044,6 +1044,14 @@ mod tests {
                 "internal: public task done/update boundary rejects caller-supplied force; intentionally not advertised",
             ),
             (
+                "restart_id",
+                "internal: app TUI restart correlation; not agent-facing",
+            ),
+            (
+                "old_instance_ref",
+                "internal: app TUI predecessor identity; not agent-facing",
+            ),
+            (
                 "provenance",
                 "internal: delegate_task provenance metadata, set by dispatch path",
             ),

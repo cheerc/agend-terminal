@@ -43,6 +43,35 @@ fn start_instance_rejects_missing_env_source_with_structured_error_3540_r1() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn restart_with_runtime_missing_predecessor_refuses_caller_identity_3649() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = tmp_home_for_create_instance_team("restart-authority-missing");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  dev:\n    backend: claude\n    args: []\n",
+    )
+    .unwrap();
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+    let requested = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 1);
+    let result = handle_restart_instance_with_runtime(
+        &home,
+        &serde_json::json!({
+            "instance": "dev",
+            "mode": "resume",
+            "force": true,
+            "old_instance_ref": requested,
+        }),
+        Some(&runtime),
+    );
+    assert_eq!(
+        result["code"], "restart_identity_unavailable",
+        "runtime authority must refuse when the predecessor is absent: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #2454 residual RED: pure generated-member team mode must route a live MCP
 /// RuntimeContext directly to the merged typed CREATE_TEAM owner. The missing
 /// owner wire-up currently tries the API socket and therefore reports its
@@ -883,7 +912,7 @@ fn fresh_restart_requeues_unconfirmed_inbox_rows_3228() {
 #[test]
 fn restart_spawn_params_carries_same_tab_fresh() {
     let env = HashMap::new();
-    let p = restart_spawn_params("dev", "claude", &[], None, &env, "fresh");
+    let p = restart_spawn_params("dev", "claude", &[], None, &env, "fresh", "r1", None);
     assert_eq!(p["layout"], "same-tab");
     // fresh must NOT request a resume.
     assert!(p.get("mode").is_none());
@@ -894,11 +923,83 @@ fn restart_spawn_params_carries_same_tab_fresh() {
 #[test]
 fn restart_spawn_params_carries_same_tab_resume() {
     let env = HashMap::new();
-    let p = restart_spawn_params("dev", "claude", &[], None, &env, "resume");
+    let p = restart_spawn_params("dev", "claude", &[], None, &env, "resume", "r1", None);
     assert_eq!(p["layout"], "same-tab");
     assert_eq!(p["mode"], "resume");
     // resume preserves context → must NOT self-kick.
     assert!(p.get("self_kick_on_ready").is_none());
+}
+
+#[test]
+fn restart_spawn_params_carries_restart_correlation_3649() {
+    let env = HashMap::new();
+    let p = restart_spawn_params(
+        "dev",
+        "claude",
+        &[],
+        None,
+        &env,
+        "resume",
+        "restart-3649",
+        Some(crate::types::InstanceRef::new(
+            crate::types::InstanceId::new(),
+            7,
+        )),
+    );
+    assert!(p["restart_id"]
+        .as_str()
+        .is_some_and(|restart_id| !restart_id.is_empty()));
+    assert!(p["old_instance_ref"].is_object());
+}
+
+#[test]
+fn restart_admission_is_one_slot_and_drops_on_terminal_cleanup_3649() {
+    let home = std::env::temp_dir().join(format!(
+        "restart-admission-{}",
+        crate::types::InstanceId::new()
+    ));
+    let first = super::restart_prep::try_admit_restart(&home, "dev", "restart-a")
+        .expect("first request admitted");
+    assert!(super::restart_prep::try_admit_restart(&home, "dev", "restart-a").is_err());
+    assert!(super::restart_prep::try_admit_restart(&home, "dev", "restart-b").is_err());
+    drop(first);
+    assert!(super::restart_prep::try_admit_restart(&home, "dev", "restart-b").is_ok());
+}
+
+#[test]
+fn concurrent_restart_admission_has_one_winner_per_target_3649() {
+    let home = std::env::temp_dir().join(format!(
+        "restart-admission-concurrent-{}",
+        crate::types::InstanceId::new()
+    ));
+    let home = &home;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    // Join every contender before dropping any successful guard. Dropping the
+    // first winner while later handles are still being joined turns this test
+    // into a scheduling race: a delayed contender can acquire the slot after
+    // the first restart has already been cleaned up.
+    let admissions = std::thread::scope(|scope| {
+        let handles = (0..8)
+            .map(|index| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    super::restart_prep::try_admit_restart(home, "dev", &format!("restart-{index}"))
+                        .ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("admission worker panicked"))
+            .collect::<Vec<_>>()
+    });
+    let winners = admissions
+        .iter()
+        .filter(|admission| admission.is_some())
+        .count();
+    assert_eq!(winners, 1);
+    drop(admissions);
 }
 
 /// must-follow ②: the self-kick flag is INDEPENDENT — set ONLY by the
@@ -911,10 +1012,10 @@ fn restart_spawn_params_carries_same_tab_resume() {
 fn self_kick_flag_set_only_by_fresh_restart_fail_safe_default() {
     let env = HashMap::new();
     // fresh restart → flag present + true.
-    let fresh = restart_spawn_params("dev", "claude", &[], None, &env, "fresh");
+    let fresh = restart_spawn_params("dev", "claude", &[], None, &env, "fresh", "r1", None);
     assert!(fresh["self_kick_on_ready"].as_bool().unwrap_or(false));
     // resume restart → no flag → reads false.
-    let resume = restart_spawn_params("dev", "claude", &[], None, &env, "resume");
+    let resume = restart_spawn_params("dev", "claude", &[], None, &env, "resume", "r1", None);
     assert!(!resume["self_kick_on_ready"].as_bool().unwrap_or(false));
     // a generic spawn-params object (the initial-fleet / create_instance shape,
     // which also maps to SpawnMode::Fresh) carries no flag → reads false.
