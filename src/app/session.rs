@@ -658,8 +658,15 @@ fn restore_node_reconciled(
             if require_identity && sp.fleet_instance_name.is_some() && pane.instance_ref.is_none() {
                 return None;
             }
+            // Identity 比對只用 instance_id（跨 boot 穩定）：generation 是
+            // daemon-owned process incarnation，跨重啟必變；整 ref 比對會把
+            // 新 boot 的同名同 id pane 整批 drop（tab 全滅）。generation 只用
+            // 於同 boot stale 判定（retired_refs，見上），此處不參與相等。
             if let Some(saved_ref) = sp.instance_ref {
-                if pane.instance_ref != Some(saved_ref) {
+                let same_instance = pane
+                    .instance_ref
+                    .is_some_and(|live| live.instance_id == saved_ref.instance_id);
+                if !same_instance {
                     pane.display_name = sp.display_name.clone();
                     successor_panes.push(pane);
                     return None;
@@ -1521,6 +1528,95 @@ mod tests {
         assert_eq!(layout.tabs.len(), 1, "later duplicate tab must collapse");
         assert_eq!(layout.tabs[0].name, "original-split");
         assert_eq!(layout.tabs[0].root().pane_count(), 2);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// 世代比對致 tab 全滅 RED：saved instance_ref.generation 跨 daemon 重啟
+    /// 必變，新 boot pane 身份恆不相等，整批 Leaf 被靜默 drop（tab 結構丟失）。
+    /// 修法（decision d-20260915001547078786-0）：identity 比對只用
+    /// instance_id（跨 boot 穩定），generation 僅同 boot stale 判定。
+    /// 真實 producer `apply_session_layout` 驅動：saved generation=1，
+    /// live pane generation=2（同 instance_id）。
+    #[test]
+    fn restore_keeps_tab_when_only_generation_changed() {
+        let home = tmp_home("generation-keep");
+        let id = crate::types::InstanceId::new();
+        let saved_ref = crate::types::InstanceRef::new(id, 1);
+        write_session(
+            &home,
+            vec![(
+                "dev-tab".to_string(),
+                SessionNode::Leaf(SessionPane {
+                    fleet_instance_name: Some("dev".to_string()),
+                    instance_ref: Some(saved_ref),
+                    display_name: None,
+                }),
+            )],
+        );
+        let agent_source: HashSet<String> = ["dev".to_string()].into_iter().collect();
+        let mut layout = Layout::new();
+        let mut next_id = 0usize;
+        let live_ref = crate::types::InstanceRef::new(id, 2);
+        let mut pb = |sp: &SessionPane, _l: &mut Layout| -> Option<Pane> {
+            let name = sp.fleet_instance_name.as_deref()?;
+            next_id += 1;
+            let mut pane = test_pane(next_id, name, Some(name));
+            pane.instance_ref = Some(live_ref);
+            Some(pane)
+        };
+        assert!(
+            apply_session_layout(&home, &agent_source, &mut pb, &mut layout),
+            "restore must succeed, got {} tabs",
+            layout.tabs.len()
+        );
+        assert_eq!(
+            layout.tabs.len(),
+            1,
+            "same instance_id with a new generation must keep its tab, not drop it"
+        );
+        assert_eq!(layout.tabs[0].name, "dev-tab");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Pinning（非 RED，修正前後皆應通過）：instance_id 不同仍 drop——
+    /// 寬鬆比對不能把不同實例誤認，successor 走新 tab 而非佔原位。
+    #[test]
+    fn restore_drops_leaf_when_instance_id_differs() {
+        let home = tmp_home("id-differs-drop");
+        let saved_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 1);
+        write_session(
+            &home,
+            vec![(
+                "dev-tab".to_string(),
+                SessionNode::Leaf(SessionPane {
+                    fleet_instance_name: Some("dev".to_string()),
+                    instance_ref: Some(saved_ref),
+                    display_name: None,
+                }),
+            )],
+        );
+        let agent_source: HashSet<String> = ["dev".to_string()].into_iter().collect();
+        let mut layout = Layout::new();
+        let mut next_id = 0usize;
+        // 全新 instance_id（同名不同實體）→ Leaf drop，pane 走 successor 新 tab。
+        let live_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 1);
+        let mut pb = |sp: &SessionPane, _l: &mut Layout| -> Option<Pane> {
+            let name = sp.fleet_instance_name.as_deref()?;
+            next_id += 1;
+            let mut pane = test_pane(next_id, name, Some(name));
+            pane.instance_ref = Some(live_ref);
+            Some(pane)
+        };
+        assert!(
+            apply_session_layout(&home, &agent_source, &mut pb, &mut layout),
+            "restore must succeed, got {} tabs",
+            layout.tabs.len()
+        );
+        assert_eq!(layout.tabs.len(), 1);
+        assert_eq!(
+            layout.tabs[0].name, "dev",
+            "different instance_id must NOT occupy the saved tab; successor takes a new name-only tab"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
