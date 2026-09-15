@@ -244,6 +244,59 @@ where
         .ok_or_else(|| "daemon create_instance returned no instance name".to_string())
 }
 
+/// Restart an existing instance through the daemon's lifecycle API (#3642).
+///
+/// The app is a thin client: it may request an instance restart, but it must
+/// never kill or fork backend children locally. The daemon owns the child
+/// process lifecycle, bumps generation, and manages bridge endpoints.
+pub(super) fn restart_instance(
+    home: &Path,
+    name: &str,
+    mode: &str,
+    reason: &str,
+) -> Result<Value, String> {
+    restart_instance_with(
+        home,
+        name,
+        mode,
+        reason,
+        resolve_active_run_dir,
+        call_tool_at,
+    )
+}
+
+fn restart_instance_with<R, C>(
+    home: &Path,
+    name: &str,
+    mode: &str,
+    reason: &str,
+    resolver: R,
+    caller: C,
+) -> Result<Value, String>
+where
+    R: Fn(&Path) -> Option<PathBuf>,
+    C: Fn(&Path, &str, Value, std::time::Duration) -> Result<Value, String>,
+{
+    let Some(run_dir) = resolver(home) else {
+        return Err("no active daemon (run dir not found)".to_string());
+    };
+    let arguments = serde_json::json!({
+        "instance": name,
+        "mode": mode,
+        "reason": reason,
+    });
+    let result = caller(
+        &run_dir,
+        "restart_instance",
+        arguments,
+        std::time::Duration::from_secs(60),
+    )?;
+    if let Some(error) = result.get("error").and_then(Value::as_str) {
+        return Err(error.to_string());
+    }
+    Ok(result)
+}
+
 pub(super) fn spawn_task_worker(
     home: &Path,
 ) -> (
@@ -708,6 +761,57 @@ mod tests {
                 "backend": "codex",
                 "args": "--model gpt-test",
                 "env": {"CODEX_TEST_FLAG": "1"}
+            })
+        );
+    }
+
+    /// #3642: `restart_instance` RPC forwards instance, mode, and reason to daemon tool.
+    #[test]
+    fn restart_instance_rpc_forwards_instance_mode_and_reason_3642() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let caller = {
+            let calls = Arc::clone(&calls);
+            move |run_dir: &std::path::Path,
+                  tool: &str,
+                  arguments: Value,
+                  timeout: std::time::Duration| {
+                calls.lock().expect("calls mutex not poisoned").push((
+                    run_dir.to_path_buf(),
+                    tool.to_string(),
+                    arguments,
+                    timeout,
+                ));
+                Ok(serde_json::json!({
+                    "name": "sub-general",
+                    "mode": "resume",
+                    "spawned": true,
+                    "tui_handoff": true
+                }))
+            }
+        };
+        let result = super::restart_instance_with(
+            std::path::Path::new("/home"),
+            "sub-general",
+            "resume",
+            "tui :restart",
+            |_home| Some(std::path::PathBuf::from("/run/current")),
+            caller,
+        )
+        .expect("daemon restart_instance succeeded");
+
+        assert_eq!(result["name"], "sub-general");
+        assert_eq!(result["spawned"], true);
+        let calls = calls.lock().expect("calls mutex not poisoned");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, std::path::Path::new("/run/current"));
+        assert_eq!(calls[0].1, "restart_instance");
+        assert_eq!(calls[0].3, std::time::Duration::from_secs(60));
+        assert_eq!(
+            calls[0].2,
+            serde_json::json!({
+                "instance": "sub-general",
+                "mode": "resume",
+                "reason": "tui :restart"
             })
         );
     }

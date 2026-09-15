@@ -1063,7 +1063,7 @@ pub(super) fn apply_attach_outcome(
 /// restore, crash respawn) passes `Resume` to reattach the CLI's prior conversation
 /// in that cwd; user-initiated new creation (backend picker, `:spawn`) passes
 /// `Fresh` so the new instance does not inherit a leftover session. Callers that
-/// explicitly reattach an existing fleet instance (fleet-instance picker, `:restart`)
+/// explicitly reattach an existing fleet instance (fleet-instance picker)
 /// also pass `Resume`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn create_pane_from_resolved(

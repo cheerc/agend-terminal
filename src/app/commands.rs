@@ -9,7 +9,7 @@ use crate::agent::AgentRegistry;
 use crate::layout::{Layout, SplitDir, Tab};
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Bundle of mutable references the command handler needs to affect the
 /// running TUI state. Constructed by the caller for each invocation.
@@ -456,32 +456,18 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                     .map(|p| p.agent_name.to_string())
             });
             if let Some(name) = target_name {
-                // Single pass: find pane info, fleet name, and location
-                #[allow(clippy::type_complexity)]
-                let mut pane_info: Option<(
-                    String,
-                    Option<PathBuf>,
-                    Option<String>,
-                    Option<String>,
-                )> = None;
+                let mut pane_info: Option<(Option<String>, Option<String>)> = None;
                 let mut pane_loc: Option<(usize, usize)> = None;
                 'outer: for (ti, tab) in ctx.layout.tabs.iter().enumerate() {
                     for id in tab.root().pane_ids() {
                         if let Some(p) = tab.root().find_pane(id) {
                             if p.agent_name.as_str() == name {
-                                let cmd = match &p.backend {
-                                    Some(b) => b.preset().command.to_string(),
-                                    None => {
-                                        tracing::warn!(agent = name, "cannot restart shell pane");
-                                        break 'outer;
-                                    }
-                                };
-                                pane_info = Some((
-                                    cmd,
-                                    p.working_dir.clone(),
-                                    p.display_name.clone(),
-                                    p.fleet_instance_name.clone(),
-                                ));
+                                if p.backend.is_none() {
+                                    tracing::warn!(agent = name, "cannot restart shell pane");
+                                    return false;
+                                }
+                                pane_info =
+                                    Some((p.display_name.clone(), p.fleet_instance_name.clone()));
                                 pane_loc = Some((ti, id));
                                 break 'outer;
                             }
@@ -489,103 +475,134 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                     }
                 }
 
-                if let Some((backend_cmd, work_dir, display_name, fleet_name)) = pane_info {
-                    super::kill_agent(ctx.home, ctx.registry, &name);
-
-                    let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
-                    let pc = cols.saturating_sub(2);
-                    let pr = rows.saturating_sub(4);
-                    ctx.name_counter.remove(&name);
-
-                    let pane_result = if let Some(ref fname) = fleet_name {
-                        // Fleet agent — resolve from fleet.yaml (full config)
-                        let fleet_path = crate::fleet::fleet_yaml_path(ctx.home);
-                        let fleet = crate::fleet::FleetConfig::load(&fleet_path).ok();
-                        match fleet.as_ref().map(|f| f.resolve_instance_checked(fname)) {
-                            Some(Ok(Some(resolved))) => {
-                                super::pane_factory::create_pane_from_resolved(
-                                    fname,
-                                    &resolved,
-                                    ctx.layout,
-                                    ctx.registry,
-                                    ctx.home,
-                                    pc,
-                                    pr,
-                                    ctx.wakeup_tx,
-                                    ctx.name_counter,
-                                    crate::backend::SpawnMode::Resume,
-                                )
-                            }
-                            Some(Err(error)) => Err(anyhow::Error::new(error)),
-                            Some(Ok(None)) | None => {
-                                let (command, submit_key) =
-                                    super::pane_factory::resolve_backend(&backend_cmd);
-                                super::pane_factory::create_pane(
-                                    ctx.layout,
-                                    ctx.registry,
-                                    ctx.home,
-                                    &name,
-                                    &command,
-                                    &[],
-                                    // Fleet resolve failed — no resume metadata,
-                                    // so start fresh rather than guess.
-                                    crate::backend::SpawnMode::Fresh,
-                                    work_dir.as_deref(),
-                                    &HashMap::new(),
-                                    &submit_key,
-                                    pc,
-                                    pr,
-                                    ctx.wakeup_tx,
-                                    ctx.name_counter,
-                                    super::pane_factory::SpawnIdentity::Managed,
-                                )
-                            }
-                        }
-                    } else {
-                        let (command, submit_key) =
-                            super::pane_factory::resolve_backend(&backend_cmd);
-                        super::pane_factory::create_pane(
-                            ctx.layout,
-                            ctx.registry,
-                            ctx.home,
-                            &name,
-                            &command,
-                            &[],
-                            crate::backend::SpawnMode::Fresh,
-                            work_dir.as_deref(),
-                            &HashMap::new(),
-                            &submit_key,
-                            pc,
-                            pr,
-                            ctx.wakeup_tx,
-                            ctx.name_counter,
-                            super::pane_factory::SpawnIdentity::Managed,
-                        )
-                    };
-                    if let Ok(new_pane) = pane_result {
-                        // Swap only vterm + rx into the existing pane slot
-                        if let Some((ti, pid)) = pane_loc {
-                            if let Some(pane) = ctx.layout.tabs[ti].root_mut().find_pane_mut(pid) {
-                                let old_id = pane.id;
-                                let old_selection = pane.selection.clone();
-                                let old_last_input = pane.last_input_at;
-
-                                *pane = new_pane;
-
-                                pane.id = old_id;
-                                pane.selection = old_selection;
-                                pane.last_input_at = old_last_input;
-                                pane.display_name = display_name;
-                                pane.scroll_offset = 0;
-                                pane.has_notification = false;
-                                return true;
-                            }
-                        }
-                        // Fallback: add as new tab
-                        let tab_name = new_pane.agent_name.clone();
-                        ctx.layout.add_tab(Tab::new(tab_name.to_string(), new_pane));
-                        return true;
+                let (display_name, instance_name) = match pane_info {
+                    Some((display_name, fleet_name)) => {
+                        let inst = fleet_name.unwrap_or(name);
+                        (display_name, inst)
                     }
+                    None => {
+                        let fleet_path = crate::fleet::fleet_yaml_path(ctx.home);
+                        if let Ok(fleet) = crate::fleet::FleetConfig::load(&fleet_path) {
+                            if fleet.resolve_instance(&name).is_some() {
+                                (None, name)
+                            } else {
+                                tracing::warn!(agent = name, "cannot find agent to restart");
+                                return false;
+                            }
+                        } else {
+                            tracing::warn!(agent = name, "cannot find agent to restart");
+                            return false;
+                        }
+                    }
+                };
+
+                let run_dir = crate::daemon::run_dir(ctx.home);
+                let old_port = crate::ipc::read_port(&run_dir, &instance_name);
+
+                let (tx, rx) = std::sync::mpsc::channel();
+                let home_buf = ctx.home.to_path_buf();
+                let inst_for_rpc = instance_name.clone();
+                // #3642: restart must delegate to daemon restart_instance lifecycle.
+                // TUI must never locally spawn a backend for a daemon-managed instance.
+                // fire-and-forget: short-lived RPC worker that exits upon receiving restart response or socket drop
+                std::thread::Builder::new()
+                    .name(format!("restart_{inst_for_rpc}"))
+                    .spawn(move || {
+                        let res = super::rpc::restart_instance(
+                            &home_buf,
+                            &inst_for_rpc,
+                            "resume",
+                            "tui :restart",
+                        );
+                        let _ = tx.send(res);
+                    })
+                    .ok();
+
+                let fleet_path = crate::fleet::fleet_yaml_path(ctx.home);
+                let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+                let pc = cols.saturating_sub(2);
+                let pr = rows.saturating_sub(4);
+
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let mut pane_result = None;
+
+                while std::time::Instant::now() < deadline {
+                    if let Ok(Err(err)) = rx.try_recv() {
+                        tracing::error!(agent = %instance_name, error = %err, "restart_instance rejected");
+                        return false;
+                    }
+                    if let Some(port) = crate::ipc::read_port(&run_dir, &instance_name) {
+                        if Some(port) != old_port {
+                            match super::pane_factory::create_remote_pane(
+                                &instance_name,
+                                ctx.home,
+                                &fleet_path,
+                                ctx.layout,
+                                pc,
+                                pr,
+                                ctx.wakeup_tx,
+                            ) {
+                                Ok(pane) => {
+                                    pane_result = Some(pane);
+                                    break;
+                                }
+                                Err(_) => {
+                                    // Port file may be partially written or listener not accepting yet
+                                }
+                            }
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+
+                if pane_result.is_none() {
+                    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                        Ok(Ok(_)) => {
+                            pane_result = super::pane_factory::create_remote_pane(
+                                &instance_name,
+                                ctx.home,
+                                &fleet_path,
+                                ctx.layout,
+                                pc,
+                                pr,
+                                ctx.wakeup_tx,
+                            )
+                            .ok();
+                        }
+                        Ok(Err(err)) => {
+                            tracing::error!(agent = %instance_name, error = %err, "restart_instance failed");
+                            return false;
+                        }
+                        Err(_) => {
+                            tracing::error!(agent = %instance_name, "restart_instance timed out");
+                            return false;
+                        }
+                    }
+                }
+
+                if let Some(new_pane) = pane_result {
+                    ctx.name_counter.remove(&instance_name);
+                    if let Some((ti, pid)) = pane_loc {
+                        if let Some(pane) = ctx.layout.tabs[ti].root_mut().find_pane_mut(pid) {
+                            let old_id = pane.id;
+                            let old_selection = pane.selection.clone();
+                            let old_last_input = pane.last_input_at;
+
+                            *pane = new_pane;
+
+                            pane.id = old_id;
+                            pane.selection = old_selection;
+                            pane.last_input_at = old_last_input;
+                            pane.display_name = display_name;
+                            pane.scroll_offset = 0;
+                            pane.has_notification = false;
+                            return true;
+                        }
+                    }
+                    // Fallback: add as new tab
+                    let tab_name = new_pane.agent_name.clone();
+                    ctx.layout.add_tab(Tab::new(tab_name.to_string(), new_pane));
+                    return true;
                 }
             }
         }
@@ -837,6 +854,86 @@ mod tests {
         ));
         assert!(layout.tabs.is_empty());
         assert!(crate::agent::lock_registry(&registry).is_empty());
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #3642 P0: `:restart` must delegate to daemon `restart_instance` lifecycle.
+    /// TUI must never locally spawn a backend for a daemon-managed instance.
+    #[test]
+    fn restart_command_uses_daemon_lifecycle_and_never_spawns_locally_3642() {
+        let src = include_str!("commands.rs");
+        let restart_start = src
+            .find(r#""restart" =>"#)
+            .expect("restart command arm must exist");
+        let restart_end = src[restart_start..]
+            .find(r#""layout" =>"#)
+            .map(|offset| restart_start + offset)
+            .expect("restart arm terminator");
+        let restart_arm = &src[restart_start..restart_end];
+
+        assert!(
+            restart_arm.contains("restart_instance"),
+            ":restart must use the daemon restart_instance lifecycle (#3642)"
+        );
+        assert!(
+            restart_arm.contains("create_remote_pane"),
+            ":restart must attach the daemon-owned process through the bridge (#3642)"
+        );
+        assert!(
+            !restart_arm.contains("create_pane_from_resolved"),
+            ":restart must not spawn a local child (#3642)"
+        );
+        assert!(
+            !restart_arm.contains("super::pane_factory::create_pane("),
+            ":restart must not create local panes (#3642)"
+        );
+        assert!(
+            !restart_arm.contains("super::kill_agent"),
+            ":restart must not attempt local process killing (#3642)"
+        );
+    }
+
+    #[test]
+    fn restart_command_fails_safely_when_daemon_absent_without_local_spawn_3642() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-cmd-restart-nodaemon-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  dev:\n    command: claude\n",
+        )
+        .expect("fleet");
+
+        let mut layout = Layout::new();
+        let mut pane = test_pane(1, "dev", Some("dev"));
+        pane.backend =
+            Some(crate::backend::Backend::from_command("claude").expect("claude backend exists"));
+        layout.add_tab(Tab::new("dev".into(), pane));
+
+        let registry = empty_registry();
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut name_counter = HashMap::new();
+        let mut ctx = CommandCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+        };
+
+        // When daemon is absent, :restart must fail gracefully without spawning
+        // any child in ctx.registry (rejection of TUI local spawn #3642).
+        assert!(!execute("restart dev", &mut ctx));
+        assert!(
+            crate::agent::lock_registry(&registry).is_empty(),
+            ":restart must never spawn local children into the registry"
+        );
         std::fs::remove_dir_all(home).ok();
     }
 
