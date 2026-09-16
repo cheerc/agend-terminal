@@ -1825,6 +1825,14 @@ mod tests {
     /// Set up a recent unsent draft (typed_ms > submit_ms → `Drafting`) and one
     /// queued notification for `agent` under `home`.
     fn seed_drafting_with_queued(home: &Path, agent: &str) {
+        seed_stale_draft(home, agent);
+        notification_queue::enqueue(home, agent, "[AGEND-MSG-PENDING] peer report")
+            .expect("enqueue test notification");
+    }
+
+    /// Set up a recent unsent draft WITHOUT any queued notification (the
+    /// restart-gate shape: `:restart` consults metadata, not the queue).
+    fn seed_stale_draft(home: &Path, agent: &str) {
         let now = chrono::Utc::now().timestamp_millis();
         crate::agent_ops::save_metadata(
             home,
@@ -1838,8 +1846,6 @@ mod tests {
             "last_submit_epoch_ms",
             serde_json::json!(now - 60_000),
         );
-        notification_queue::enqueue(home, agent, "[AGEND-MSG-PENDING] peer report")
-            .expect("enqueue test notification");
     }
 
     /// #1944 §3.9: a stale type-then-clear draft (typed_ms > submit_ms but the
@@ -2003,6 +2009,57 @@ mod tests {
         assert!(
             injected.is_empty(),
             "codex with normal-intensity input → keep deferring (protection unchanged)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #3663: TUI publishes the empty-box observation for daemon-side gates ──
+
+    /// A cleared box with ZERO queued notifications (the `:restart` shape —
+    /// the gate reads metadata, not the queue) must still publish the cleared
+    /// observation, so the daemon-side `draft_state` flips to `None`.
+    #[test]
+    fn cleared_observation_published_with_empty_queue_3663() {
+        let home = tmp_home("cleared-publish-empty");
+        seed_stale_draft(&home, "lead");
+        let mut p = pane_with_screen("lead", Some(Backend::ClaudeCode), "❯ ");
+        p.pending_notification_count = 0;
+
+        flush_notifications_for_pane(&home, &mut p, |_t, _channel_origin| {
+            panic!("nothing queued — injector must not run");
+        });
+        notification_queue::flush_pending_input_activity(&home);
+        assert_eq!(
+            notification_queue::draft_state(&home, "lead"),
+            notification_queue::DraftState::None,
+            "#3663: daemon-side draft_state must read None after the TUI publish"
+        );
+        assert!(
+            !crate::inbox::notify::operator_has_live_draft(&home, "lead"),
+            "#3663: operator_has_live_draft must clear (no 1.5s typing here)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A REAL draft (text in the box) must NOT publish a cleared observation —
+    /// the daemon-side gate must keep deferring.
+    #[test]
+    fn cleared_observation_not_published_for_live_draft_3663() {
+        let home = tmp_home("cleared-publish-typed");
+        seed_stale_draft(&home, "lead");
+        let mut p = pane_with_screen("lead", Some(Backend::ClaudeCode), "❯ half-typed reply");
+        p.pending_notification_count = 0;
+
+        flush_notifications_for_pane(&home, &mut p, |_t, _channel_origin| Ok(()));
+        notification_queue::flush_pending_input_activity(&home);
+        assert_eq!(
+            notification_queue::draft_state(&home, "lead"),
+            notification_queue::DraftState::Drafting,
+            "#3663: a live draft must keep Drafting daemon-side (#1457 preserved)"
+        );
+        assert!(
+            crate::inbox::notify::operator_has_live_draft(&home, "lead"),
+            "a live draft must keep operator_has_live_draft true"
         );
         std::fs::remove_dir_all(&home).ok();
     }

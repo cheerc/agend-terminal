@@ -1217,6 +1217,71 @@ fn operator_has_live_draft_reflects_unsent_keystrokes() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3663: type-then-clear through the REAL restart entry — a stale unsent
+/// draft PLUS a newer TUI-observed empty box must reach the SPAWN boundary
+/// without the 60s draft-grace block. Runs the entry on a scoped thread with
+/// a 15s join budget: at base the gate defers 60s (timeout → RED); with the
+/// fix the gate fast-passes and the entry reaches SPAWN in ~1s (GREEN).
+/// Asserts at the real SPAWN boundary (`LAST_SPAWN_ARGS`), not on the pure
+/// gate: the contract is about the restart actually proceeding.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn restart_entry_reaches_spawn_when_box_cleared_after_typing_3663() {
+    use crate::mcp::handlers::instance_state::spawn::LAST_SPAWN_ARGS;
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = home_with_pinned_claude("3663-cleared", "[]");
+    // Stale unsent draft (typed 30s ago, outside the 1.5s typing window) +
+    // a newer cleared observation (literal key: RED compiles against base).
+    let now = chrono::Utc::now().timestamp_millis();
+    crate::agent_ops::save_metadata(
+        &home,
+        "dev",
+        "last_input_epoch_ms",
+        serde_json::json!(now - 30_000),
+    );
+    crate::agent_ops::save_metadata(
+        &home,
+        "dev",
+        "last_submit_epoch_ms",
+        serde_json::json!(now - 60_000),
+    );
+    // Setup check (holds at RED and GREEN): the stale draft alone defers.
+    assert!(
+        crate::inbox::notify::operator_has_live_draft(&home, "dev"),
+        "setup: the stale unsent draft alone must read as a live draft"
+    );
+    // The TUI observes the visibly empty box (literal key: RED compiles).
+    crate::agent_ops::save_metadata(
+        &home,
+        "dev",
+        "last_cleared_epoch_ms",
+        serde_json::json!(now - 5_000),
+    );
+    *LAST_SPAWN_ARGS.lock() = None;
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+    let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let resp = handle_restart_instance_with_runtime(
+                &home,
+                &serde_json::json!({"instance": "dev", "mode": "fresh", "force": false}),
+                Some(&runtime),
+            );
+            done_tx.send(resp).ok();
+        });
+        let resp = done_rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect(
+            "#3663: the restart entry must return within 15s (a 60s draft-grace block is the bug)",
+        );
+        assert!(
+            LAST_SPAWN_ARGS.lock().is_some(),
+            "#3663: a cleared box must let the restart reach SPAWN; got {resp}"
+        );
+    });
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 fn await_unsent_draft_or_grace_returns_fast_without_a_draft() {
