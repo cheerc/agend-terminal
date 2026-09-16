@@ -167,7 +167,7 @@ mod tests {
     #[test]
     fn oversized_transitions_rotate_on_next_write_3669() {
         let dir = std::env::temp_dir().join(format!(
-            "agend-test-state-transitions-3669-{}",
+            "agend-3669-transitions-rotate-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).ok();
