@@ -91,6 +91,11 @@ pub(super) enum Overlay {
     ConfirmClose {
         target: CloseTarget,
     },
+    /// Explicit operator restart confirmation. The command is retained until
+    /// the operator accepts, so no pane is killed while the prompt is shown.
+    ConfirmRestart {
+        command: String,
+    },
     ConfirmDeleteInstance {
         name: String,
         input: String,
@@ -200,6 +205,20 @@ pub(super) struct OverlayCtx<'a> {
 pub(super) struct OverlayOutcome {
     /// Layout changed in a way that requires a resize pass before next draw.
     pub needs_resize: bool,
+}
+
+fn execute_command(command: &str, ctx: &mut OverlayCtx<'_>, outcome: &mut OverlayOutcome) {
+    let mut cctx = super::commands::CommandCtx {
+        layout: &mut *ctx.layout,
+        registry: ctx.registry,
+        home: ctx.home,
+        wakeup_tx: ctx.wakeup_tx,
+        name_counter: &mut *ctx.name_counter,
+        restart_tx: ctx.restart_request_tx,
+    };
+    if super::commands::execute(command, &mut cctx) {
+        outcome.needs_resize = true;
+    }
 }
 
 /// Dispatch a key press to the currently-active overlay. Mutates `*overlay`
@@ -449,6 +468,16 @@ pub(super) fn handle_key(
                 *overlay = Overlay::None;
             }
         },
+        Overlay::ConfirmRestart { command } => match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let command = command.clone();
+                *overlay = Overlay::None;
+                execute_command(&command, ctx, &mut outcome);
+            }
+            _ => {
+                *overlay = Overlay::None;
+            }
+        },
         Overlay::ConfirmDeleteInstance {
             name,
             input,
@@ -614,17 +643,11 @@ pub(super) fn handle_key(
             // candidate, so muscle memory / scripts behave identically).
             KeyCode::Enter => {
                 let cmd = input.clone();
-                *overlay = Overlay::None;
-                let mut cctx = super::commands::CommandCtx {
-                    layout: &mut *ctx.layout,
-                    registry: ctx.registry,
-                    home: ctx.home,
-                    wakeup_tx: ctx.wakeup_tx,
-                    name_counter: &mut *ctx.name_counter,
-                    restart_tx: ctx.restart_request_tx,
-                };
-                if super::commands::execute(&cmd, &mut cctx) {
-                    outcome.needs_resize = true;
+                if super::commands::is_restart_command(&cmd) {
+                    *overlay = Overlay::ConfirmRestart { command: cmd };
+                } else {
+                    *overlay = Overlay::None;
+                    execute_command(&cmd, ctx, &mut outcome);
                 }
             }
             KeyCode::Esc => {
@@ -2314,6 +2337,38 @@ mod tests {
             _ => panic!("palette must stay open after Tab"),
         }
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3662 RED: `:restart` must ask for confirmation before the command
+    /// dispatcher can kill or replace a pane.
+    #[test]
+    fn restart_command_confirms_before_execution_3662() {
+        let source = include_str!("overlay.rs").replace("\r\n", "\n");
+        assert_restart_confirmation_order(&source);
+        let crlf_source = source.replace('\n', "\r\n");
+        assert_restart_confirmation_order(&crlf_source);
+    }
+
+    fn assert_restart_confirmation_order(source: &str) {
+        let source = source.replace("\r\n", "\n");
+        let start = source
+            .find("Overlay::Command {\n            ref mut input")
+            .expect("command overlay handler must exist");
+        let end = source[start..]
+            .find("Overlay::Decisions {")
+            .map(|offset| start + offset)
+            .expect("command overlay handler end marker");
+        let region = &source[start..end];
+        let confirm = region
+            .find("ConfirmRestart")
+            .expect("restart Enter must open a confirmation overlay");
+        let execute = region
+            .find("execute_command")
+            .expect("command overlay must retain the execution path");
+        assert!(
+            confirm < execute,
+            "restart confirmation must be established before command execution"
+        );
     }
 }
 

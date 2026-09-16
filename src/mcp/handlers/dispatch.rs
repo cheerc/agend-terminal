@@ -337,7 +337,14 @@ pub(crate) fn dispatch_start_instance(ctx: &HandlerCtx<'_>) -> Value {
 adapter!(dispatch_bind_topic, ha, instance::handle_bind_topic);
 /// #2454 Slice 10: D7 restart DELETE uses the same runtime-owned service.
 pub(crate) fn dispatch_restart_instance(ctx: &HandlerCtx<'_>) -> Value {
-    instance::handle_restart_instance_with_runtime(ctx.home, ctx.args, ctx.runtime)
+    // #3662: this is the public, explicit MCP ingress. Keep the unsent-draft
+    // bypass separate from `force`, whose existing meaning also permits a
+    // fresh restart through an uncommitted worktree.
+    let mut args = ctx.args.clone();
+    if let Some(object) = args.as_object_mut() {
+        object.insert("skip_unsent_draft_gate".into(), json!(true));
+    }
+    instance::handle_restart_instance_with_runtime(ctx.home, &args, ctx.runtime)
 }
 /// #3572: preserve the API-owned RuntimeContext through set_model's optional
 /// restart so DELETE/SPAWN use the same in-process lifecycle as restart_instance.
@@ -1688,6 +1695,25 @@ mod tests {
         assert!(
             api_region.contains("agent_ops::move_pane"),
             "API move_pane must call the same shared neutral service"
+        );
+    }
+
+    /// #3662 RED: public MCP restart ingress must mark the request explicit;
+    /// internal restart callers retain the ordinary draft gate.
+    #[test]
+    fn explicit_mcp_restart_marks_draft_gate_bypass_3662() {
+        let source = include_str!("dispatch.rs");
+        let start = source
+            .find("pub(crate) fn dispatch_restart_instance(")
+            .expect("restart dispatch must exist");
+        let end = source[start..]
+            .find("pub(crate) fn dispatch_set_model(")
+            .map(|offset| start + offset)
+            .expect("restart dispatch end marker");
+        let region = &source[start..end];
+        assert!(
+            region.contains("skip_unsent_draft_gate"),
+            "MCP restart ingress must bypass only the unsent-draft gate"
         );
     }
 
