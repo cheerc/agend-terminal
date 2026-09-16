@@ -1554,6 +1554,9 @@ mod tests {
     use crate::layout::{PaneSource, Tab};
     use std::collections::HashSet;
 
+    #[path = "appstate_team_order_tests.rs"]
+    mod team_order_tests;
+
     fn closed_before_attach_registry_survives(unmanaged: bool) -> bool {
         let home = std::env::temp_dir().join(format!(
             "app_state_late_attach_{}_{}_{}",
@@ -2139,6 +2142,36 @@ mod tests {
         // standalone tab is active after the first batch.
         state.ui.layout.next_tab();
         let active_before = state.ui.layout.tabs[state.ui.layout.active].name.clone();
+        let team_index = state
+            .ui
+            .layout
+            .tabs
+            .iter()
+            .position(|tab| tab.name == "svc")
+            .expect("team tab exists");
+        state.ui.layout.goto_tab(team_index);
+        state
+            .ui
+            .layout
+            .active_tab_mut()
+            .expect("team tab exists")
+            .cycle_focus();
+        let focused_before = state
+            .ui
+            .layout
+            .active_tab()
+            .and_then(|tab| tab.focused_pane())
+            .map(|pane| pane.agent_name.to_string())
+            .expect("team focus exists");
+        state.ui.layout.goto_tab(
+            state
+                .ui
+                .layout
+                .tabs
+                .iter()
+                .position(|tab| tab.name == active_before)
+                .expect("active tab exists"),
+        );
         state.place_remote_team_grouped(&["svc-c".to_string()], &home, &mut pane_builder);
         assert_eq!(
             state.ui.layout.tabs[state.ui.layout.active].name, active_before,
@@ -2159,6 +2192,13 @@ mod tests {
         let mut non_orchestrators = team_names[1..].to_vec();
         non_orchestrators.sort();
         assert_eq!(non_orchestrators, vec!["svc-b", "svc-c"]);
+        assert_eq!(
+            team_tab
+                .focused_pane()
+                .map(|pane| pane.agent_name.to_string()),
+            Some(focused_before),
+            "appending a team member must preserve the existing focused pane"
+        );
         let solo_tab = state
             .ui
             .layout
