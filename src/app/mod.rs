@@ -922,10 +922,63 @@ const DRAFT_INPUT_TAIL_ROWS: usize = 8;
 /// raw `Drafting` against the ACTUAL rendered input box (`pane.vterm` is
 /// TUI-owned; the headless flush has no pane and conservatively honors the
 /// raw draft state), plus the badge refresh.
+///
+/// #1944: the input-box probe shared by the flush gate below and the #3663
+/// publish path. `Some(true)` = box verifiably empty, `Some(false)` = real
+/// draft, `None` = undeterminable (fail toward protection). Only runs when
+/// `raw_state` is `Drafting` — otherwise there is no stale draft to refine.
+fn probe_input_box_empty(
+    pane: &mut Pane,
+    raw_state: notification_queue::DraftState,
+) -> Option<bool> {
+    if raw_state != notification_queue::DraftState::Drafting {
+        return None;
+    }
+    pane.backend.as_ref().and_then(|b| {
+        // #1948(b): codex's empty box shows DIM ghost text after `›`, which a
+        // plain marker probe mis-reads as typed content — route it through the
+        // DIM-aware check (needs the per-char dim mask). Everyone else uses the
+        // text-only probe: marker (claude/agy) → placeholder (kiro) → fallback.
+        // #t-97931 (F-A): route through the path-aware `Pane::tail_lines*` — off-
+        // thread the main-thread `pane.vterm` is idle/blank, so reading it directly
+        // mis-reads a real unsent draft as an empty box and the gate clobbers it.
+        if let Some(marker) = b.input_dim_ghost_marker() {
+            let (text, dim) = pane.tail_lines_with_dim(DRAFT_INPUT_TAIL_ROWS);
+            notification_queue::input_box_dim_aware_empty(&text, &dim, marker)
+        } else {
+            notification_queue::input_box_empty_probe(
+                &pane.tail_lines(DRAFT_INPUT_TAIL_ROWS),
+                b.input_prompt_marker(),
+                b.input_empty_placeholder(),
+            )
+        }
+    })
+}
+
+/// #3663: publish the TUI-observed empty box so DAEMON-side gates (restart
+/// defer, `should_defer_inject`, ambient gate — all metadata-only readers in
+/// another process) see the same refinement the TUI flush applies. Runs even
+/// when the queue is empty (the restart gate reads metadata, not the queue);
+/// gated on `raw_state == Drafting` so idle panes never write metadata every
+/// tick. Buffered + non-blocking; the ~1s badge cadence flushes it.
+fn publish_cleared_observation(home: &Path, pane: &mut Pane) {
+    let raw_state = notification_queue::draft_state(home, &pane.agent_name);
+    if raw_state != notification_queue::DraftState::Drafting {
+        return;
+    }
+    if probe_input_box_empty(pane, raw_state) == Some(true) {
+        notification_queue::record_cleared_activity(home, &pane.agent_name);
+    }
+}
+
 fn flush_notifications_for_pane<F>(home: &Path, pane: &mut Pane, injector: F)
 where
     F: FnMut(&str, Option<crate::channel::ChannelKind>) -> anyhow::Result<()>,
 {
+    // #3663: publish the empty-box observation even when nothing is queued —
+    // the restart gate reads metadata, not the queue, so a type-then-clear
+    // with zero pending notifications must still lift the daemon-side defer.
+    publish_cleared_observation(home, pane);
     if pane.pending_notification_count == 0 {
         return;
     }
@@ -943,29 +996,7 @@ where
     // undeterminable read (no marker / agent mid-output) both keep deferring
     // (fail toward draft-protection — never risk clobbering a real draft).
     let raw_state = notification_queue::draft_state(home, &pane.agent_name);
-    let buffer_empty = if raw_state == notification_queue::DraftState::Drafting {
-        pane.backend.as_ref().and_then(|b| {
-            // #1948(b): codex's empty box shows DIM ghost text after `›`, which a
-            // plain marker probe mis-reads as typed content — route it through the
-            // DIM-aware check (needs the per-char dim mask). Everyone else uses the
-            // text-only probe: marker (claude/agy) → placeholder (kiro) → fallback.
-            // #t-97931 (F-A): route through the path-aware `Pane::tail_lines*` — off-
-            // thread the main-thread `pane.vterm` is idle/blank, so reading it directly
-            // mis-reads a real unsent draft as an empty box and the gate clobbers it.
-            if let Some(marker) = b.input_dim_ghost_marker() {
-                let (text, dim) = pane.tail_lines_with_dim(DRAFT_INPUT_TAIL_ROWS);
-                notification_queue::input_box_dim_aware_empty(&text, &dim, marker)
-            } else {
-                notification_queue::input_box_empty_probe(
-                    &pane.tail_lines(DRAFT_INPUT_TAIL_ROWS),
-                    b.input_prompt_marker(),
-                    b.input_empty_placeholder(),
-                )
-            }
-        })
-    } else {
-        None
-    };
+    let buffer_empty = probe_input_box_empty(pane, raw_state);
     let effective_state = if buffer_empty == Some(true) {
         notification_queue::DraftState::None
     } else {
@@ -1791,6 +1822,14 @@ mod tests {
     /// Set up a recent unsent draft (typed_ms > submit_ms → `Drafting`) and one
     /// queued notification for `agent` under `home`.
     fn seed_drafting_with_queued(home: &Path, agent: &str) {
+        seed_stale_draft(home, agent);
+        notification_queue::enqueue(home, agent, "[AGEND-MSG-PENDING] peer report")
+            .expect("enqueue test notification");
+    }
+
+    /// Set up a recent unsent draft WITHOUT any queued notification (the
+    /// restart-gate shape: `:restart` consults metadata, not the queue).
+    fn seed_stale_draft(home: &Path, agent: &str) {
         let now = chrono::Utc::now().timestamp_millis();
         crate::agent_ops::save_metadata(
             home,
@@ -1804,8 +1843,6 @@ mod tests {
             "last_submit_epoch_ms",
             serde_json::json!(now - 60_000),
         );
-        notification_queue::enqueue(home, agent, "[AGEND-MSG-PENDING] peer report")
-            .expect("enqueue test notification");
     }
 
     /// #1944 §3.9: a stale type-then-clear draft (typed_ms > submit_ms but the
@@ -1969,6 +2006,57 @@ mod tests {
         assert!(
             injected.is_empty(),
             "codex with normal-intensity input → keep deferring (protection unchanged)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #3663: TUI publishes the empty-box observation for daemon-side gates ──
+
+    /// A cleared box with ZERO queued notifications (the `:restart` shape —
+    /// the gate reads metadata, not the queue) must still publish the cleared
+    /// observation, so the daemon-side `draft_state` flips to `None`.
+    #[test]
+    fn cleared_observation_published_with_empty_queue_3663() {
+        let home = tmp_home("cleared-publish-empty");
+        seed_stale_draft(&home, "lead");
+        let mut p = pane_with_screen("lead", Some(Backend::ClaudeCode), "❯ ");
+        p.pending_notification_count = 0;
+
+        flush_notifications_for_pane(&home, &mut p, |_t, _channel_origin| {
+            panic!("nothing queued — injector must not run");
+        });
+        notification_queue::flush_pending_input_activity(&home);
+        assert_eq!(
+            notification_queue::draft_state(&home, "lead"),
+            notification_queue::DraftState::None,
+            "#3663: daemon-side draft_state must read None after the TUI publish"
+        );
+        assert!(
+            !crate::inbox::notify::operator_has_live_draft(&home, "lead"),
+            "#3663: operator_has_live_draft must clear (no 1.5s typing here)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A REAL draft (text in the box) must NOT publish a cleared observation —
+    /// the daemon-side gate must keep deferring.
+    #[test]
+    fn cleared_observation_not_published_for_live_draft_3663() {
+        let home = tmp_home("cleared-publish-typed");
+        seed_stale_draft(&home, "lead");
+        let mut p = pane_with_screen("lead", Some(Backend::ClaudeCode), "❯ half-typed reply");
+        p.pending_notification_count = 0;
+
+        flush_notifications_for_pane(&home, &mut p, |_t, _channel_origin| Ok(()));
+        notification_queue::flush_pending_input_activity(&home);
+        assert_eq!(
+            notification_queue::draft_state(&home, "lead"),
+            notification_queue::DraftState::Drafting,
+            "#3663: a live draft must keep Drafting daemon-side (#1457 preserved)"
+        );
+        assert!(
+            crate::inbox::notify::operator_has_live_draft(&home, "lead"),
+            "a live draft must keep operator_has_live_draft true"
         );
         std::fs::remove_dir_all(&home).ok();
     }

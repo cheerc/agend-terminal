@@ -1827,6 +1827,85 @@ mod should_defer_inject_tests_1513 {
             "#1675: a paused (3s) live operator draft must defer actionable, not force-submit it"
         );
     }
+
+    // #3663: type-then-clear — stale typed>submit PLUS a newer TUI-observed
+    // empty box must NOT defer an actionable wake (inject now, not ~5min later).
+    #[test]
+    fn actionable_injects_when_box_cleared_after_typing_3663() {
+        let h = tmp_home("cleared-inject");
+        let now = chrono::Utc::now().timestamp_millis();
+        std::fs::create_dir_all(h.join("metadata")).unwrap();
+        std::fs::write(
+            h.join("metadata").join("a.json"),
+            format!(
+                "{{\"last_input_epoch_ms\":{},\"last_submit_epoch_ms\":{},\"last_cleared_epoch_ms\":{}}}",
+                now - 30_000,
+                now - 60_000,
+                now - 5_000
+            ),
+        )
+        .unwrap();
+        assert!(
+            !should_defer_inject(&h, "a", Some("idle"), true),
+            "#3663: cleared-newer-than-typed must inject now, not defer ~5min"
+        );
+        std::fs::remove_dir_all(&h).ok();
+    }
+
+    // #3663 guard: cleared OLDER than the last keystroke must still defer —
+    // the operator typed after the empty observation (a live draft).
+    #[test]
+    fn actionable_defers_when_cleared_before_typing_3663() {
+        let h = tmp_home("cleared-stale");
+        let now = chrono::Utc::now().timestamp_millis();
+        std::fs::create_dir_all(h.join("metadata")).unwrap();
+        std::fs::write(
+            h.join("metadata").join("a.json"),
+            format!(
+                "{{\"last_input_epoch_ms\":{},\"last_submit_epoch_ms\":{},\"last_cleared_epoch_ms\":{}}}",
+                now - 5_000,
+                now - 60_000,
+                now - 30_000
+            ),
+        )
+        .unwrap();
+        assert!(
+            should_defer_inject(&h, "a", Some("idle"), true),
+            "#3663: a stale cleared observation must not lift a live draft"
+        );
+        std::fs::remove_dir_all(&h).ok();
+    }
+
+    // #3663: end-to-end record path — seeded stale draft defers; then
+    // record_cleared_activity + flush lifts the defer (no sleeps: seeded stale).
+    #[test]
+    fn cleared_record_flush_round_trip_lifts_defer_3663() {
+        let h = tmp_home("cleared-roundtrip");
+        let now = chrono::Utc::now().timestamp_millis();
+        crate::agent_ops::save_metadata(
+            &h,
+            "a",
+            "last_input_epoch_ms",
+            serde_json::json!(now - 30_000),
+        );
+        crate::agent_ops::save_metadata(
+            &h,
+            "a",
+            "last_submit_epoch_ms",
+            serde_json::json!(now - 60_000),
+        );
+        assert!(
+            should_defer_inject(&h, "a", Some("idle"), true),
+            "setup: the seeded stale draft must defer before clearing"
+        );
+        crate::notification_queue::record_cleared_activity(&h, "a");
+        crate::notification_queue::flush_pending_input_activity(&h);
+        assert!(
+            !should_defer_inject(&h, "a", Some("idle"), true),
+            "#3663: a flushed cleared observation must lift the defer"
+        );
+        std::fs::remove_dir_all(&h).ok();
+    }
 }
 
 #[cfg(test)]

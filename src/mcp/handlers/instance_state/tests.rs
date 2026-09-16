@@ -1217,6 +1217,47 @@ fn operator_has_live_draft_reflects_unsent_keystrokes() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3663: type-then-clear — a stale unsent draft PLUS a newer TUI-observed
+/// empty box reads as NO live draft, so `await_unsent_draft_or_grace` takes
+/// the fast path (no 60s block attributable to the cleared line).
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn operator_has_live_draft_clears_after_empty_box_observed_3663() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-cleared-draft-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    // A stale unsent draft (typed 30s ago, outside the 1.5s typing window) →
+    // a live draft via the Drafting arm only.
+    let now = chrono::Utc::now().timestamp_millis();
+    crate::agent_ops::save_metadata(
+        &home,
+        "a",
+        "last_input_epoch_ms",
+        serde_json::json!(now - 30_000),
+    );
+    crate::agent_ops::save_metadata(
+        &home,
+        "a",
+        "last_submit_epoch_ms",
+        serde_json::json!(now - 60_000),
+    );
+    assert!(crate::inbox::notify::operator_has_live_draft(&home, "a"));
+    // The TUI observes the visibly empty box and publishes → no live draft.
+    crate::notification_queue::record_cleared_activity(&home, "a");
+    crate::notification_queue::flush_pending_input_activity(&home);
+    assert!(!crate::inbox::notify::operator_has_live_draft(&home, "a"));
+    // The restart gate fast path returns immediately (a dropped no-draft
+    // check would hang this to the nextest timeout).
+    await_unsent_draft_or_grace(&home, "a", false);
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 fn await_unsent_draft_or_grace_returns_fast_without_a_draft() {
