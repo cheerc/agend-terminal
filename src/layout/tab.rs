@@ -603,6 +603,37 @@ mod tests {
             "a team tab without its online lead must expose uncertainty"
         );
     }
+    /// #3672 RED: a tab with no pane belonging to the lead must draw NO
+    /// lead badge — the lead-absent case (e.g. a moved-out member tab) is
+    /// not uncertainty about the lead's identity, it is simply not the
+    /// lead's tab. The old call-site `None => view.badge(lead, None)` arm
+    /// returned `Uncertain` by definition and drew ` [LEAD?]`.
+    #[test]
+    fn lead_absent_tab_draws_no_lead_badge_3672() {
+        let member_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 2);
+        let mut pane = leaf(1, "member");
+        pane.fleet_instance_name = Some("member".into());
+        pane.instance_ref = Some(member_ref);
+        let mut tab = tab_with_pane("member", 1, (0, 0, 20, 10));
+        tab.root = Some(PaneNode::Leaf(Box::new(pane)));
+        let config: crate::fleet::FleetConfig = serde_yaml_ng::from_str(
+            "teams:\n  ops:\n    members: [lead, member]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+        let mut roster = std::collections::HashMap::new();
+        roster.insert("member".to_string(), member_ref);
+        // Roster ALSO knows the lead (fresh identity) — the tab still has
+        // no pane belonging to it, so no badge may be drawn.
+        let lead_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 1);
+        roster.insert("lead".to_string(), lead_ref);
+        let view = crate::team_view::TeamView::from_fleet(config, Some(roster));
+
+        assert_eq!(
+            tab.tab_bar_label_with_team(true, Some(&view)),
+            " ops ",
+            "#3672: a tab without the lead draws no lead badge"
+        );
+    }
     #[test]
     fn split_at_pane_targets_non_focused_pane() {
         let mut tab = Tab::new("t".to_string(), leaf(1, "a"));
