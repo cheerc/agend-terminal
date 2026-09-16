@@ -947,6 +947,23 @@ fn draft_state_without_cleared_keeps_timestamp_behavior_3663() {
     std::fs::remove_dir_all(home).ok();
 }
 
+/// #3663 review F1: a FUTURE cleared observation (corrupt/clock-skewed —
+/// TUI and daemon share the host clock, so cleared can never legitimately
+/// postdate now) is IGNORED: the live draft keeps Drafting instead of being
+/// hidden (which would clobber a real input line or bypass restart grace).
+#[test]
+fn draft_state_future_cleared_stays_drafting_3663() {
+    let home = tmp_home("draft_cleared_future");
+    let now = chrono::Utc::now().timestamp_millis();
+    write_ts_cleared(&home, "a", now - 30_000, now - 60_000, now + 60_000);
+    assert_eq!(
+        draft_state(&home, "a"),
+        DraftState::Drafting,
+        "future cleared must fail closed (ignore), not hide the live draft"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
 /// #1457: escape valve releases ONE oldest notification, leaving the rest
 /// queued (no clobbering batch).
 #[test]
@@ -1372,16 +1389,39 @@ fn activity_requeue_merges_each_field_by_max_3321() {
         agent: "agent1".to_owned(),
         input_ms: Some(200),
         submit_ms: Some(400),
+        cleared_ms: None,
     };
     let newer_input = PendingActivity {
         home: target.home.clone(),
         agent: target.agent.clone(),
         input_ms: Some(300),
         submit_ms: Some(100),
+        cleared_ms: None,
     };
     merge_activity(&mut target, &newer_input);
     assert_eq!(target.input_ms, Some(300));
     assert_eq!(target.submit_ms, Some(400));
+}
+
+/// #3663: the cleared leg merges by max like input/submit.
+#[test]
+fn activity_requeue_merges_cleared_by_max_3663() {
+    let mut target = PendingActivity {
+        home: PathBuf::from("/home/agent"),
+        agent: "agent1".to_owned(),
+        input_ms: None,
+        submit_ms: None,
+        cleared_ms: Some(100),
+    };
+    let newer = PendingActivity {
+        home: target.home.clone(),
+        agent: target.agent.clone(),
+        input_ms: None,
+        submit_ms: None,
+        cleared_ms: Some(300),
+    };
+    merge_activity(&mut target, &newer);
+    assert_eq!(target.cleared_ms, Some(300));
 }
 
 /// #3321 RED: a held exact metadata lock must not park the flush worker.

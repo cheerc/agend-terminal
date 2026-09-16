@@ -18,6 +18,12 @@ const COMPOSE_METADATA_KEY: &str = "last_input_epoch_ms";
 /// `COMPOSE_METADATA_KEY` which records ANY input keystroke. Used by
 /// the daemon supervisor to detect "typed but not submitted" state.
 const SUBMIT_METADATA_KEY: &str = "last_submit_epoch_ms";
+/// #3663: epoch-ms of the most recent TUI-observed EMPTY input box. Published
+/// by the TUI (~1s badge cadence) when the #1944 probe reads `Some(true)`.
+/// Lets `draft_state` discount a stale type-then-clear (`typed > submit` but
+/// the box is visibly empty) that the timestamp-only heuristic mis-reads as
+/// `Drafting` for up to 5 min. Monotonic max-merge; absent (legacy) reads 0.
+pub(crate) const CLEARED_METADATA_KEY: &str = "last_cleared_epoch_ms";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedNotification {
@@ -55,14 +61,16 @@ fn draining_path(home: &Path, agent_name: &str) -> PathBuf {
     queue_path(home, agent_name).with_extension("draining")
 }
 
-/// #3321: latest-wins in-memory activity pair. Both producers update this
-/// buffer; the periodic flush drains one pair into one metadata RMW.
+/// #3321: latest-wins in-memory activity triple. All producers update this
+/// buffer; the periodic flush drains one triple into one metadata RMW.
 #[derive(Debug, Clone)]
 struct PendingActivity {
     home: PathBuf,
     agent: String,
     input_ms: Option<i64>,
     submit_ms: Option<i64>,
+    /// #3663: TUI-observed empty-box timestamp (monotonic max-merge).
+    cleared_ms: Option<i64>,
 }
 
 static PENDING_ACTIVITY: std::sync::Mutex<Vec<PendingActivity>> = std::sync::Mutex::new(Vec::new());
@@ -76,6 +84,9 @@ fn merge_activity(target: &mut PendingActivity, source: &PendingActivity) {
     }
     if source.submit_ms > target.submit_ms {
         target.submit_ms = source.submit_ms;
+    }
+    if source.cleared_ms > target.cleared_ms {
+        target.cleared_ms = source.cleared_ms;
     }
 }
 
@@ -99,12 +110,38 @@ fn record_activity(home: &Path, agent_name: &str, input: bool) {
             agent: agent_name.to_owned(),
             input_ms: input.then_some(timestamp),
             submit_ms: (!input).then_some(timestamp),
+            cleared_ms: None,
         });
     }
 }
 
 pub fn record_input_activity(home: &Path, agent_name: &str) {
     record_activity(home, agent_name, true);
+}
+
+/// #3663: record a TUI-observed EMPTY input box for this pane. Called from the
+/// TUI badge cadence when the #1944 probe reads `Some(true)`; buffered like
+/// input/submit (never blocks the render loop) and flushed by the same
+/// `flush_pending_input_activity` batch.
+pub fn record_cleared_activity(home: &Path, agent_name: &str) {
+    let timestamp = chrono::Utc::now().timestamp_millis();
+    let mut pending = PENDING_ACTIVITY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(entry) = pending
+        .iter_mut()
+        .find(|entry| entry.home.as_path() == home && entry.agent == agent_name)
+    {
+        entry.cleared_ms = Some(entry.cleared_ms.unwrap_or(0).max(timestamp));
+    } else {
+        pending.push(PendingActivity {
+            home: home.to_path_buf(),
+            agent: agent_name.to_owned(),
+            input_ms: None,
+            submit_ms: None,
+            cleared_ms: Some(timestamp),
+        });
+    }
 }
 
 fn take_pending_activity(home: &Path) -> Vec<PendingActivity> {
@@ -119,12 +156,15 @@ fn take_pending_activity(home: &Path) -> Vec<PendingActivity> {
 }
 
 fn activity_values(entry: &PendingActivity) -> Vec<(&str, serde_json::Value)> {
-    let mut values = Vec::with_capacity(2);
+    let mut values = Vec::with_capacity(3);
     if let Some(timestamp) = entry.input_ms {
         values.push((COMPOSE_METADATA_KEY, json!(timestamp)));
     }
     if let Some(timestamp) = entry.submit_ms {
         values.push((SUBMIT_METADATA_KEY, json!(timestamp)));
+    }
+    if let Some(timestamp) = entry.cleared_ms {
+        values.push((CLEARED_METADATA_KEY, json!(timestamp)));
     }
     values
 }
@@ -196,6 +236,15 @@ pub fn flush_pending_activity_at_teardown(home: &Path) {
 /// detection — keeps the read inline-cheap (single file read, single
 /// JSON parse) so per-tick overhead stays bounded.
 pub fn read_input_submit_timestamps(home: &Path, agent_name: &str) -> (i64, i64) {
+    let (typed_ms, submit_ms, _) = read_draft_timestamps(home, agent_name);
+    (typed_ms, submit_ms)
+}
+
+/// #3663: read the full draft triple `(typed_ms, submit_ms, cleared_ms)`.
+/// `cleared_ms` is `0` when missing (legacy metadata, or the TUI never
+/// observed an empty box). Single file read / single JSON parse, same as
+/// the pair reader — the draft gate must not double the per-tick disk I/O.
+pub fn read_draft_timestamps(home: &Path, agent_name: &str) -> (i64, i64, i64) {
     // #1680: resolve via the SAME path resolver the write side uses
     // (`save_metadata` → `metadata_path_resolved`). The previous hand-coded
     // `metadata/<name>.json` read the never-written name file while the write
@@ -203,14 +252,15 @@ pub fn read_input_submit_timestamps(home: &Path, agent_name: &str) -> (i64, i64)
     // (`None`) and the inject path force-submitted the operator's unsent draft.
     let meta_path = agent_ops::metadata_path_resolved(home, agent_name);
     let Ok(content) = std::fs::read_to_string(meta_path) else {
-        return (0, 0);
+        return (0, 0, 0);
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return (0, 0);
+        return (0, 0, 0);
     };
     let typed_ms = value[COMPOSE_METADATA_KEY].as_i64().unwrap_or(0);
     let submit_ms = value[SUBMIT_METADATA_KEY].as_i64().unwrap_or(0);
-    (typed_ms, submit_ms)
+    let cleared_ms = value[CLEARED_METADATA_KEY].as_i64().unwrap_or(0);
+    (typed_ms, submit_ms, cleared_ms)
 }
 
 /// #1457: how long an unsent draft defers notification delivery before the
@@ -239,12 +289,26 @@ pub enum DraftState {
 /// #1457: classify the focused pane's draft state for delivery gating.
 /// `typed > submit` means keystrokes were entered but not submitted (a live
 /// draft); `typed <= submit` (or never typed) means the buffer is clean.
+///
+/// #3663: a TUI-observed empty box NEWER than the last keystroke
+/// (`cleared_ms > typed_ms`, strict — a tie keeps protection) discounts the
+/// stale type-then-clear as `None`, even though `typed > submit` still holds.
+/// A tie or older observation means the operator typed AFTER the empty read —
+/// a live draft — so protection stands.
+///
+/// Fail-closed (review F1): a FUTURE cleared observation (`cleared_ms >
+/// now_ms` — corrupt or clock-skewed, since TUI and daemon share the host
+/// clock) is IGNORED, not honored: a future clear must never hide a live
+/// draft and clobber a real input line or bypass restart grace.
 pub fn draft_state(home: &Path, agent_name: &str) -> DraftState {
-    let (typed_ms, submit_ms) = read_input_submit_timestamps(home, agent_name);
+    let (typed_ms, submit_ms, cleared_ms) = read_draft_timestamps(home, agent_name);
     if typed_ms == 0 || typed_ms <= submit_ms {
         return DraftState::None;
     }
     let now_ms = chrono::Utc::now().timestamp_millis();
+    if cleared_ms > typed_ms && cleared_ms <= now_ms {
+        return DraftState::None;
+    }
     if now_ms.saturating_sub(typed_ms) < draft_escape_timeout_ms() {
         DraftState::Drafting
     } else if submit_ms == 0 {

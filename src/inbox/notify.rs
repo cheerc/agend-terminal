@@ -1878,7 +1878,7 @@ mod should_defer_inject_tests_1513 {
 
     // #3663: end-to-end cleared path — seeded stale draft defers; then a
     // flushed cleared observation lifts the defer (no sleeps: seeded stale).
-    // Writes the key literally so this RED test compiles against base.
+    // Writes the key literally (RED-compatible: compiles against base).
     #[test]
     fn cleared_record_flush_round_trip_lifts_defer_3663() {
         let h = tmp_home("cleared-roundtrip");
@@ -1908,6 +1908,62 @@ mod should_defer_inject_tests_1513 {
         assert!(
             !should_defer_inject(&h, "a", Some("idle"), true),
             "#3663: a flushed cleared observation must lift the defer"
+        );
+        std::fs::remove_dir_all(&h).ok();
+    }
+
+    // #3663 GREEN: the same round-trip through the production record API
+    // (`record_cleared_activity` + batch flush) — pins the buffered publish
+    // path the TUI uses, not just the metadata key reading.
+    #[test]
+    fn cleared_record_api_flush_round_trip_lifts_defer_3663() {
+        let h = tmp_home("cleared-record-api");
+        let now = chrono::Utc::now().timestamp_millis();
+        crate::agent_ops::save_metadata(
+            &h,
+            "a",
+            "last_input_epoch_ms",
+            serde_json::json!(now - 30_000),
+        );
+        crate::agent_ops::save_metadata(
+            &h,
+            "a",
+            "last_submit_epoch_ms",
+            serde_json::json!(now - 60_000),
+        );
+        assert!(
+            should_defer_inject(&h, "a", Some("idle"), true),
+            "setup: the seeded stale draft must defer before clearing"
+        );
+        crate::notification_queue::record_cleared_activity(&h, "a");
+        crate::notification_queue::flush_pending_input_activity(&h);
+        assert!(
+            !should_defer_inject(&h, "a", Some("idle"), true),
+            "#3663: a flushed cleared observation must lift the defer"
+        );
+        std::fs::remove_dir_all(&h).ok();
+    }
+
+    // #3663 review F1: a FUTURE cleared observation must NOT lift the defer —
+    // fail closed toward draft protection.
+    #[test]
+    fn actionable_defers_when_cleared_in_future_3663() {
+        let h = tmp_home("cleared-future");
+        let now = chrono::Utc::now().timestamp_millis();
+        std::fs::create_dir_all(h.join("metadata")).unwrap();
+        std::fs::write(
+            h.join("metadata").join("a.json"),
+            format!(
+                "{{\"last_input_epoch_ms\":{},\"last_submit_epoch_ms\":{},\"last_cleared_epoch_ms\":{}}}",
+                now - 30_000,
+                now - 60_000,
+                now + 60_000
+            ),
+        )
+        .unwrap();
+        assert!(
+            should_defer_inject(&h, "a", Some("idle"), true),
+            "#3663 F1: future cleared must fail closed (keep deferring)"
         );
         std::fs::remove_dir_all(&h).ok();
     }
