@@ -77,6 +77,16 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(5);
 /// scheduling noise while still bounding an MCP worker's stall.
 pub const DEFAULT_BOUNDED_BUDGET: Duration = Duration::from_millis(250);
 
+/// #3669: three-dimensional retention for `fleet_events.jsonl` — the same
+/// shape as the daemon's `mcp::usage_stats` policy (live bytes + generation
+/// count + max age), duplicated here (not shared) because this crate is a
+/// standalone workspace member with no dependency on the daemon crate — and
+/// the shim binary that links it cannot depend on daemon code either.
+/// Keep the values in sync with `src/jsonl_retention.rs`'s retention table.
+pub const MAX_LIVE_BYTES: u64 = 10 * 1024 * 1024;
+pub const MAX_ROTATED_FILES: usize = 5;
+pub const MAX_ROTATED_AGE: Duration = Duration::from_secs(30 * 86400);
+
 /// Path of the audit log under `home`.
 pub fn audit_path(home: &Path) -> PathBuf {
     home.join(AUDIT_FILE)
@@ -218,12 +228,97 @@ fn append_audit_line(
     acquire(&lock, mode)?;
 
     // (2) Exactly one `write_all` while the lock is held.
-    let result = target.write_all(line.as_bytes()).map_err(AppendError::Write);
+    let result = target
+        .write_all(line.as_bytes())
+        .map_err(AppendError::Write);
+    drop(target);
+
+    // #3669: retention INSIDE the lock hold — rotate + prune before the
+    // lock releases, so no concurrent appender can interleave into the
+    // file being renamed or miss the size check.
+    if result.is_ok() {
+        maintain_retention(home);
+    }
 
     // Released by the OS on close; explicit so the critical section's end is
     // visible rather than implied by scope.
     drop(lock);
     result
+}
+
+/// #3669: best-effort retention pass over `fleet_events.jsonl` — called with
+/// the companion lock HELD. Every step is infallible-by-contract (errors
+/// swallowed): retention must never fail an audit append, and the fail-closed
+/// gates treat `Ok` as "record trustworthy", so a retention failure must not
+/// surface as an append failure either.
+fn maintain_retention(home: &Path) {
+    let path = audit_path(home);
+    rotate_if_needed(&path);
+    prune_rotated(&path, std::time::SystemTime::now());
+}
+
+fn rotated_audit_path(base: &Path, gen: usize) -> PathBuf {
+    let mut name = base.file_name().map(|s| s.to_owned()).unwrap_or_default();
+    name.push(format!(".{gen}"));
+    base.with_file_name(name)
+}
+
+fn rotate_if_needed(path: &Path) {
+    if MAX_ROTATED_FILES == 0 {
+        return;
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.len() <= MAX_LIVE_BYTES {
+        return;
+    }
+
+    let _ = std::fs::remove_file(rotated_audit_path(path, MAX_ROTATED_FILES));
+    for gen in (1..MAX_ROTATED_FILES).rev() {
+        let src = rotated_audit_path(path, gen);
+        let dst = rotated_audit_path(path, gen + 1);
+        if src.exists() {
+            let _ = std::fs::rename(src, dst);
+        }
+    }
+    if std::fs::rename(path, rotated_audit_path(path, 1)).is_ok() {
+        let _ = std::fs::File::create(path);
+    }
+}
+
+fn prune_rotated(path: &Path, now: std::time::SystemTime) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let Some(base_name) = path.file_name().and_then(|s| s.to_str()) else {
+        return;
+    };
+    let prefix = format!("{base_name}.");
+
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let entry_path = entry.path();
+        let Some(name) = entry_path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some(gen) = name
+            .strip_prefix(&prefix)
+            .and_then(|s| s.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let mtime = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let too_old = now
+            .duration_since(mtime)
+            .map(|age| age > MAX_ROTATED_AGE)
+            .unwrap_or(false);
+        if gen > MAX_ROTATED_FILES || too_old {
+            let _ = std::fs::remove_file(&entry_path);
+        }
+    }
 }
 
 /// Map one `try_lock` outcome onto the error the caller sees.
@@ -369,7 +464,10 @@ mod tests {
         for i in 0..N {
             append_audit_line_bounded(&home, &row(i), DEFAULT_BOUNDED_BUDGET).unwrap();
         }
-        let mut seqs: Vec<u64> = rows(&home).iter().filter_map(|r| r["seq"].as_u64()).collect();
+        let mut seqs: Vec<u64> = rows(&home)
+            .iter()
+            .filter_map(|r| r["seq"].as_u64())
+            .collect();
         seqs.sort_unstable();
         assert_eq!(
             seqs,
@@ -439,6 +537,92 @@ mod tests {
         assert_eq!(raw.matches('\n').count(), 1, "exactly one newline");
         assert!(raw.ends_with('\n'), "the line must be terminated");
         assert_eq!(rows(&home).len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3669: an oversized live audit log rotates down on the next append —
+    /// the crossing record is preserved in generation .1 and the live file
+    /// is back under the budget.
+    #[test]
+    fn oversized_live_rotates_on_next_append_3669() {
+        let home = tmp_home("oversize-3669");
+        std::fs::write(audit_path(&home), "x".repeat(MAX_LIVE_BYTES as usize + 1)).unwrap();
+
+        append_audit_line_bounded(&home, &row(0), DEFAULT_BOUNDED_BUDGET).unwrap();
+
+        let live = std::fs::metadata(audit_path(&home)).unwrap().len();
+        assert!(
+            live <= MAX_LIVE_BYTES,
+            "live audit log must rotate down on next append; got {live}"
+        );
+        assert!(
+            rotated_audit_path(&audit_path(&home), 1).exists(),
+            "rotation must preserve history in generation .1"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3669: generations past the cap are pruned on append.
+    #[test]
+    fn generation_cap_prunes_oldest_3669() {
+        let home = tmp_home("gens-3669");
+        let base = audit_path(&home);
+        for gen in 1..=MAX_ROTATED_FILES {
+            std::fs::write(rotated_audit_path(&base, gen), "gen\n").unwrap();
+        }
+        std::fs::write(&base, "x".repeat(MAX_LIVE_BYTES as usize + 1)).unwrap();
+
+        append_audit_line_bounded(&home, &row(0), DEFAULT_BOUNDED_BUDGET).unwrap();
+
+        assert!(
+            !rotated_audit_path(&base, MAX_ROTATED_FILES + 1).exists(),
+            "generation cap must prune beyond MAX_ROTATED_FILES"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3669: a stale rotated generation is pruned even without size rotation.
+    #[test]
+    fn age_cap_prunes_stale_generations_3669() {
+        use std::time::Duration;
+        let home = tmp_home("age-3669");
+        let base = audit_path(&home);
+        let old = rotated_audit_path(&base, 1);
+        let fresh = rotated_audit_path(&base, 2);
+        std::fs::write(&old, "old\n").unwrap();
+        std::fs::write(&fresh, "fresh\n").unwrap();
+
+        let stale = std::time::SystemTime::now() - Duration::from_secs(30 * 86400 + 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+
+        append_audit_line_bounded(&home, &row(0), DEFAULT_BOUNDED_BUDGET).unwrap();
+
+        assert!(!old.exists(), "stale rotated generation must be pruned");
+        assert!(fresh.exists(), "fresh rotated generation must be retained");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3669: retention is best-effort — a rotation on an unwritable home
+    /// must not turn the append itself into an error.
+    #[test]
+    #[cfg(unix)]
+    fn retention_failure_never_fails_the_append_3669() {
+        let home = tmp_home("best-effort-3669");
+        // A directory as the audit path: the append's open fails with Open
+        // (proving the failure path still works), but more importantly a
+        // home where rotation cannot proceed must not panic.
+        std::fs::create_dir_all(audit_path(&home)).unwrap();
+        let err = append_audit_line_bounded(&home, &row(0), DEFAULT_BOUNDED_BUDGET)
+            .expect_err("append to a directory must fail");
+        assert!(
+            matches!(err, AppendError::Open(_)),
+            "append failure mode unchanged by retention: {err:?}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
