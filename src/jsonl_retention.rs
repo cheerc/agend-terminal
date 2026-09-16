@@ -148,9 +148,15 @@ fn prune_rotated(path: &Path, policy: RetentionPolicy, now: SystemTime) {
 /// generation + age caps WITHOUT touching the live `.jsonl` file itself —
 /// the live file only ever shrinks via on-write rotation, so a sweep can
 /// never drop audit records. Returns the number of generation files
-/// removed. Lock-free by design: it only deletes `.N` files (never the
-/// live file writers hold), so no companion lock is needed; a concurrent
-/// on-write prune deleting the same file first is a harmless no-op.
+/// removed.
+///
+/// #3671: each store is swept under its own companion lock
+/// (non-blocking — a contended store is SKIPPED, never waited on, so tick
+/// cadence never stalls behind a writer). Writer rotation is a multi-step
+/// remove/shift/rename sequence; a lock-free sweep could observe `.4` as
+/// over-cap after the writer removed `.5` but before the `.4`→`.5` rename
+/// landed, delete `.4`, and the writer's ignored rename error would then
+/// drop that generation permanently.
 ///
 /// Covered stores and their policies live in the module retention table.
 pub fn sweep_rotated_generations(home: &Path) -> usize {
@@ -166,6 +172,14 @@ pub fn sweep_rotated_generations(home: &Path) -> usize {
     let mut removed = 0;
     for (file, max_gens, max_age) in stores {
         let path = home.join(file);
+        // Non-blocking: skip the store when a writer holds its companion
+        // lock rather than pruning under an in-flight rotation. The guard
+        // must stay alive for the whole prune — dropping it early would
+        // reopen the interleave window.
+        let _guard = match crate::store::try_acquire_file_lock(&path.with_extension("jsonl.lock")) {
+            Ok(Some(guard)) => guard,
+            Ok(None) | Err(_) => continue,
+        };
         let before: Vec<PathBuf> = (1..=(*max_gens + 4))
             .map(|gen| rotated_path(&path, gen))
             .filter(|p| p.exists())
@@ -307,8 +321,8 @@ mod tests {
         std::fs::write(&residue, "gen\n").unwrap();
 
         let lock_path = path.with_extension("jsonl.lock");
-        let _guard = crate::store::acquire_file_lock(&lock_path)
-            .expect("test holds the writer lock");
+        let _guard =
+            crate::store::acquire_file_lock(&lock_path).expect("test holds the writer lock");
 
         let _swept = sweep_rotated_generations(&home);
 
@@ -326,6 +340,142 @@ mod tests {
             swept_after >= 1 && !residue.exists(),
             "after the writer releases the lock the sweep must clear the \
              over-cap generation; got swept={swept_after}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3671-D: the age cap boundary is strict-greater-than — a generation
+    /// exactly at the cap is retained, one past it is pruned. (±60 s margins
+    /// keep filesystem mtime granularity out of the assertion.)
+    #[test]
+    fn age_cap_boundary_is_strict_greater_than_3671() {
+        let home = tmp_home("age-boundary-3671");
+        let path = home.join("state-transitions.jsonl");
+        let at_cap = rotated_path(&path, 1);
+        let past_cap = rotated_path(&path, 2);
+        std::fs::write(&at_cap, "at-cap\n").unwrap();
+        std::fs::write(&past_cap, "past-cap\n").unwrap();
+
+        let age_policy = RetentionPolicy {
+            max_live_bytes: 1024 * 1024,
+            max_rotated_files: 5,
+            max_rotated_age: Duration::from_secs(3600),
+        };
+        let now = SystemTime::now();
+        std::fs::File::options()
+            .write(true)
+            .open(&at_cap)
+            .unwrap()
+            .set_modified(now - Duration::from_secs(3540))
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&past_cap)
+            .unwrap()
+            .set_modified(now - Duration::from_secs(3660))
+            .unwrap();
+
+        append_line_with_retention(&path, &json!({"ts": "now"}), age_policy).unwrap();
+
+        assert!(
+            at_cap.exists(),
+            "a generation within the age cap must be retained"
+        );
+        assert!(
+            !past_cap.exists(),
+            "a generation past the age cap must be pruned"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3671-D: a symlinked generation is removed as a link — the sweep
+    /// deletes the `.N` link itself and never follows it into the target.
+    #[test]
+    #[cfg(unix)]
+    fn sweep_removes_symlink_generation_but_keeps_target_3671() {
+        let home = tmp_home("symlink-3671");
+        let path = home.join("state-transitions.jsonl");
+        std::fs::write(&path, "live\n").unwrap();
+        let target = home.join("outside-target.txt");
+        std::fs::write(&target, "outside\n").unwrap();
+        let link = rotated_path(&path, 6);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let swept = sweep_rotated_generations(&home);
+
+        assert!(
+            swept >= 1 && !link.exists() && target.exists(),
+            "sweep must remove the over-cap symlink generation itself while \
+             keeping its target; swept={swept}"
+        );
+        assert!(
+            std::fs::read_to_string(&path).unwrap() == "live\n",
+            "the live file must be byte-identical after a sweep"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3671-D: concurrent writers (rotating under the companion lock) and
+    /// the hourly sweep interleave without loss or panic — every acknowledged
+    /// row survives somewhere in live + generations, and the live file only
+    /// ever holds complete lines.
+    #[test]
+    fn concurrent_writers_and_sweep_lose_nothing_3671() {
+        use std::sync::{Arc, Barrier};
+        let home = tmp_home("concurrent-3671");
+        let path = home.join("state-transitions.jsonl");
+        let tiny = RetentionPolicy {
+            max_live_bytes: 512,
+            max_rotated_files: 3,
+            max_rotated_age: Duration::from_secs(30 * 86400),
+        };
+        const WRITERS: usize = 4;
+        const ROWS: usize = 25;
+        let barrier = Arc::new(Barrier::new(WRITERS + 1));
+        let mut handles = Vec::new();
+        for w in 0..WRITERS {
+            let home = home.clone();
+            let path = path.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for r in 0..ROWS {
+                    let row = json!({"w": w, "r": r});
+                    append_line_with_retention(&path, &row, tiny).unwrap();
+                    if r % 5 == 0 {
+                        sweep_rotated_generations(&home);
+                    }
+                }
+            }));
+        }
+        barrier.wait();
+        for h in handles {
+            h.join().expect("writer thread must not panic");
+        }
+        sweep_rotated_generations(&home);
+
+        let mut seen = std::collections::HashSet::new();
+        let mut files = vec![path.clone()];
+        for gen in 1..=tiny.max_rotated_files {
+            let p = rotated_path(&path, gen);
+            if p.exists() {
+                files.push(p);
+            }
+        }
+        for f in &files {
+            for line in std::fs::read_to_string(f).unwrap().lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let v: serde_json::Value =
+                    serde_json::from_str(line).expect("every row must be parseable");
+                seen.insert((v["w"].as_u64().unwrap(), v["r"].as_u64().unwrap()));
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            WRITERS * ROWS,
+            "every acknowledged row must survive in live + generations"
         );
         std::fs::remove_dir_all(&home).ok();
     }
