@@ -290,6 +290,46 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// #3671-B RED: the hourly sweep must serialize with the writer's
+    /// companion lock. Writer rotation is a multi-step remove/shift/rename
+    /// sequence; a lock-free sweep can observe `.4` as over-cap after the
+    /// writer removed `.5` but before the `.4`→`.5` rename lands, delete
+    /// `.4`, and the writer's ignored rename error then drops that
+    /// generation permanently. While a writer holds the companion lock the
+    /// sweep must skip that store (non-blocking — tick cadence must not
+    /// stall) instead of pruning under it.
+    #[test]
+    fn sweep_skips_store_while_writer_holds_lock_3671() {
+        let home = tmp_home("sweep-locked-3671");
+        let path = home.join("state-transitions.jsonl");
+        std::fs::write(&path, "live\n").unwrap();
+        let residue = rotated_path(&path, 6);
+        std::fs::write(&residue, "gen\n").unwrap();
+
+        let lock_path = path.with_extension("jsonl.lock");
+        let _guard = crate::store::acquire_file_lock(&lock_path)
+            .expect("test holds the writer lock");
+
+        let _swept = sweep_rotated_generations(&home);
+
+        assert!(
+            residue.exists(),
+            "#3671-B: sweep must not prune a store whose companion lock is \
+             held by a writer — rotation is a multi-step remove/rename \
+             sequence and an interleaved sweep can drop a generation \
+             permanently"
+        );
+
+        drop(_guard);
+        let swept_after = sweep_rotated_generations(&home);
+        assert!(
+            swept_after >= 1 && !residue.exists(),
+            "after the writer releases the lock the sweep must clear the \
+             over-cap generation; got swept={swept_after}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// The hourly sweep removes over-cap generations but NEVER the live
     /// file: residue left by an older build (`.6`, `.7`) is swept while
     /// `state-transitions.jsonl` itself is untouched.

@@ -607,6 +607,37 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// #3671-A RED: the target must be opened only AFTER the companion
+    /// lock is acquired. A refused (Contended) append must leave no trace —
+    /// but the open-before-lock order creates the (empty) target file before
+    /// even attempting the lock, so a skipped record still mutates the home
+    /// dir. Worse, the same order lets a concurrent rotation rename the live
+    /// inode out from under the pre-opened descriptor, diverting the write
+    /// into generation `.1` instead of the live file.
+    #[test]
+    fn contended_append_leaves_no_target_behind_3671() {
+        let home = tmp_home("contended-no-target-3671");
+        assert!(
+            !audit_path(&home).exists(),
+            "precondition: no audit log yet in this home"
+        );
+        let holder = hold(&home);
+
+        let err = append_audit_line_best_effort(&home, &row(0))
+            .expect_err("must skip while the lock is held");
+        assert!(matches!(err, AppendError::Contended), "got {err:?}");
+        assert!(
+            !audit_path(&home).exists(),
+            "#3671-A: a Contended append must not create the target file — \
+             the target may only be opened after the lock is held, otherwise \
+             a concurrent rotation can rename the inode under the pre-opened \
+             descriptor and divert the write into generation .1"
+        );
+
+        drop(holder);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// #3669: retention is best-effort — a rotation on an unwritable home
     /// must not turn the append itself into an error.
     #[test]
