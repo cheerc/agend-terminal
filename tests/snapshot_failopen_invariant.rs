@@ -157,6 +157,11 @@ const AUDITED_FILES: &[(&str, &str, &str)] = &[
         "writer",
         "#3417 test fixture: runs the real snapshot writer and reads its synthetic output to verify runtime-created config convergence. Not a production decision reader; this file contains tests only.",
     ),
+    (
+        "src/app/tests.rs",
+        "writer",
+        "test fixture: writes synthetic snapshots (crate::snapshot::save/AgentSnapshot) so run_core snapshot tests have deterministic agent state. Not a reader; no production decision reads snapshot here — the whole file is #[cfg(test)]-only via its `mod tests;` declaration in app/mod.rs, which the AST scanner (parsing this file standalone) cannot see.",
+    ),
 ];
 
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
