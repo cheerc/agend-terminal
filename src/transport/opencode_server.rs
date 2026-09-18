@@ -35,6 +35,20 @@ const OPENCODE_MESSAGE_ID_RANDOM_LEN: usize = 14;
 const OPENCODE_MESSAGE_ID_TIMESTAMP_MASK: u64 = (1_u64 << 48) - 1;
 const OPENCODE_MESSAGE_ID_TIMESTAMP_HALF_RANGE: u64 = 1_u64 << 47;
 const ROLLOVER_JOURNAL_VERSION: u8 = 1;
+/// Busy-parked ordinary deliveries are re-driven FIFO when the in-flight turn
+/// completes. A parked delivery that keeps colliding with a busy session is
+/// failed closed after this many park events — never retried forever.
+const MAX_PARKED_REDRIVE_ATTEMPTS: u32 = 3;
+
+/// An ordinary delivery parked while another turn held the session, waiting
+/// for `complete()` to re-drive it. `attempts` counts park events (the
+/// initial busy collision is 1); the cap is enforced in `deliver_blocking`
+/// and defensively in `redrive_parked`.
+#[derive(Debug, Clone)]
+struct ParkedDelivery {
+    envelope: DeliveryEnvelope,
+    attempts: u32,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RolloverJournal {
@@ -1175,6 +1189,9 @@ pub(crate) struct OpenCodeNativeShared {
     backend_version: Option<String>,
     in_flight: Option<Uuid>,
     pending: HashMap<Uuid, DeliveryEnvelope>,
+    /// Ordinary deliveries parked by a busy collision, in arrival order.
+    /// `complete()` re-drives them FIFO through the normal submit path.
+    parked: VecDeque<ParkedDelivery>,
     /// Delivery IDs that have been observed in a message-specific event or
     /// session history. Session-level status is never enough by itself.
     target_confirmed: HashSet<Uuid>,
@@ -1194,6 +1211,7 @@ impl OpenCodeNativeShared {
             backend_version: None,
             in_flight: None,
             pending: HashMap::new(),
+            parked: VecDeque::new(),
             target_confirmed: HashSet::new(),
             events: VecDeque::new(),
             stream: None,
@@ -1277,16 +1295,53 @@ impl OpenCodeNativeShared {
             ));
         }
         if self.in_flight.is_some() {
-            let mut failed = DeliveryReceipt::for_state(&envelope, DeliveryState::Failed);
-            failed.detail = Some(
-                "OpenCode ordinary turn is already in flight; no durable queue accepted this delivery"
-                    .to_string(),
-            );
-            store.record(failed)?;
+            // The session is busy, but the durable Queued row above already
+            // accepted this delivery: park the intent for FIFO re-drive when
+            // the in-flight turn completes instead of failing terminally.
+            let prior = self
+                .parked
+                .iter()
+                .find(|parked| parked.envelope.delivery_id == envelope.delivery_id)
+                .map(|parked| parked.attempts)
+                .unwrap_or(0);
+            let attempts = prior + 1;
+            self.parked
+                .retain(|parked| parked.envelope.delivery_id != envelope.delivery_id);
+            if attempts > MAX_PARKED_REDRIVE_ATTEMPTS {
+                let mut failed = DeliveryReceipt::for_state(&envelope, DeliveryState::Failed);
+                failed.detail = Some(
+                    "OpenCode ordinary turn is already in flight; parked redrive attempts exhausted"
+                        .to_string(),
+                );
+                store.record(failed)?;
+                return Err(anyhow::anyhow!(
+                    "OpenCode session already has an ordinary turn in flight"
+                ));
+            }
+            self.parked.push_back(ParkedDelivery {
+                envelope: envelope.clone(),
+                attempts,
+            });
+            let mut queued = DeliveryReceipt::for_state(&envelope, DeliveryState::Queued);
+            queued.detail = Some(format!(
+                "OpenCode ordinary turn is in flight; parked for redrive (attempt {attempts})"
+            ));
+            store.record(queued)?;
             return Err(anyhow::anyhow!(
                 "OpenCode session already has an ordinary turn in flight"
             ));
         }
+        self.submit_prompt_async(&store, &envelope)
+    }
+
+    /// The post-gate half of `deliver_blocking`: attach, rollover check, and
+    /// `prompt_async` submit. Shared by fresh deliveries and parked re-drives
+    /// so both face identical validation.
+    fn submit_prompt_async(
+        &mut self,
+        store: &ReceiptStore,
+        envelope: &DeliveryEnvelope,
+    ) -> anyhow::Result<DeliveryReceipt> {
         let locator = self
             .locator
             .clone()
@@ -1301,7 +1356,7 @@ impl OpenCodeNativeShared {
             previous_wire_message_id.as_deref(),
             self.message_id_timestamp(),
         ) {
-            return self.begin_rollover(&store, &envelope, &session_id);
+            return self.begin_rollover(store, envelope, &session_id);
         }
         let wire_message_id = match self.next_message_id(previous_wire_message_id.as_deref()) {
             Ok(message_id) => message_id,
@@ -1341,8 +1396,8 @@ impl OpenCodeNativeShared {
         };
         let _ = response;
         self.record_accepted(
-            &store,
-            &envelope,
+            store,
+            envelope,
             wire_message_id,
             session_id,
             "OpenCode prompt_async accepted",
@@ -2137,10 +2192,112 @@ impl OpenCodeNativeShared {
         self.in_flight = None;
         self.pending.remove(&delivery_id);
         self.target_confirmed.remove(&delivery_id);
+        self.redrive_parked()?;
         Ok(BackendEvent::Completed {
             delivery_id,
             event: method.to_string(),
         })
+    }
+
+    /// Re-drive busy-parked deliveries FIFO through the normal submit path.
+    /// Each intent is removed from `parked` BEFORE attempting so a delivery
+    /// is never submitted twice; a re-drive that collides busy again is
+    /// re-parked with `attempts + 1` and failed closed past the cap. Only the
+    /// intents parked before this call are retried — intents re-parked by
+    /// this round wait for the next completion — so the loop always ends.
+    fn redrive_parked(&mut self) -> anyhow::Result<()> {
+        if self.parked.is_empty() {
+            return Ok(());
+        }
+        // Parked intents only exist after a successful attach in this adapter
+        // lifetime; without a locator there is nothing safe to submit, so
+        // leave the queue intact for the next completion.
+        if self.locator.is_none() {
+            return Ok(());
+        }
+        let store = ReceiptStore::for_instance(&self.home, &self.instance)?;
+        let redrive_count = self.parked.len();
+        for _ in 0..redrive_count {
+            let Some(parked) = self.parked.pop_front() else {
+                break;
+            };
+            if self.in_flight.is_some() {
+                let attempts = parked.attempts + 1;
+                if attempts > MAX_PARKED_REDRIVE_ATTEMPTS {
+                    let mut failed =
+                        DeliveryReceipt::for_state(&parked.envelope, DeliveryState::Failed);
+                    failed.detail = Some(
+                        "OpenCode ordinary turn is already in flight; parked redrive attempts exhausted"
+                            .to_string(),
+                    );
+                    store.record(failed)?;
+                } else {
+                    let mut queued =
+                        DeliveryReceipt::for_state(&parked.envelope, DeliveryState::Queued);
+                    queued.detail = Some(format!(
+                        "OpenCode ordinary turn is in flight; parked for redrive (attempt {attempts})"
+                    ));
+                    store.record(queued)?;
+                    self.parked.push_back(ParkedDelivery {
+                        envelope: parked.envelope,
+                        attempts,
+                    });
+                }
+                continue;
+            }
+            if parked.attempts > MAX_PARKED_REDRIVE_ATTEMPTS {
+                let mut failed =
+                    DeliveryReceipt::for_state(&parked.envelope, DeliveryState::Failed);
+                failed.detail = Some(
+                    "OpenCode ordinary turn is already in flight; parked redrive attempts exhausted"
+                        .to_string(),
+                );
+                store.record(failed)?;
+                continue;
+            }
+            if let Some(latest) = store.latest(parked.envelope.delivery_id)? {
+                if latest.state.is_terminal() {
+                    continue;
+                }
+            }
+            match self.submit_prompt_async(&store, &parked.envelope) {
+                Ok(_) => {}
+                Err(error)
+                    if error
+                        .to_string()
+                        .contains("already has an ordinary turn in flight") =>
+                {
+                    let attempts = parked.attempts + 1;
+                    if attempts > MAX_PARKED_REDRIVE_ATTEMPTS {
+                        let mut failed =
+                            DeliveryReceipt::for_state(&parked.envelope, DeliveryState::Failed);
+                        failed.detail = Some(
+                            "OpenCode ordinary turn is already in flight; parked redrive attempts exhausted"
+                                .to_string(),
+                        );
+                        store.record(failed)?;
+                    } else {
+                        let mut queued =
+                            DeliveryReceipt::for_state(&parked.envelope, DeliveryState::Queued);
+                        queued.detail = Some(format!(
+                            "OpenCode ordinary turn is in flight; parked for redrive (attempt {attempts})"
+                        ));
+                        store.record(queued)?;
+                        self.parked.push_back(ParkedDelivery {
+                            envelope: parked.envelope,
+                            attempts,
+                        });
+                    }
+                }
+                Err(_) => {
+                    // Any other submit outcome (Failed/Ambiguous/Completed) is
+                    // already recorded durably by the submit path; the intent
+                    // stays dropped and the loop moves to the next parked
+                    // delivery while the session is still idle.
+                }
+            }
+        }
+        Ok(())
     }
 
     fn poll_event_blocking(&mut self) -> anyhow::Result<Option<BackendEvent>> {
