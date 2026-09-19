@@ -6,6 +6,7 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 use crate::team_view::TeamView;
+use crate::types::InstanceRef;
 #[path = "app_state_remote.rs"]
 mod app_state_remote;
 
@@ -108,6 +109,91 @@ fn attach_retry_due_for_test(consecutive_failures: u32) -> bool {
 fn advance_deferred_for_test(fails: u32) -> (u32, bool) {
     advance_deferred(fails)
 }
+
+/// #3627: how many consecutive Live snapshots at the SAME daemon generation
+/// must agree that an exact instance ref is absent before the poll fallback
+/// removes its panes. Two snapshots keep a single racing poll from destroying
+/// a just-deleted-then-recreated instance; a generation change resets the
+/// count so a daemon restart can never accumulate confirmations across boots.
+pub(super) const CONFIRMED_RETIREMENT_SNAPSHOTS: u8 = 2;
+
+/// #3627: poll-fallback retirement candidate for one exact instance ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RetirementCandidate {
+    /// Daemon generation token (`.daemon` identity) the count belongs to.
+    generation: String,
+    /// Consecutive Live snapshots at `generation` that saw the ref absent.
+    confirmations: u8,
+}
+
+/// #3627 pure policy. Advance the confirmed-retirement tracker for one Live
+/// snapshot and return the exact refs whose retirement is now CONFIRMED.
+///
+/// Callers MUST only reach this with definitive reads: the daemon reported
+/// `Live`, and the fleet + registry snapshot reads succeeded. Under those
+/// preconditions a ref is removed only when:
+/// - it is currently rendered on a pane, yet absent from the exact live
+///   roster, AND
+/// - [`CONFIRMED_RETIREMENT_SNAPSHOTS`] consecutive snapshots at the SAME
+///   daemon `generation` agree, AND
+/// - no restart/reconnect is in flight for it.
+///
+/// A ref that reappears, moves generation, or has an in-flight restart is
+/// dropped from the tracker (its pane is retained). Candidates for refs no
+/// longer rendered are purged, so the operation stays idempotent.
+fn confirmed_retirements(
+    candidates: &mut HashMap<InstanceRef, RetirementCandidate>,
+    rendered: &[InstanceRef],
+    live_refs: &std::collections::HashSet<InstanceRef>,
+    generation: &str,
+    restart_in_flight: &std::collections::HashSet<InstanceRef>,
+) -> Vec<InstanceRef> {
+    let rendered_set: std::collections::HashSet<InstanceRef> = rendered.iter().copied().collect();
+    candidates.retain(|reference, _| rendered_set.contains(reference));
+    let mut confirmed = Vec::new();
+    let mut counted: std::collections::HashSet<InstanceRef> = std::collections::HashSet::new();
+    for reference in rendered.iter().copied() {
+        // A ref rendered on more than one pane is still ONE ref: it must not
+        // accumulate multiple confirmations in a single snapshot.
+        if !counted.insert(reference) {
+            continue;
+        }
+        if live_refs.contains(&reference) || restart_in_flight.contains(&reference) {
+            candidates.remove(&reference);
+            continue;
+        }
+        let entry = candidates
+            .entry(reference)
+            .or_insert_with(|| RetirementCandidate {
+                generation: generation.to_string(),
+                confirmations: 0,
+            });
+        if entry.generation != generation {
+            entry.generation = generation.to_string();
+            entry.confirmations = 0;
+        }
+        entry.confirmations = entry.confirmations.saturating_add(1);
+        if entry.confirmations >= CONFIRMED_RETIREMENT_SNAPSHOTS {
+            confirmed.push(reference);
+        }
+    }
+    confirmed
+}
+
+/// #3627: a Live snapshot may only prove an exact ref ABSENT when its ref set
+/// is trustworthy. A daemon that stops emitting `instance_ref` fields
+/// (downgrade/regression) still returns names, so an untrusted snapshot would
+/// read as "every ref is gone" and wrongly retire panes after two polls. Fail
+/// toward retention: require at least one parseable ref AND one ref per live
+/// name, so a ref-bearing snapshot with a genuinely absent ref stays provable
+/// while a ref-less one is never definitive.
+fn snapshot_is_ref_authoritative(
+    names: &std::collections::HashSet<String>,
+    refs: &HashMap<String, InstanceRef>,
+) -> bool {
+    !refs.is_empty() && names.len() == refs.len()
+}
+
 use crate::channel::TelegramStatus;
 
 /// #2453 R2: bounded typed owner for the app owner-restart in-flight state.
@@ -242,6 +328,17 @@ pub(super) struct AppState {
     /// roster attach. Bounded to the worker queue capacity; terminal outcomes
     /// remove entries immediately and delayed outcomes expire during ticks.
     remote_restarts: HashMap<String, RemoteRestartPending>,
+    /// #3627: poll-fallback confirmed-retirement tracker, keyed by exact
+    /// instance ref. Bounded by the number of distinct rendered refs; purged
+    /// whenever a ref reappears, changes daemon generation, or leaves the
+    /// layout, so it can never retain panes past a definitive retirement nor
+    /// remove one on transient evidence.
+    retirement_candidates: HashMap<InstanceRef, RetirementCandidate>,
+    /// #3627: a retirement session-write failure that arrived while another
+    /// overlay was open. The notice is held here and promoted to the dismissable
+    /// notice overlay as soon as no other overlay is showing, so the operator
+    /// always sees that retirement is pending retry — never a lost log line.
+    pending_retirement_notice: Option<String>,
 }
 
 /// #render-first attach pipeline handles: (keepalive sender, outcome
@@ -337,6 +434,8 @@ impl AppState {
                 restart_commit_pending: None,
             },
             remote_restarts: HashMap::new(),
+            retirement_candidates: HashMap::new(),
+            pending_retirement_notice: None,
         }
     }
 
@@ -1243,13 +1342,12 @@ impl AppState {
                                         pending.request.old_instance_ref == Some(instance_ref)
                                     })
                                 });
-                            if !retained_for_restart
-                                && self
-                                    .ui
-                                    .layout
-                                    .remove_fleet_instance_views_exact(instance_ref)
-                            {
-                                self.needs_resize = true;
+                            if !retained_for_restart {
+                                // #3627: an exact InstanceDeleted event is
+                                // definitive retirement proof — remove the
+                                // pane(s) now and durably flush the layout so a
+                                // hard restart cannot revive a stale view.
+                                self.commit_confirmed_retirements(&[instance_ref], deps.home);
                             }
                         }
                         crate::api::ApiEvent::InstanceCreated {
@@ -1698,12 +1796,169 @@ impl AppState {
         let Some(names) = self.pending_remote_roster_names.take() else {
             return;
         };
-        self.pending_remote_roster_refs.take();
+        let live_refs = self.pending_remote_roster_refs.take().unwrap_or_default();
         // A healthy Live snapshot owns this roster pass and refreshes the
         // idle-sync throttle, preventing the fallback poll from starving the
         // Live path with a competing reconciliation.
         self.reconcile_remote_roster(&names, crate::runtime::AgentListMode::Live, deps);
         self.last_remote_sync = std::time::Instant::now();
+        // #3627: the same Live snapshot is the poll fallback's evidence. Only
+        // an exact ref proven absent twice at one daemon generation is removed;
+        // every transient case retains its pane.
+        self.apply_confirmed_retirements(&names, &live_refs, deps);
+    }
+
+    /// #3627: turn one Live registry snapshot into confirmed retirements. The
+    /// fallback removes panes ONLY when all of the following hold — otherwise
+    /// every pane is retained:
+    /// - the daemon reported `Live` (the caller only queues Live snapshots);
+    /// - the snapshot carries parseable exact refs for every live name
+    ///   ([`snapshot_is_ref_authoritative`]) — a ref-less snapshot never counts
+    ///   as proof of absence;
+    /// - fleet metadata is readable (a parse/read error cannot prove config
+    ///   deletion);
+    /// - the exact ref is absent from the snapshot's live roster;
+    /// - the same daemon generation confirms it absent on two consecutive
+    ///   snapshots (see [`confirmed_retirements`]);
+    /// - no restart/reconnect is in flight for the ref.
+    fn apply_confirmed_retirements(
+        &mut self,
+        names: &std::collections::HashSet<String>,
+        live_refs: &HashMap<String, InstanceRef>,
+        deps: &AppDeps<'_>,
+    ) {
+        let Some(run_dir) = deps.attached_run_dir.as_ref() else {
+            return;
+        };
+        // A snapshot whose live names have no parseable refs proves nothing
+        // about any exact ref: retain every pane rather than misread a daemon
+        // regression (or downgrade) as "all refs absent".
+        if !snapshot_is_ref_authoritative(names, live_refs) {
+            tracing::debug!(
+                names = names.len(),
+                refs = live_refs.len(),
+                "roster snapshot is not ref-authoritative; retirement polling held"
+            );
+            return;
+        }
+        // "fleet read success": a missing or unparsable fleet.yaml means the
+        // instance could still be configured, so nothing may be removed.
+        let Ok(fleet) = crate::fleet::FleetConfig::load(deps.fleet_path) else {
+            return;
+        };
+        // An instance still declared in fleet metadata is config-present, not
+        // retired — retain it even when its process is momentarily unreachable
+        // (mid spawn / bridge down). Only a config-deleted ref can be removed.
+        let configured: std::collections::HashSet<crate::types::InstanceId> = fleet
+            .instances
+            .values()
+            .filter_map(|instance| {
+                instance
+                    .id
+                    .as_deref()
+                    .and_then(crate::types::InstanceId::parse)
+            })
+            .collect();
+        let generation = crate::daemon::event_hub::source_id(run_dir);
+        if generation.is_empty() || generation == "unknown" {
+            return;
+        }
+        let live: std::collections::HashSet<InstanceRef> = live_refs.values().copied().collect();
+        let rendered: Vec<InstanceRef> = self
+            .rendered_instance_refs()
+            .into_iter()
+            .filter(|reference| !configured.contains(&reference.instance_id))
+            .collect();
+        let restart_in_flight: std::collections::HashSet<InstanceRef> = self
+            .remote_restarts
+            .values()
+            .flat_map(|pending| {
+                pending
+                    .request
+                    .old_instance_ref
+                    .into_iter()
+                    .chain(pending.successor_instance_ref)
+            })
+            .collect();
+        let confirmed = confirmed_retirements(
+            &mut self.retirement_candidates,
+            &rendered,
+            &live,
+            &generation,
+            &restart_in_flight,
+        );
+        if !confirmed.is_empty() {
+            self.commit_confirmed_retirements(&confirmed, deps.home);
+        }
+    }
+
+    /// #3627: every exact ref currently rendered on a pane anywhere in the
+    /// layout. Panes without a trusted identity are omitted — they can never
+    /// be removed by the poll fallback.
+    fn rendered_instance_refs(&self) -> Vec<InstanceRef> {
+        let mut refs = Vec::new();
+        for tab in &self.ui.layout.tabs {
+            for pane_id in tab.root().pane_ids() {
+                if let Some(reference) = tab.root().find_pane(pane_id).and_then(Pane::instance_ref)
+                {
+                    refs.push(reference);
+                }
+            }
+        }
+        refs
+    }
+
+    /// #3627: remove the panes for confirmed-retired exact refs across ALL tabs
+    /// (target-only tabs close, mixed tabs keep their other panes), then flush
+    /// the session immediately — never waiting for the 10s throttle — and, if
+    /// the layout cannot be made durable, surface a retryable notice. Safe to
+    /// call with a ref whose panes are already gone: nothing then happens.
+    fn commit_confirmed_retirements(&mut self, refs: &[InstanceRef], home: &std::path::Path) {
+        let mut removed = false;
+        for &reference in refs {
+            if self.ui.layout.remove_fleet_instance_views_exact(reference) {
+                removed = true;
+            }
+        }
+        if !removed {
+            return;
+        }
+        self.needs_resize = true;
+        self.dirty = true;
+        let session_saved = session::save_session(home, &self.ui.layout);
+        let durable = session_saved
+            || refs
+                .iter()
+                .all(|&reference| session::record_retired_ref(home, reference));
+        if !durable {
+            let message = "Instance retirement removed pane(s), but the session \
+                 layout could not be saved; retirement is pending retry.";
+            tracing::error!(?refs, "retired pane session flush failed");
+            self.surface_retirement_notice(message.to_string());
+        }
+    }
+
+    /// #3627: make a retryable retirement notice impossible to lose. It is
+    /// shown immediately when no overlay is active; otherwise it is queued and
+    /// [`Self::promote_pending_retirement_notice`] surfaces it the moment the
+    /// operator's overlay closes, so a write failure is never just a log line.
+    fn surface_retirement_notice(&mut self, message: String) {
+        if matches!(self.ui.overlay, Overlay::None) {
+            self.ui.overlay = Overlay::ReconnectNotice { message };
+        } else {
+            self.pending_retirement_notice = Some(message);
+        }
+    }
+
+    /// Promote a queued retirement notice once the overlay slot is free. A
+    /// still-open overlay keeps it queued (not dropped).
+    fn promote_pending_retirement_notice(&mut self) {
+        if !matches!(self.ui.overlay, Overlay::None) {
+            return;
+        }
+        if let Some(message) = self.pending_retirement_notice.take() {
+            self.ui.overlay = Overlay::ReconnectNotice { message };
+        }
     }
 
     fn request_remote_agent_state_refresh(&mut self, deps: &AppDeps<'_>) {
@@ -1726,6 +1981,7 @@ impl AppState {
         deps: &AppDeps<'_>,
         reap_workers: &mut Vec<std::thread::JoinHandle<()>>,
     ) {
+        self.promote_pending_retirement_notice();
         self.refresh_team_view(deps);
         self.reap_remote_restart_state();
         self.reconcile_pending_remote_roster(deps);
