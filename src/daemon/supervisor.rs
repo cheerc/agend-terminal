@@ -865,6 +865,15 @@ fn tick(
         // lock, then perform all disk/registry work after the guard drops.
         let usage_limit_raw_state: crate::state::AgentState;
         let usage_limit_pane_tail: String;
+        // #3671: drain the #1527 transition buffer under the core lock but
+        // emit the file appends AFTER the guard drops (`log_state_transition_at`
+        // takes a blocking companion flock plus retention filesystem IO —
+        // holding the per-agent core mutex across it stalls the PTY
+        // read-loop `feed`; CR-2026-06-14 blocking-IO class). Owned rows +
+        // snippet cross the boundary; behavior (one row per drained
+        // transition, same ts/snippet) is unchanged.
+        let logged_transitions: Vec<crate::state::TransitionRecord>;
+        let transition_snippet: String;
         // CR-2026-06-14 (concurrency): hoist the two per-agent disk reads that
         // feed the awaiting-operator gate OUT of the core lock. Both depend only
         // on (home, name), not on core state, so reading them lock-free here
@@ -914,8 +923,13 @@ fn tick(
             // the old prev/new-at-tick comparison, which silently missed any
             // transition that completed async between two supervisor ticks
             // (prev==new), i.e. nearly all feed-driven ones including the error
-            // states. `log_state_transition_at` is a file append (no self-IPC,
-            // no new lock) so logging under the core lock is #1492-safe.
+            // states. #3671: the drain happens here but the file appends run
+            // AFTER the core lock drops (see `logged_transitions` below) —
+            // `log_state_transition_at` takes a blocking companion flock plus
+            // retention filesystem IO, so emitting under the lock would hold
+            // the per-agent core mutex across it (CR-2026-06-14 class). The
+            // append itself takes no registry/core lock, so lock-free emission
+            // stays #1492-safe.
             let snippet = core.vterm.tail_lines(3);
             let (transitions, dropped) = core.state.drain_pending_transitions();
             if dropped > 0 {
@@ -925,11 +939,8 @@ fn tick(
                     "#1527: transition-log buffer overflowed (drainer fell behind) — oldest dropped"
                 );
             }
-            for t in &transitions {
-                crate::daemon::usage_limit::log_state_transition_at(
-                    home, &name, t.from, t.to, &t.ts, &snippet,
-                );
-            }
+            transition_snippet = snippet.clone();
+            logged_transitions = transitions;
 
             // #1530: de-gate the UsageLimit + member-state reactions off the
             // (feed-blind) `prev != new` tick comparison. React on the NET state
@@ -953,7 +964,7 @@ fn tick(
             // ships. The big `supervise_one()->TickOutcome` extraction that would
             // make it compile-impossible is deferred (#1644) — revisit when a new
             // reaction is added to this loop; both guards above make that safe.
-            for decision in reactions_from_transitions(&transitions) {
+            for decision in reactions_from_transitions(&logged_transitions) {
                 // #1530/F2/#2877: backend resolved from the immutable declared
                 // identity, falling back to the captured live command for legacy
                 // handles (no registry re-acquire while holding core).
@@ -1112,6 +1123,22 @@ fn tick(
                 None
             }
         };
+
+        // #3671: emit the drained transition rows now that the core lock is
+        // dropped — the append takes the blocking companion flock plus
+        // retention filesystem IO, which must not hold the per-agent core
+        // mutex (CR-2026-06-14 blocking-IO class). Same rows, same ts and
+        // snippet as the in-lock drain; only the emission point moved.
+        for t in &logged_transitions {
+            crate::daemon::usage_limit::log_state_transition_at(
+                home,
+                &name,
+                t.from,
+                t.to,
+                &t.ts,
+                &transition_snippet,
+            );
+        }
 
         // #1530: emit the collected reactions now that the core lock is dropped
         // (#1492-safe — the member-notify self-IPC no longer runs under the

@@ -43,6 +43,17 @@ impl PerTickHandler for LogRotationHandler {
                 "log_rotation: pruned oversize daemon.log.* entries"
             );
         }
+        // #3669: hourly safety net for JSONL rotated generations. The
+        // on-write path already prunes (rotate + age cap under the append
+        // lock), so this only fires when a writer died mid-rotation or an
+        // older build left residue: it sweeps stale/over-cap `.N`
+        // generations of the daemon-owned stores WITHOUT touching the live
+        // files (never deletes `.jsonl` itself — that would drop audit
+        // records; the live file only ever shrinks via on-write rotation).
+        let swept = crate::jsonl_retention::sweep_rotated_generations(ctx.home);
+        if swept > 0 {
+            tracing::info!(swept, "log_rotation: swept stale JSONL generations");
+        }
         crate::logging::update_daemon_log_symlink_unix(ctx.home);
     }
 }

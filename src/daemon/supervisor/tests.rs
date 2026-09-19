@@ -912,6 +912,62 @@ fn tick_emitters_run_after_core_lock_drops_1644() {
     }
 }
 
+/// #3671-C RED: the transition-log file append must run AFTER the per-agent
+/// core lock drops — never inside it. `log_state_transition_at` now runs
+/// through `append_line_with_retention` (blocking companion-flock +
+/// read_dir/metadata/remove/rename), so calling it under `core.lock()`
+/// holds the per-agent core mutex across filesystem latency and lock
+/// contention, stalling the PTY read-loop `feed` (the CR-2026-06-14
+/// blocking-IO-under-core-lock class). Collect the drained rows under the
+/// lock, emit them after it drops — same collect→drop→emit shape as #1644.
+/// Brace-matches the same `let action = { … }` block; scoped to the `tick`
+/// fn body so it never matches its own needle literals.
+#[test]
+fn transition_log_emitted_after_core_lock_drops_3671() {
+    let src = include_str!("../supervisor.rs");
+    let tick_start = src.find("\nfn tick(").expect("tick fn must exist");
+    let after = &src[tick_start..];
+    let tick_end = after[1..]
+        .find("\nfn ")
+        .map(|i| i + 1)
+        .unwrap_or(after.len());
+    let tick = &after[..tick_end];
+
+    let anchor = ["let action", ": Option<NoticeAction> = {"].concat();
+    let astart = tick.find(&anchor).expect("tick core-lock block present");
+    let open = astart + tick[astart..].find('{').expect("block opens");
+    let mut depth = 0usize;
+    let mut close = open;
+    for (i, c) in tick[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = open + i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(close > open, "core-lock block must close");
+    let in_block = &tick[open..=close];
+    let after_block = &tick[close..];
+
+    let emitter = ["log_state_transition", "_at("].concat();
+    assert!(
+        !in_block.contains(&emitter),
+        "#3671-C: `{emitter}` takes a blocking companion flock plus retention \
+         filesystem IO and must NOT run inside the core-lock block \
+         (collect→drop→emit; CR-2026-06-14 blocking-IO class)"
+    );
+    assert!(
+        after_block.contains(&emitter),
+        "#3671-C: `{emitter}` must run AFTER the core lock drops"
+    );
+}
+
 // ── #1523: AuthError content-FP stability gate ──────────────────────
 
 /// The stability window must exceed the observed self-heal time (~31s) by a

@@ -67,6 +67,7 @@ mod instructions;
 mod integrity_core;
 mod invariant_inputs;
 mod ipc;
+mod jsonl_retention;
 mod keybinds;
 mod layout;
 mod logging;

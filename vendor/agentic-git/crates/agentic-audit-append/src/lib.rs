@@ -18,11 +18,16 @@
 //! ## The contract
 //! 1. **Serialize first.** The complete line, newline included, is built in memory
 //!    *before* any lock is taken, so the locked region contains no formatting.
-//! 2. **One `write_all` under the lock.** The target file is opened before locking;
-//!    the lock covers exactly one `write_all` call and nothing else.
+//! 2. **Open and write under the lock.** The target file is opened AFTER the
+//!    companion lock is acquired, and the lock covers the open, exactly one
+//!    `write_all`, and the retention pass. Opening before locking let a
+//!    concurrent rotation rename the live inode out from under the pre-opened
+//!    descriptor (#3671): the write then landed in generation `.1` instead of
+//!    the live file, aging and deleting independently of later live writes.
 //! 3. **No unlocked fallback.** A caller that cannot take the lock gets
-//!    [`AppendError::Contended`] and writes nothing. Falling back to an unlocked
-//!    append would reintroduce the interleaving this crate removes.
+//!    [`AppendError::Contended`] and writes nothing — nor even opens the
+//!    target. Falling back to an unlocked append would reintroduce the
+//!    interleaving this crate removes.
 //!
 //! What an `Err` does and does not promise: [`Contended`](AppendError::Contended)
 //! and [`Open`](AppendError::Open) mean nothing reached the file, because both
@@ -36,7 +41,8 @@
 //! but single-`write()` atomicity for regular files is a platform property rather
 //! than a POSIX guarantee (`PIPE_BUF` covers pipes only) and would fail silently on
 //! filesystems that do not provide it. The lock is what makes the property a
-//! contract; the pre-serialization is what makes the locked window one syscall wide.
+//! contract; the pre-serialization is what keeps the write itself to one
+//! `write_all` call inside that window.
 //!
 //! ## Contention policy is the caller's, not this crate's
 //! The two policies differ because the callers' obligations differ, so each is a
@@ -72,10 +78,21 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Default budget for the destructive-gate callers.
 ///
-/// The locked region is a single `write_all`, so a holder is expected to release
-/// within microseconds; a budget three orders of magnitude larger absorbs
-/// scheduling noise while still bounding an MCP worker's stall.
+/// The locked region is open + one `write_all` + retention, all local
+/// filesystem work, so a holder is expected to release within milliseconds;
+/// a budget two orders of magnitude larger absorbs scheduling noise while
+/// still bounding an MCP worker's stall.
 pub const DEFAULT_BOUNDED_BUDGET: Duration = Duration::from_millis(250);
+
+/// #3669: three-dimensional retention for `fleet_events.jsonl` — the same
+/// shape as the daemon's `mcp::usage_stats` policy (live bytes + generation
+/// count + max age), duplicated here (not shared) because this crate is a
+/// standalone workspace member with no dependency on the daemon crate — and
+/// the shim binary that links it cannot depend on daemon code either.
+/// Keep the values in sync with `src/jsonl_retention.rs`'s retention table.
+pub const MAX_LIVE_BYTES: u64 = 10 * 1024 * 1024;
+pub const MAX_ROTATED_FILES: usize = 5;
+pub const MAX_ROTATED_AGE: Duration = Duration::from_secs(30 * 86400);
 
 /// Path of the audit log under `home`.
 pub fn audit_path(home: &Path) -> PathBuf {
@@ -98,15 +115,17 @@ pub enum AppendError {
     /// was written** — no write was even attempted — and it must not be written
     /// unlocked.
     Contended,
-    /// The lock file or the log could not be opened. **Nothing was written**; this
-    /// happens before the lock is taken and before any write.
+    /// The lock file could not be opened, or (after the lock was taken) the
+    /// log could not be opened. **Nothing was written**; no write is ever
+    /// attempted before both the lock is held and the target is open.
     Open(std::io::Error),
     /// The lock syscall itself failed — distinct from the lock merely being held,
     /// which is [`Contended`](AppendError::Contended). **Nothing was written**:
-    /// both files opened, but the lock was never acquired so no write ran.
+    /// the lock file opened, but the lock was never acquired so the target
+    /// was never even opened, let alone written.
     ///
-    /// Separate from [`Open`](AppendError::Open) because by this point both opens
-    /// have already SUCCEEDED. Folding it into `Open` made the error tell an
+    /// Separate from [`Open`](AppendError::Open) because by this point the lock
+    /// open has already SUCCEEDED. Folding it into `Open` made the error tell an
     /// operator to check permissions and disk for a failure that was neither.
     Lock(std::io::Error),
     /// `write_all` failed while the lock was held. **A partial record may be on
@@ -206,24 +225,109 @@ fn append_audit_line(
         .open(lock_path(home))
         .map_err(AppendError::Open)?;
 
-    // Open the target BEFORE locking so the locked region is the write and nothing
-    // else. An `open` here would otherwise sit inside every writer's critical
-    // section for no benefit.
+    acquire(&lock, mode)?;
+
+    // #3671: open the target only AFTER the lock is held. Opening before
+    // locking let a concurrent rotation rename the live inode out from under
+    // the pre-opened descriptor, diverting the write into generation `.1`.
     let mut target = OpenOptions::new()
         .create(true)
         .append(true)
         .open(audit_path(home))
         .map_err(AppendError::Open)?;
 
-    acquire(&lock, mode)?;
-
     // (2) Exactly one `write_all` while the lock is held.
-    let result = target.write_all(line.as_bytes()).map_err(AppendError::Write);
+    let result = target
+        .write_all(line.as_bytes())
+        .map_err(AppendError::Write);
+    drop(target);
+
+    // #3669: retention INSIDE the lock hold — rotate + prune before the
+    // lock releases, so no concurrent appender can interleave into the
+    // file being renamed or miss the size check.
+    if result.is_ok() {
+        maintain_retention(home);
+    }
 
     // Released by the OS on close; explicit so the critical section's end is
     // visible rather than implied by scope.
     drop(lock);
     result
+}
+
+/// #3669: best-effort retention pass over `fleet_events.jsonl` — called with
+/// the companion lock HELD. Every step is infallible-by-contract (errors
+/// swallowed): retention must never fail an audit append, and the fail-closed
+/// gates treat `Ok` as "record trustworthy", so a retention failure must not
+/// surface as an append failure either.
+fn maintain_retention(home: &Path) {
+    let path = audit_path(home);
+    rotate_if_needed(&path);
+    prune_rotated(&path, std::time::SystemTime::now());
+}
+
+fn rotated_audit_path(base: &Path, gen: usize) -> PathBuf {
+    let mut name = base.file_name().map(|s| s.to_owned()).unwrap_or_default();
+    name.push(format!(".{gen}"));
+    base.with_file_name(name)
+}
+
+fn rotate_if_needed(path: &Path) {
+    if MAX_ROTATED_FILES == 0 {
+        return;
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.len() <= MAX_LIVE_BYTES {
+        return;
+    }
+
+    let _ = std::fs::remove_file(rotated_audit_path(path, MAX_ROTATED_FILES));
+    for gen in (1..MAX_ROTATED_FILES).rev() {
+        let src = rotated_audit_path(path, gen);
+        let dst = rotated_audit_path(path, gen + 1);
+        if src.exists() {
+            let _ = std::fs::rename(src, dst);
+        }
+    }
+    if std::fs::rename(path, rotated_audit_path(path, 1)).is_ok() {
+        let _ = std::fs::File::create(path);
+    }
+}
+
+fn prune_rotated(path: &Path, now: std::time::SystemTime) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let Some(base_name) = path.file_name().and_then(|s| s.to_str()) else {
+        return;
+    };
+    let prefix = format!("{base_name}.");
+
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let entry_path = entry.path();
+        let Some(name) = entry_path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some(gen) = name
+            .strip_prefix(&prefix)
+            .and_then(|s| s.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let mtime = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let too_old = now
+            .duration_since(mtime)
+            .map(|age| age > MAX_ROTATED_AGE)
+            .unwrap_or(false);
+        if gen > MAX_ROTATED_FILES || too_old {
+            let _ = std::fs::remove_file(&entry_path);
+        }
+    }
 }
 
 /// Map one `try_lock` outcome onto the error the caller sees.
@@ -369,7 +473,10 @@ mod tests {
         for i in 0..N {
             append_audit_line_bounded(&home, &row(i), DEFAULT_BOUNDED_BUDGET).unwrap();
         }
-        let mut seqs: Vec<u64> = rows(&home).iter().filter_map(|r| r["seq"].as_u64()).collect();
+        let mut seqs: Vec<u64> = rows(&home)
+            .iter()
+            .filter_map(|r| r["seq"].as_u64())
+            .collect();
         seqs.sort_unstable();
         assert_eq!(
             seqs,
@@ -430,7 +537,7 @@ mod tests {
     }
 
     /// The serialized line is exactly one JSON object plus one newline — the
-    /// property that makes the locked region a single `write_all`.
+    /// property that keeps the write itself to a single `write_all` call.
     #[test]
     fn one_append_writes_exactly_one_terminated_line() {
         let home = tmp_home("one-line");
@@ -439,6 +546,186 @@ mod tests {
         assert_eq!(raw.matches('\n').count(), 1, "exactly one newline");
         assert!(raw.ends_with('\n'), "the line must be terminated");
         assert_eq!(rows(&home).len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3669: an oversized live audit log rotates down on the next append —
+    /// the crossing record is preserved in generation .1 and the live file
+    /// is back under the budget.
+    #[test]
+    fn oversized_live_rotates_on_next_append_3669() {
+        let home = tmp_home("oversize-3669");
+        std::fs::write(audit_path(&home), "x".repeat(MAX_LIVE_BYTES as usize + 1)).unwrap();
+
+        append_audit_line_bounded(&home, &row(0), DEFAULT_BOUNDED_BUDGET).unwrap();
+
+        let live = std::fs::metadata(audit_path(&home)).unwrap().len();
+        assert!(
+            live <= MAX_LIVE_BYTES,
+            "live audit log must rotate down on next append; got {live}"
+        );
+        assert!(
+            rotated_audit_path(&audit_path(&home), 1).exists(),
+            "rotation must preserve history in generation .1"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3669: generations past the cap are pruned on append.
+    #[test]
+    fn generation_cap_prunes_oldest_3669() {
+        let home = tmp_home("gens-3669");
+        let base = audit_path(&home);
+        for gen in 1..=MAX_ROTATED_FILES {
+            std::fs::write(rotated_audit_path(&base, gen), "gen\n").unwrap();
+        }
+        std::fs::write(&base, "x".repeat(MAX_LIVE_BYTES as usize + 1)).unwrap();
+
+        append_audit_line_bounded(&home, &row(0), DEFAULT_BOUNDED_BUDGET).unwrap();
+
+        assert!(
+            !rotated_audit_path(&base, MAX_ROTATED_FILES + 1).exists(),
+            "generation cap must prune beyond MAX_ROTATED_FILES"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3669: a stale rotated generation is pruned even without size rotation.
+    #[test]
+    fn age_cap_prunes_stale_generations_3669() {
+        use std::time::Duration;
+        let home = tmp_home("age-3669");
+        let base = audit_path(&home);
+        let old = rotated_audit_path(&base, 1);
+        let fresh = rotated_audit_path(&base, 2);
+        std::fs::write(&old, "old\n").unwrap();
+        std::fs::write(&fresh, "fresh\n").unwrap();
+
+        let stale = std::time::SystemTime::now() - Duration::from_secs(30 * 86400 + 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+
+        append_audit_line_bounded(&home, &row(0), DEFAULT_BOUNDED_BUDGET).unwrap();
+
+        assert!(!old.exists(), "stale rotated generation must be pruned");
+        assert!(fresh.exists(), "fresh rotated generation must be retained");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3671-A RED: the target must be opened only AFTER the companion
+    /// lock is acquired. A refused (Contended) append must leave no trace —
+    /// but the open-before-lock order creates the (empty) target file before
+    /// even attempting the lock, so a skipped record still mutates the home
+    /// dir. Worse, the same order lets a concurrent rotation rename the live
+    /// inode out from under the pre-opened descriptor, diverting the write
+    /// into generation `.1` instead of the live file.
+    #[test]
+    fn contended_append_leaves_no_target_behind_3671() {
+        let home = tmp_home("contended-no-target-3671");
+        assert!(
+            !audit_path(&home).exists(),
+            "precondition: no audit log yet in this home"
+        );
+        let holder = hold(&home);
+
+        let err = append_audit_line_best_effort(&home, &row(0))
+            .expect_err("must skip while the lock is held");
+        assert!(matches!(err, AppendError::Contended), "got {err:?}");
+        assert!(
+            !audit_path(&home).exists(),
+            "#3671-A: a Contended append must not create the target file — \
+             the target may only be opened after the lock is held, otherwise \
+             a concurrent rotation can rename the inode under the pre-opened \
+             descriptor and divert the write into generation .1"
+        );
+
+        drop(holder);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3671-D: the age cap boundary is strict-greater-than — a generation
+    /// within the cap is retained, one past it is pruned. (Mirrors the
+    /// daemon-side boundary test; the two retention implementations are
+    /// intentionally duplicated, so each pins its own boundary.)
+    #[test]
+    fn age_cap_boundary_is_strict_greater_than_3671() {
+        use std::time::Duration;
+        let home = tmp_home("age-boundary-3671");
+        let base = audit_path(&home);
+        let within = rotated_audit_path(&base, 1);
+        let past = rotated_audit_path(&base, 2);
+        std::fs::write(&within, "within\n").unwrap();
+        std::fs::write(&past, "past\n").unwrap();
+
+        let now = std::time::SystemTime::now();
+        std::fs::File::options()
+            .write(true)
+            .open(&within)
+            .unwrap()
+            .set_modified(now - Duration::from_secs(30 * 86400 - 60))
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&past)
+            .unwrap()
+            .set_modified(now - Duration::from_secs(30 * 86400 + 3600))
+            .unwrap();
+
+        append_audit_line_bounded(&home, &row(0), DEFAULT_BOUNDED_BUDGET).unwrap();
+
+        assert!(
+            within.exists(),
+            "a generation within the age cap must be retained"
+        );
+        assert!(
+            !past.exists(),
+            "a generation past the age cap must be pruned"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3671-D: a symlinked generation is removed as a link on prune — the
+    /// link itself is deleted, its target is never followed.
+    #[test]
+    #[cfg(unix)]
+    fn prune_removes_symlink_generation_but_keeps_target_3671() {
+        let home = tmp_home("symlink-3671");
+        let base = audit_path(&home);
+        let target = home.join("outside-target.txt");
+        std::fs::write(&target, "outside\n").unwrap();
+        let link = rotated_audit_path(&base, MAX_ROTATED_FILES + 1);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        append_audit_line_bounded(&home, &row(0), DEFAULT_BOUNDED_BUDGET).unwrap();
+
+        assert!(
+            !link.exists() && target.exists(),
+            "prune must remove the over-cap symlink generation itself while \
+             keeping its target"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3669: retention is best-effort — a rotation on an unwritable home
+    /// must not turn the append itself into an error.
+    #[test]
+    #[cfg(unix)]
+    fn retention_failure_never_fails_the_append_3669() {
+        let home = tmp_home("best-effort-3669");
+        // A directory as the audit path: the append's open fails with Open
+        // (proving the failure path still works), but more importantly a
+        // home where rotation cannot proceed must not panic.
+        std::fs::create_dir_all(audit_path(&home)).unwrap();
+        let err = append_audit_line_bounded(&home, &row(0), DEFAULT_BOUNDED_BUDGET)
+            .expect_err("append to a directory must fail");
+        assert!(
+            matches!(err, AppendError::Open(_)),
+            "append failure mode unchanged by retention: {err:?}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }

@@ -6,13 +6,26 @@
 
 use crate::state::AgentState;
 use std::path::Path;
+use std::time::Duration;
+
+/// #3669: retention for `state-transitions.jsonl` — same three dimensions as
+/// `mcp::usage_stats` (live bytes + generation count + max age). Kept in sync
+/// with `crate::jsonl_retention`'s retention table.
+pub const TRANSITIONS_MAX_LIVE_BYTES: u64 = 10 * 1024 * 1024;
+pub const TRANSITIONS_MAX_ROTATED_FILES: usize = 5;
+pub const TRANSITIONS_MAX_ROTATED_AGE: Duration = Duration::from_secs(30 * 86400);
 
 /// #1527: log a state transition to `state-transitions.jsonl` with an explicit
 /// `ts` — the instant the transition was RECORDED (`StateTracker::record_set`),
 /// not the later drain time. The supervisor drains buffered transitions and
 /// logs each with its captured timestamp so the on-disk order + times reflect
-/// reality. File append only (no self-IPC, no lock) → #1492-safe under the
-/// core lock.
+/// reality.
+///
+/// #3669: the append runs through `crate::jsonl_retention`
+/// (companion-lock serialized + rotate/prune on write). The lock is the
+/// advisory companion file (`state-transitions.jsonl.lock`), NOT the agent
+/// core mutex — so this stays #1492-safe: no registry/core lock is taken,
+/// and the self-IPC assert only fires on paths that actually self-IPC.
 pub fn log_state_transition_at(
     home: &Path,
     agent: &str,
@@ -30,14 +43,15 @@ pub fn log_state_transition_at(
         "pty_snippet": snippet,
     });
     let path = home.join("state-transitions.jsonl");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        use std::io::Write;
-        let _ = writeln!(f, "{}", entry);
-    }
+    let _ = crate::jsonl_retention::append_line_with_retention(
+        &path,
+        &entry,
+        crate::jsonl_retention::RetentionPolicy {
+            max_live_bytes: TRANSITIONS_MAX_LIVE_BYTES,
+            max_rotated_files: TRANSITIONS_MAX_ROTATED_FILES,
+            max_rotated_age: TRANSITIONS_MAX_ROTATED_AGE,
+        },
+    );
 }
 
 /// Propagate UsageLimit: set QuotaExceeded on all same-backend agents.
@@ -144,6 +158,39 @@ mod tests {
         assert!(
             content.contains("\"ts\":\"2026-05-31T00:00:00+00:00\""),
             "must use the explicit (push-time) ts: {content}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #3669: an oversized live transitions file rotates down on the next
+    /// logged transition (same append-then-rotate pattern as usage_stats).
+    #[test]
+    fn oversized_transitions_rotate_on_next_write_3669() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-3669-transitions-rotate-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("state-transitions.jsonl");
+        std::fs::write(&path, format!("old:{}\n", "x".repeat(11 * 1024 * 1024))).ok();
+
+        log_state_transition_at(
+            &dir,
+            "dev",
+            AgentState::Idle,
+            AgentState::UsageLimit,
+            "2026-09-16T00:00:00+00:00",
+            "snippet",
+        );
+
+        let live = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            live <= TRANSITIONS_MAX_LIVE_BYTES,
+            "oversized transitions must rotate down on next write; got {live}"
+        );
+        assert!(
+            dir.join("state-transitions.jsonl.1").exists(),
+            "rotation must preserve history in generation .1"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
