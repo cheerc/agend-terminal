@@ -541,6 +541,40 @@ pub fn run_doctor_orphans_apply(
     }
 }
 
+/// Recover one exact markerless bound worktree. The explicit `--yes` guard is
+/// kept at the CLI boundary so scripts cannot accidentally invoke archival
+/// cleanup by omitting the destructive confirmation.
+#[allow(clippy::too_many_arguments)]
+pub fn run_admin_recover_worktree(
+    home: &Path,
+    instance: &str,
+    branch: &str,
+    worktree: &Path,
+    source_repo: &Path,
+    actor: &str,
+    audit_reason: &str,
+    yes: bool,
+) -> anyhow::Result<()> {
+    if !yes {
+        anyhow::bail!("refusing markerless worktree recovery without --yes");
+    }
+    let report = crate::admin::worktree_recovery::recover_markerless_bound_worktree(
+        home,
+        actor,
+        audit_reason,
+        instance,
+        branch,
+        worktree,
+        source_repo,
+    )
+    .map_err(|message| anyhow::anyhow!(message))?;
+    println!(
+        "recovered markerless worktree to {}",
+        report.archive.display()
+    );
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────
 // Sprint 59 Wave 2 PR-IMPL (F2 — γ): `agend-terminal doctor topics`
 // — operator-callable diagnostic for telegram topic state.
