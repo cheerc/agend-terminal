@@ -1,6 +1,7 @@
 //! Admin utilities — manual maintenance commands.
 
 pub mod cleanup_zombies;
+pub mod worktree_recovery;
 // #3273 V1. Dead-code analysis is per-crate: the binary uses only the subset
 // `doctor` and the per-tick handler need, while the full surface (tool-evidence
 // types, `SampleOutcome`, the `Unsupported` arm) is exercised through the

@@ -674,6 +674,34 @@ enum AdminCommands {
         #[arg(long, default_value = "human")]
         format: String,
     },
+    /// Recover one exact markerless bound worktree after a timed-out release.
+    ///
+    /// This is an operator-only, fail-closed path: it archives the residual
+    /// directory before clearing the exact binding. Normal release and GC
+    /// continue to refuse markerless targets.
+    RecoverWorktree {
+        /// Bound instance name.
+        #[arg(long)]
+        instance: String,
+        /// Branch recorded by the binding.
+        #[arg(long)]
+        branch: String,
+        /// Residual worktree directory to archive.
+        #[arg(long)]
+        worktree: std::path::PathBuf,
+        /// Source repository recorded by the binding.
+        #[arg(long)]
+        source_repo: std::path::PathBuf,
+        /// Operator identity recorded in the recovery manifest.
+        #[arg(long)]
+        actor: String,
+        /// Nonempty audit reason recorded in the recovery manifest.
+        #[arg(long)]
+        audit_reason: String,
+        /// Required confirmation for this destructive archive operation.
+        #[arg(long)]
+        yes: bool,
+    },
     /// #2548: on-demand token usage + estimated USD cost from Claude Code /
     /// Codex session transcripts. Moved from the `tokens` MCP tool (zero calls
     /// in 20 days). Cost is an estimate; OpenCode/Kiro/Gemini not covered.
@@ -1668,6 +1696,24 @@ fn main() -> anyhow::Result<()> {
                     serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string())
                 );
             }
+            AdminCommands::RecoverWorktree {
+                instance,
+                branch,
+                worktree,
+                source_repo,
+                actor,
+                audit_reason,
+                yes,
+            } => cli::run_admin_recover_worktree(
+                &home,
+                &instance,
+                &branch,
+                &worktree,
+                &source_repo,
+                &actor,
+                &audit_reason,
+                yes,
+            )?,
             AdminCommands::Tokens {
                 action,
                 group_by,
