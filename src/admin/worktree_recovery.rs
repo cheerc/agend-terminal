@@ -223,7 +223,7 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&home).expect("create temporary home");
         home
     }
 
@@ -233,14 +233,15 @@ mod tests {
         let instance = format!("recovery-test-{}", std::process::id());
         let branch = "review/orphan";
         let source_repo = home.join("source-repo");
-        std::fs::create_dir_all(&source_repo).unwrap();
+        std::fs::create_dir_all(&source_repo).expect("create source repository fixture");
         let worktree = crate::worktree_pool::daemon_managed_worktree_root(&home)
             .join(&instance)
             .join("review-orphan");
-        std::fs::create_dir_all(&worktree).unwrap();
-        std::fs::write(worktree.join("leftover.txt"), b"preserve me").unwrap();
+        std::fs::create_dir_all(&worktree).expect("create worktree fixture");
+        std::fs::write(worktree.join("leftover.txt"), b"preserve me")
+            .expect("write residual worktree fixture");
         crate::binding::bind_full(&home, &instance, "", branch, &worktree, &source_repo, false)
-            .unwrap();
+            .expect("bind recovery fixture");
 
         let report = recover_markerless_bound_worktree(
             &home,
@@ -255,13 +256,14 @@ mod tests {
 
         assert!(!worktree.exists());
         assert_eq!(
-            std::fs::read(report.archive.join("leftover.txt")).unwrap(),
+            std::fs::read(report.archive.join("leftover.txt")).expect("read archived fixture"),
             b"preserve me"
         );
         let manifest: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(report.archive.join(".agend-recovery-manifest.json")).unwrap(),
+            &std::fs::read(report.archive.join(".agend-recovery-manifest.json"))
+                .expect("read recovery manifest"),
         )
-        .unwrap();
+        .expect("parse recovery manifest");
         assert_eq!(manifest["schema_version"], 1);
         assert_eq!(manifest["actor"], "operator");
         assert_eq!(manifest["instance"], instance);
@@ -283,18 +285,18 @@ mod tests {
         let instance = format!("recovery-managed-{}", std::process::id());
         let branch = "review/managed";
         let source_repo = home.join("source-repo");
-        std::fs::create_dir_all(&source_repo).unwrap();
+        std::fs::create_dir_all(&source_repo).expect("create source repository fixture");
         let worktree = crate::worktree_pool::daemon_managed_worktree_root(&home)
             .join(&instance)
             .join("review-managed");
-        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&worktree).expect("create worktree fixture");
         std::fs::write(
             worktree.join(crate::worktree_pool::MANAGED_MARKER),
             "agent=recovery-managed\n",
         )
-        .unwrap();
+        .expect("write managed marker fixture");
         crate::binding::bind_full(&home, &instance, "", branch, &worktree, &source_repo, false)
-            .unwrap();
+            .expect("bind recovery fixture");
 
         let error = recover_markerless_bound_worktree(
             &home,
@@ -318,13 +320,13 @@ mod tests {
         let instance = format!("recovery-mismatch-{}", std::process::id());
         let branch = "review/mismatch";
         let source_repo = home.join("source-repo");
-        std::fs::create_dir_all(&source_repo).unwrap();
+        std::fs::create_dir_all(&source_repo).expect("create source repository fixture");
         let worktree = crate::worktree_pool::daemon_managed_worktree_root(&home)
             .join(&instance)
             .join("review-mismatch");
-        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&worktree).expect("create worktree fixture");
         crate::binding::bind_full(&home, &instance, "", branch, &worktree, &source_repo, false)
-            .unwrap();
+            .expect("bind recovery fixture");
 
         let error = recover_markerless_bound_worktree(
             &home,
@@ -348,12 +350,13 @@ mod tests {
         let instance = format!("recovery-race-{}", std::process::id());
         let branch = "review/race".to_string();
         let source_repo = home.join("source-repo");
-        std::fs::create_dir_all(&source_repo).unwrap();
+        std::fs::create_dir_all(&source_repo).expect("create source repository fixture");
         let worktree = crate::worktree_pool::daemon_managed_worktree_root(&home)
             .join(&instance)
             .join("review-race");
-        std::fs::create_dir_all(&worktree).unwrap();
-        std::fs::write(worktree.join("leftover.txt"), b"race-safe").unwrap();
+        std::fs::create_dir_all(&worktree).expect("create worktree fixture");
+        std::fs::write(worktree.join("leftover.txt"), b"race-safe")
+            .expect("write residual worktree fixture");
         crate::binding::bind_full(
             &home,
             &instance,
@@ -363,7 +366,7 @@ mod tests {
             &source_repo,
             false,
         )
-        .unwrap();
+        .expect("bind recovery fixture");
 
         let first_home = home.clone();
         let first_instance = instance.clone();
@@ -397,7 +400,10 @@ mod tests {
                 &second_source,
             )
         });
-        let results = [first.join().unwrap(), second.join().unwrap()];
+        let results = [
+            first.join().expect("join first recovery attempt"),
+            second.join().expect("join second recovery attempt"),
+        ];
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
         assert!(crate::binding::read(&home, &instance).is_none());
         assert!(!worktree.exists());
