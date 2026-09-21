@@ -5778,6 +5778,388 @@ fn test_sweep_handler_dry_run_returns_categorized_plan() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+fn write_manual_sweep_provenance(home: &std::path::Path, project: &str, repo: &str) {
+    std::fs::write(
+        home.join("task_sweep_provenance.json"),
+        serde_json::json!({
+            "entries": [{
+                "project_id": project,
+                "repo": repo,
+                "api_base": "https://api.github.com",
+                "observed_at": "2026-01-01T00:00:00Z",
+                "config_generation": 1,
+                "legacy_since": null,
+                "retired_at": null,
+                "retirement_reason": null,
+            }],
+            "next_generation": 1,
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn manual_sweep_repository_scope_excludes_foreign_board_candidates_3584() {
+    let home = tmp_home("3584-repository-scope");
+    write_fleet_yaml(&home, &["alive"]);
+    crate::daemon::task_sweep::handle_task_sweep_config(
+        &home,
+        &serde_json::json!({"repository": "test/repo"}),
+    );
+    write_manual_sweep_provenance(&home, "default", "test/repo");
+
+    let default_id = create_open_task(&home, "shipped PR #999");
+    let foreign_id = handle(
+        &home,
+        "alive",
+        &serde_json::json!({
+            "action": "create",
+            "title": "foreign shipped PR #999",
+            "assignee": "alive",
+            "project": "foreign-board"
+        }),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let scope =
+        crate::daemon::task_sweep::resolve_manual_sweep_repository_scope(&home, "test/repo");
+    assert_eq!(scope.projects, vec!["default"]);
+    assert!(scope.diagnostics.is_empty(), "scope: {scope:?}");
+
+    let scoped_projects: std::collections::BTreeSet<String> =
+        scope.projects.iter().cloned().collect();
+    let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+    let categories = sweep::scan_categories_with_authority_scoped(
+        &home,
+        &sweep::OwnerAuthority::available(live, ["alive".to_string()].into_iter().collect()),
+        &stub_pr_lookup,
+        &stub_issue_lookup,
+        Some("test/repo"),
+        Some(&scoped_projects),
+        chrono::Utc::now() + chrono::Duration::days(60),
+    )
+    .unwrap();
+    assert!(categories.all_ids().contains(&default_id));
+    assert!(!categories.all_ids().contains(&foreign_id));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn manual_sweep_repository_scope_reports_baseline_and_provider_failures_3584() {
+    let home = tmp_home("3584-repository-diagnostics");
+    write_fleet_yaml(&home, &["alive"]);
+    crate::daemon::task_sweep::handle_task_sweep_config(
+        &home,
+        &serde_json::json!({"repository": "test/repo"}),
+    );
+    let _id = create_open_task(&home, "baseline PR #999");
+    let scope =
+        crate::daemon::task_sweep::resolve_manual_sweep_repository_scope(&home, "test/repo");
+    assert_eq!(scope.projects, Vec::<String>::new());
+    assert_eq!(scope.diagnostics[0].code, "BASELINE_UNVERIFIED");
+
+    write_manual_sweep_provenance(&home, "default", "test/repo");
+    let scoped_projects: std::collections::BTreeSet<String> =
+        ["default".to_string()].into_iter().collect();
+    let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+    let provider_error =
+        |_: &str, _: u32| -> Result<sweep::PrState, String> { Err("provider offline".to_string()) };
+    let categories = sweep::scan_categories_with_authority_scoped(
+        &home,
+        &sweep::OwnerAuthority::available(live, ["alive".to_string()].into_iter().collect()),
+        &provider_error,
+        &stub_issue_lookup,
+        Some("test/repo"),
+        Some(&scoped_projects),
+        chrono::Utc::now() + chrono::Duration::days(60),
+    )
+    .unwrap();
+    assert!(categories.all_ids().is_empty());
+    assert_eq!(categories.diagnostics[0]["code"], "PROVIDER_UNAVAILABLE");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn manual_sweep_repository_scope_reports_named_board_without_mapping_3584() {
+    let home = tmp_home("3584-manual-unmapped");
+    let created = handle(
+        &home,
+        "operator",
+        &serde_json::json!({
+            "action": "create",
+            "title": "named board task",
+            "project": "manual/board"
+        }),
+    );
+    assert!(created["id"].as_str().is_some());
+    let scope =
+        crate::daemon::task_sweep::resolve_manual_sweep_repository_scope(&home, "manual/board");
+    assert!(scope.projects.is_empty());
+    assert_eq!(scope.diagnostics[0].code, "MANUAL_UNMAPPED");
+    assert!(scope.diagnostics[0].repository.is_none());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn manual_sweep_rejects_foreign_confirm_id_before_emit_3584() {
+    let home = tmp_home("3584-foreign-confirm");
+    write_fleet_yaml(&home, &["alive"]);
+    crate::daemon::task_sweep::handle_task_sweep_config(
+        &home,
+        &serde_json::json!({"repository": "test/repo"}),
+    );
+    write_manual_sweep_provenance(&home, "default", "test/repo");
+    let foreign_id = handle(
+        &home,
+        "alive",
+        &serde_json::json!({
+            "action": "create",
+            "title": "foreign task",
+            "assignee": "alive",
+            "project": "foreign-board"
+        }),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let response = handle(
+        &home,
+        "operator",
+        &serde_json::json!({
+            "action": "sweep",
+            "apply": true,
+            "confirm_ids": [foreign_id],
+            "audit_reason": "scope fence fixture"
+        }),
+    );
+    assert_eq!(response["code"], "repository_scope_confirm_id_out_of_scope");
+    assert_eq!(response["foreign_confirm_ids"][0], foreign_id);
+    let foreign = list_all_at(
+        &home,
+        &crate::task_events::board_root(&home, "foreign-board"),
+    )
+    .into_iter()
+    .find(|task| task.id == foreign_id)
+    .unwrap();
+    assert_eq!(foreign.status, crate::task_events::TaskStatus::Open);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+fn backdate_task_event_for_sweep(home: &std::path::Path, task_id: &str, days: i64) {
+    let path = home.join("task_events.jsonl");
+    let past = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+    let mut changed = false;
+    let rewritten = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+            let event_task_id = value["event"]["task_id"].as_str();
+            if event_task_id == Some(task_id) {
+                value["timestamp"] = serde_json::json!(past);
+                changed = true;
+                serde_json::to_string(&value).unwrap()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(changed, "task event fixture must contain {task_id}");
+    std::fs::write(path, format!("{}\n", rewritten)).unwrap();
+    crate::task_events::catalog::rebuild_for_test(home);
+}
+
+#[test]
+fn manual_sweep_rejects_repository_claim_change_before_emit_3584() {
+    let home = tmp_home("3584-scope-toctou");
+    let repo_a = home.join("repo-a");
+    let repo_b = home.join("repo-b");
+    init_git_repo_with_origin(&repo_a, "https://github.com/test/repo.git");
+    init_git_repo_with_origin(&repo_b, "https://github.com/other/repo.git");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  alive:\n    backend: claude\nteams:\n  sweep:\n    members: [alive]\n    source_repo: {}\n    project_id: default\n",
+            repo_a.display()
+        ),
+    )
+    .unwrap();
+    crate::daemon::task_sweep::handle_task_sweep_config(
+        &home,
+        &serde_json::json!({"repository": "test/repo"}),
+    );
+    write_manual_sweep_provenance(&home, "default", "test/repo");
+    let task_id = handle(
+        &home,
+        "operator",
+        &serde_json::json!({"action": "create", "title": "stale unreferenced task"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    backdate_task_event_for_sweep(&home, &task_id, 30);
+    let dry = handle(
+        &home,
+        "operator",
+        &serde_json::json!({
+            "action": "sweep",
+            "repository": "test/repo"
+        }),
+    );
+    assert!(
+        dry["candidate_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(&task_id))),
+        "stale fixture must be a candidate: {dry}"
+    );
+
+    let repo_b = repo_b.clone();
+    let home_for_hook = home.clone();
+    super::set_before_manual_sweep_repository_scope_hook_for_test(move || {
+        let response = crate::teams::update(
+            &home_for_hook,
+            &serde_json::json!({
+                "name": "sweep",
+                "repository_path": repo_b,
+            }),
+        );
+        assert!(
+            response["error"].is_null(),
+            "claim mutation failed: {response}"
+        );
+    });
+
+    let response = handle(
+        &home,
+        "operator",
+        &serde_json::json!({
+            "action": "sweep",
+            "repository": "test/repo",
+            "apply": true,
+            "confirm_ids": [task_id],
+            "audit_reason": "scope authority TOCTOU regression"
+        }),
+    );
+    assert_eq!(
+        response["code"], "repository_scope_changed",
+        "response: {response}"
+    );
+    let task = list_all_at(&home, &crate::task_events::board_root(&home, "default"))
+        .into_iter()
+        .find(|task| task.id == task_id)
+        .unwrap();
+    assert_eq!(
+        task.status,
+        crate::task_events::TaskStatus::Open,
+        "mapping change must prevent a stale-scope cancellation"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn manual_sweep_stable_repository_claim_can_apply_3584() {
+    let home = tmp_home("3584-scope-stable-apply");
+    let repo = home.join("repo");
+    init_git_repo_with_origin(&repo, "https://github.com/test/repo.git");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  alive:\n    backend: claude\nteams:\n  sweep:\n    members: [alive]\n    source_repo: {}\n    project_id: default\n",
+            repo.display()
+        ),
+    )
+    .unwrap();
+    crate::daemon::task_sweep::handle_task_sweep_config(
+        &home,
+        &serde_json::json!({"repository": "test/repo"}),
+    );
+    write_manual_sweep_provenance(&home, "default", "test/repo");
+    let task_id = handle(
+        &home,
+        "operator",
+        &serde_json::json!({
+            "action": "create",
+            "title": "stable stale unreferenced task"
+        }),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    backdate_task_event_for_sweep(&home, &task_id, 30);
+    let dry = handle(
+        &home,
+        "operator",
+        &serde_json::json!({
+            "action": "sweep",
+            "repository": "test/repo"
+        }),
+    );
+    assert!(
+        dry["candidate_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(&task_id))),
+        "stable stale fixture must be a candidate: {dry}"
+    );
+
+    let response = handle(
+        &home,
+        "operator",
+        &serde_json::json!({
+            "action": "sweep",
+            "repository": "test/repo",
+            "apply": true,
+            "confirm_ids": [task_id],
+            "audit_reason": "stable scope apply regression"
+        }),
+    );
+    assert_eq!(response["applied"], 1, "response: {response}");
+    let task = list_all_at(&home, &crate::task_events::board_root(&home, "default"))
+        .into_iter()
+        .find(|task| task.id == task_id)
+        .unwrap();
+    assert_eq!(task.status, crate::task_events::TaskStatus::Cancelled);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+fn init_git_repo_with_origin(path: &std::path::Path, origin: &str) {
+    std::fs::create_dir_all(path).unwrap();
+    let run = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+    };
+    run(&["init", "-q", "-b", "main"]);
+    run(&["remote", "add", "origin", origin]);
+}
+
+#[test]
+fn manual_sweep_repository_scope_rejects_ambiguous_claims_3584() {
+    let home = tmp_home("3584-ambiguous-scope");
+    let repo_a = home.join("repo-a");
+    let repo_b = home.join("repo-b");
+    init_git_repo_with_origin(&repo_a, "https://github.com/org/a.git");
+    init_git_repo_with_origin(&repo_b, "https://github.com/org/b.git");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  alive:\n    backend: claude\nteams:\n  team-a:\n    members: [alive]\n    source_repo: {}\n    project_id: shared-board\n  team-b:\n    members: [alive]\n    source_repo: {}\n    project_id: shared-board\n",
+            repo_a.display(),
+            repo_b.display()
+        ),
+    )
+    .unwrap();
+    let scope = crate::daemon::task_sweep::resolve_manual_sweep_repository_scope(&home, "org/a");
+    assert!(scope.projects.is_empty());
+    assert_eq!(scope.diagnostics[0].code, "AMBIGUOUS_REPOSITORY_MAPPING");
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn test_sweep_apply_without_confirm_ids_rejected() {
     // GREEN 3a: apply=true without confirm_ids must surface
