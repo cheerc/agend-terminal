@@ -10,6 +10,27 @@ use std::path::{Path, PathBuf};
 
 const SCHEMA_VERSION: u32 = 1;
 
+#[cfg(test)]
+thread_local! {
+    static FORCE_CLEAR_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct ClearFailureGuard;
+
+#[cfg(test)]
+impl Drop for ClearFailureGuard {
+    fn drop(&mut self) {
+        FORCE_CLEAR_FAILURE.with(|flag| flag.set(false));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn force_clear_failure() -> ClearFailureGuard {
+    FORCE_CLEAR_FAILURE.with(|flag| flag.set(true));
+    ClearFailureGuard
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum State {
@@ -127,6 +148,26 @@ pub(crate) fn begin_from_binding(home: &Path, instance: &str) -> Result<Option<T
         binding_signature_sha256: crate::daemon::utils::sha256_hex(&signature),
         archive: None,
     };
+    // A release can be retried after a daemon restart, and a delete handler can
+    // re-enter the same boundary while its lifecycle fence is still pending.
+    // Preserve the first exact signed intent instead of replacing it with a
+    // fresh timestamp or silently accepting a different target identity.
+    if let Some(existing) = read(home, instance)? {
+        if existing.state != State::Recovered {
+            if existing.instance == tombstone.instance
+                && existing.branch == tombstone.branch
+                && existing.worktree == tombstone.worktree
+                && existing.source_repo == tombstone.source_repo
+                && existing.binding_sha256 == tombstone.binding_sha256
+                && existing.binding_signature_sha256 == tombstone.binding_signature_sha256
+            {
+                return Ok(Some(existing));
+            }
+            return Err(
+                "recovery_required: existing tombstone identity does not match binding".to_string(),
+            );
+        }
+    }
     write(home, &tombstone)?;
     Ok(Some(tombstone))
 }
@@ -152,6 +193,10 @@ pub(crate) fn mark_recovered(home: &Path, instance: &str, archive: &Path) -> Res
 }
 
 pub(crate) fn clear(home: &Path, instance: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if FORCE_CLEAR_FAILURE.with(std::cell::Cell::get) {
+        return Err("forced deletion tombstone clear failure".to_string());
+    }
     let path = path(home, instance);
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),

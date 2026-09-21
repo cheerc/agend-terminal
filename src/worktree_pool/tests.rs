@@ -1408,6 +1408,73 @@ fn auto_release_exact_fingerprint_cannot_release_new_generation_s1() {
 }
 
 #[test]
+fn stale_auto_release_preserves_current_generation_recovery_journal_3696() {
+    let home = tmp_home("stale-auto-current-recovery");
+    let repo = tmp_repo("stale-auto-current-recovery-repo");
+    let lease = lease_bound(
+        &home,
+        &repo,
+        "agent-stale-current-recovery",
+        "feat/stale-generation-a",
+    );
+    let expected_a =
+        match crate::binding::snapshot_guarded_binding(&home, "agent-stale-current-recovery")
+            .expect("snapshot generation A")
+        {
+            crate::binding::GuardedBinding::Known { fingerprint, .. } => fingerprint,
+            other => panic!("expected Known generation A, got {other:?}"),
+        };
+    let binding_path = crate::paths::binding_path(&home, "agent-stale-current-recovery");
+    let signature_path = crate::paths::runtime_dir(&home)
+        .join("agent-stale-current-recovery")
+        .join("binding.json.sig");
+    std::fs::remove_file(&binding_path).expect("remove generation A binding");
+    std::fs::remove_file(&signature_path).expect("remove generation A signature");
+    crate::binding::bind_full(
+        &home,
+        "agent-stale-current-recovery",
+        "T-generation-b",
+        "feat/stale-generation-b",
+        &lease.path,
+        &repo,
+        false,
+    )
+    .expect("install generation B");
+    prepare_release_journal(&home, "agent-stale-current-recovery")
+        .expect("generation B journal should be durable");
+    std::fs::remove_dir_all(&lease.path).expect("simulate generation B removal");
+    mark_release_recovery_required(&home, "agent-stale-current-recovery")
+        .expect("mark generation B recovery required");
+    let tombstone_path =
+        crate::agent::deletion_recovery::path(&home, "agent-stale-current-recovery");
+    let tombstone_before = std::fs::read(&tombstone_path).expect("read generation B tombstone");
+
+    let outcome = release_full_exact(&home, "agent-stale-current-recovery", &expected_a, false);
+
+    assert!(
+        outcome.stale_fingerprint && !outcome.released,
+        "stale generation A must not release generation B: {outcome:?}"
+    );
+    assert_eq!(
+        std::fs::read(&tombstone_path).expect("generation B tombstone must remain"),
+        tombstone_before,
+        "stale generation A must not clear generation B recovery authority"
+    );
+    assert_eq!(
+        crate::binding::read(&home, "agent-stale-current-recovery")
+            .expect("generation B binding must remain")["branch"],
+        "feat/stale-generation-b"
+    );
+    assert!(
+        !lease.path.exists(),
+        "generation B residue remains absent for recovery"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
 fn dirty_release_begins_notice_emit_after_all_transaction_flocks_drop_s1() {
     let home = tmp_home("s1-notice-unlocked");
     let repo = tmp_repo("s1-notice-unlocked-repo");
@@ -4975,6 +5042,315 @@ fn release_remove_failure_retains_binding_with_structured_stage() {
     assert!(lease.path.exists(), "failed target must remain inspectable");
 
     std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3696 RED: the real normal release path must journal the exact signed
+/// binding before removing the worktree.  An interruption after physical
+/// removal and before binding clear must leave a durable recovery fence so a
+/// daemon restart can route the residue to operator recovery.
+#[test]
+fn normal_release_interruption_retains_durable_recovery_journal_3696() {
+    let home = tmp_home("release-journal-red");
+    let repo = tmp_repo("release-journal-red-repo");
+    let lease = lease_bound(
+        &home,
+        &repo,
+        "agent-release-journal",
+        "feat/release-journal",
+    );
+    let binding_path = crate::paths::binding_path(&home, "agent-release-journal");
+    let signature_path = crate::paths::runtime_dir(&home)
+        .join("agent-release-journal")
+        .join("binding.json.sig");
+    let binding_before = std::fs::read(&binding_path).expect("read binding before release");
+    let signature_before =
+        std::fs::read(&signature_path).expect("read binding signature before release");
+
+    let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _hook = release_test_seam::install(|phase| {
+            if phase == ReleaseTestPhase::AfterWorktreeRemoveBeforeBindingClear {
+                panic!("simulate daemon interruption after physical removal");
+            }
+        });
+        release_full(&home, "agent-release-journal", false);
+    }));
+
+    assert!(
+        interrupted.is_err(),
+        "the seam must simulate an interruption"
+    );
+    assert!(
+        !lease.path.exists(),
+        "physical remove must have happened first"
+    );
+    assert_eq!(
+        std::fs::read(&binding_path).expect("binding remains after interruption"),
+        binding_before
+    );
+    assert_eq!(
+        std::fs::read(&signature_path).expect("signature remains after interruption"),
+        signature_before
+    );
+    let journal = crate::agent::deletion_recovery::read(&home, "agent-release-journal")
+        .expect("read release recovery journal")
+        .expect("normal release must persist a recovery journal before removal");
+    assert_eq!(
+        journal.state,
+        crate::agent::deletion_recovery::State::RecoveryRequired
+    );
+
+    let report = crate::admin::worktree_recovery::recover_markerless_bound_worktree(
+        &home,
+        "operator",
+        "archive interrupted normal release residue",
+        "agent-release-journal",
+        "feat/release-journal",
+        &lease.path,
+        &repo,
+    )
+    .expect("restart recovery must archive the exact release residue");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(report.archive.join(".agend-recovery-manifest.json"))
+            .expect("read release recovery manifest"),
+    )
+    .expect("parse release recovery manifest");
+    assert_eq!(manifest["instance"], "agent-release-journal");
+    assert_eq!(manifest["branch"], "feat/release-journal");
+    assert!(report
+        .archive
+        .join(".agend-recovery-binding.json")
+        .is_file());
+    assert!(report
+        .archive
+        .join(".agend-recovery-binding.json.sig")
+        .is_file());
+    assert!(crate::binding::read(&home, "agent-release-journal").is_none());
+    assert_eq!(
+        crate::agent::deletion_recovery::read(&home, "agent-release-journal")
+            .expect("read completed recovery journal")
+            .expect("recovery receipt remains durable")
+            .state,
+        crate::agent::deletion_recovery::State::Recovered
+    );
+    let retry = crate::admin::worktree_recovery::recover_markerless_bound_worktree(
+        &home,
+        "operator",
+        "idempotent retry after normal release recovery",
+        "agent-release-journal",
+        "feat/release-journal",
+        &lease.path,
+        &repo,
+    )
+    .expect("identical recovery retry must succeed");
+    assert_eq!(retry.archive, report.archive);
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn exact_bound_release_journals_before_remove_3696() {
+    let home = tmp_home("exact-release-journal");
+    let repo = tmp_repo("exact-release-journal-repo");
+    let lease = lease_bound(&home, &repo, "agent-exact-journal", "feat/exact-journal");
+    let expected = match crate::binding::snapshot_guarded_binding(&home, "agent-exact-journal")
+        .expect("snapshot exact binding")
+    {
+        crate::binding::GuardedBinding::Known { fingerprint, .. } => fingerprint,
+        other => panic!("expected known binding, got {other:?}"),
+    };
+
+    let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _hook = release_test_seam::install(|phase| {
+            if phase == ReleaseTestPhase::AfterWorktreeRemoveBeforeBindingClear {
+                panic!("simulate exact release interruption");
+            }
+        });
+        release_bound_target_exact(&home, "agent-exact-journal", &expected, &lease.path, &repo);
+    }));
+
+    assert!(interrupted.is_err());
+    assert!(!lease.path.exists());
+    assert_eq!(
+        crate::agent::deletion_recovery::read(&home, "agent-exact-journal")
+            .expect("read exact release journal")
+            .expect("exact bound release must journal signed binding")
+            .state,
+        crate::agent::deletion_recovery::State::RecoveryRequired
+    );
+    let report = crate::admin::worktree_recovery::recover_markerless_bound_worktree(
+        &home,
+        "operator",
+        "recover exact release interruption",
+        "agent-exact-journal",
+        "feat/exact-journal",
+        &lease.path,
+        &repo,
+    )
+    .expect("exact release residue must be recoverable");
+    assert!(report
+        .archive
+        .join(".agend-recovery-manifest.json")
+        .is_file());
+    assert!(crate::binding::read(&home, "agent-exact-journal").is_none());
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn stale_normal_release_clears_only_the_superseded_generation_journal_3696() {
+    let home = tmp_home("release-journal-stale-generation");
+    let repo = tmp_repo("release-journal-stale-generation-repo");
+    let lease = lease_bound(
+        &home,
+        &repo,
+        "agent-release-journal-stale",
+        "feat/release-journal-a",
+    );
+    prepare_release_journal(&home, "agent-release-journal-stale")
+        .expect("generation A journal should be durable");
+
+    let binding_path = crate::paths::binding_path(&home, "agent-release-journal-stale");
+    let signature_path = crate::paths::runtime_dir(&home)
+        .join("agent-release-journal-stale")
+        .join("binding.json.sig");
+    let settled_archive = home
+        .join(".trash")
+        .join("worktrees")
+        .join("superseded-generation");
+    let _hook = release_test_seam::install({
+        let home = home.clone();
+        let binding_path = binding_path.clone();
+        let signature_path = signature_path.clone();
+        let worktree = lease.path.clone();
+        let repo = repo.clone();
+        let settled_archive = settled_archive.clone();
+        move |phase| {
+            if phase == ReleaseTestPhase::AfterBindingSnapshot {
+                std::fs::remove_file(&binding_path).expect("remove generation A binding");
+                std::fs::remove_file(&signature_path).expect("remove generation A signature");
+                std::fs::create_dir_all(&settled_archive).expect("create settled archive");
+                crate::agent::deletion_recovery::mark_recovered(
+                    &home,
+                    "agent-release-journal-stale",
+                    &settled_archive,
+                )
+                .expect("settle generation A recovery before replacement bind");
+                crate::binding::bind_full(
+                    &home,
+                    "agent-release-journal-stale",
+                    "",
+                    "feat/release-journal-b",
+                    &worktree,
+                    &repo,
+                    false,
+                )
+                .expect("install replacement generation B");
+            }
+        }
+    });
+    let outcome = release_full(&home, "agent-release-journal-stale", false);
+
+    assert!(
+        outcome.stale_fingerprint,
+        "replacement generation must win CAS"
+    );
+    assert!(crate::binding::read(&home, "agent-release-journal-stale").is_some());
+    assert!(
+        crate::agent::deletion_recovery::read(&home, "agent-release-journal-stale")
+            .expect("read generation journal")
+            .is_none(),
+        "stale generation A journal must not fence replacement generation B"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn release_journal_clear_failure_is_settled_by_restart_retry_3696() {
+    let home = tmp_home("release-journal-clear-failure");
+    let repo = tmp_repo("release-journal-clear-failure-repo");
+    let lease = lease_bound(
+        &home,
+        &repo,
+        "agent-release-journal-clear",
+        "feat/release-journal-clear",
+    );
+    let outcome = {
+        let _failure = crate::agent::deletion_recovery::force_clear_failure();
+        release_full(&home, "agent-release-journal-clear", false)
+    };
+
+    assert!(!outcome.released, "unlink failure must not report success");
+    assert!(!lease.path.exists(), "physical teardown already completed");
+    assert!(crate::binding::read(&home, "agent-release-journal-clear").is_none());
+    assert_eq!(
+        crate::agent::deletion_recovery::read(&home, "agent-release-journal-clear")
+            .expect("read retained recovery journal")
+            .expect("journal remains after clear failure")
+            .state,
+        crate::agent::deletion_recovery::State::RecoveryRequired
+    );
+
+    let retry = release_full(&home, "agent-release-journal-clear", false);
+    assert!(
+        retry.released,
+        "restart retry must settle completed release: {retry:?}"
+    );
+    assert!(retry.already_released);
+    assert!(
+        crate::agent::deletion_recovery::read(&home, "agent-release-journal-clear")
+            .expect("read settled journal")
+            .is_none()
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_signature_sidecar_is_present_invalid_and_fails_closed_3696() {
+    use std::os::unix::fs::symlink;
+
+    let home = tmp_home("release-journal-dangling-signature");
+    let repo = tmp_repo("release-journal-dangling-signature-repo");
+    let lease = lease_bound(
+        &home,
+        &repo,
+        "agent-release-journal-dangling",
+        "feat/release-journal-dangling",
+    );
+    let signature_path = crate::paths::runtime_dir(&home)
+        .join("agent-release-journal-dangling")
+        .join("binding.json.sig");
+    std::fs::remove_file(&signature_path).expect("remove valid signature sidecar");
+    symlink("missing-signature", &signature_path).expect("create dangling signature sidecar");
+
+    let outcome = release_full(&home, "agent-release-journal-dangling", false);
+
+    assert!(
+        !outcome.released,
+        "dangling signature must not release: {outcome:?}"
+    );
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("signature")),
+        "failure must identify invalid signature evidence: {outcome:?}"
+    );
+    assert!(
+        lease.path.exists(),
+        "fail-closed release must preserve target"
+    );
+    assert!(
+        crate::binding::read(&home, "agent-release-journal-dangling").is_some(),
+        "fail-closed release must preserve binding"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
 }
 
 #[test]
