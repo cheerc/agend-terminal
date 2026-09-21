@@ -4,10 +4,24 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+fn remove_empty_dir_tree(dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                remove_empty_dir_tree(&entry.path());
+            }
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecoveryReport {
     pub archive: PathBuf,
 }
+
+#[path = "worktree_recovery_archive.rs"]
+mod archive;
 
 /// Recover one exact markerless bound worktree.
 ///
@@ -30,6 +44,80 @@ pub(crate) fn recover_markerless_bound_worktree(
         return Err("branch is required".to_string());
     }
 
+    // #3696: a completed operator archive is a durable idempotency receipt.
+    // It deliberately lives outside runtime/<instance>/, which the first
+    // recovery removes after unbinding.  A retry returns the exact same
+    // archive and never touches a same-name replacement binding.
+    let mut durable_tombstone = crate::agent::deletion_recovery::read(home, instance)?;
+    if let Some(tombstone) = durable_tombstone.as_ref() {
+        if tombstone.state == crate::agent::deletion_recovery::State::Recovered {
+            if tombstone.instance != instance
+                || tombstone.branch != branch
+                || Path::new(&tombstone.worktree) != worktree
+                || Path::new(&tombstone.source_repo) != source_repo
+            {
+                return Err(
+                    "recovery refused: supplied instance/branch/worktree/source does not match tombstone"
+                        .to_string(),
+                );
+            }
+            let archive = tombstone
+                .archive
+                .as_deref()
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    "recovery refused: recovered tombstone has no archive".to_string()
+                })?;
+            if !archive.is_dir() {
+                return Err(format!(
+                    "recovery refused: recorded archive is unavailable: {}",
+                    archive.display()
+                ));
+            }
+            return Ok(RecoveryReport { archive });
+        }
+    }
+
+    // Lock order is deliberate and shared with normal lifecycle mutation:
+    // lifecycle permit -> per-agent mutation lock -> binding-file lock.
+    let permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        home,
+        instance,
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+    )
+    .map_err(|e| format!("recovery refused: {e}"))?;
+    let _agent_lock = crate::binding::acquire_agent_mutation_lock(home, instance)?;
+    let _binding_lock = crate::binding::acquire_binding_file_lock(home, instance)?;
+
+    let tombstone_recovery = durable_tombstone.as_ref().is_some_and(|tombstone| {
+        tombstone.state == crate::agent::deletion_recovery::State::RecoveryRequired
+    });
+    if !tombstone_recovery && crate::worktree_pool::is_agent_alive(home, instance) {
+        return Err(format!(
+            "recovery refused: instance '{instance}' still shows liveness"
+        ));
+    }
+
+    if let Some(tombstone) = durable_tombstone.as_ref() {
+        let recorded_archive_exists = tombstone
+            .archive
+            .as_deref()
+            .is_some_and(|archive| Path::new(archive).is_dir());
+        if tombstone.archive.is_some() && (recorded_archive_exists || !worktree.exists()) {
+            return archive::recover_recorded_archive(
+                home,
+                actor,
+                audit_reason,
+                instance,
+                branch,
+                worktree,
+                source_repo,
+                tombstone,
+                &permit,
+            );
+        }
+    }
+
     let root = crate::worktree_pool::daemon_managed_worktree_root(home)
         .canonicalize()
         .map_err(|e| format!("managed worktree root is unavailable: {e}"))?;
@@ -45,23 +133,6 @@ pub(crate) fn recover_markerless_bound_worktree(
     let source = source_repo
         .canonicalize()
         .map_err(|e| format!("source repository is unavailable: {e}"))?;
-
-    // Lock order is deliberate and shared with normal lifecycle mutation:
-    // lifecycle permit -> per-agent mutation lock -> binding-file lock.
-    let permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
-        home,
-        instance,
-        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
-    )
-    .map_err(|e| format!("recovery refused: {e}"))?;
-    let _agent_lock = crate::binding::acquire_agent_mutation_lock(home, instance)?;
-    let _binding_lock = crate::binding::acquire_binding_file_lock(home, instance)?;
-
-    if crate::worktree_pool::is_agent_alive(home, instance) {
-        return Err(format!(
-            "recovery refused: instance '{instance}' still shows liveness"
-        ));
-    }
 
     let crate::binding::GuardedBinding::Known { value: binding, .. } =
         crate::binding::guarded_binding_disk_fresh(home, instance)
@@ -91,6 +162,23 @@ pub(crate) fn recover_markerless_bound_worktree(
                 .to_string(),
         );
     }
+    if let Some(tombstone) = durable_tombstone.as_ref() {
+        if tombstone.instance != instance
+            || !matches!(
+                tombstone.state,
+                crate::agent::deletion_recovery::State::Deleting
+                    | crate::agent::deletion_recovery::State::RecoveryRequired
+            )
+            || tombstone.branch != bound_branch
+            || Path::new(&tombstone.worktree) != Path::new(bound_worktree)
+            || Path::new(&tombstone.source_repo) != Path::new(bound_source)
+        {
+            return Err(
+                "recovery refused: supplied identity does not match the delete tombstone"
+                    .to_string(),
+            );
+        }
+    }
     if crate::worktree_pool::is_daemon_managed(&target) {
         return Err(
             "recovery refused: worktree still has its managed marker; use normal release"
@@ -117,6 +205,34 @@ pub(crate) fn recover_markerless_bound_worktree(
         .join("binding.json.sig");
     let binding_signature = std::fs::read(&signature_path)
         .map_err(|e| format!("read binding signature {}: {e}", signature_path.display()))?;
+    if let Some(tombstone) = durable_tombstone.as_ref() {
+        let binding_sha256 = crate::daemon::utils::sha256_hex(&binding_body);
+        let signature_sha256 = crate::daemon::utils::sha256_hex(&binding_signature);
+        if tombstone.binding_sha256 != binding_sha256
+            || tombstone.binding_signature_sha256 != signature_sha256
+        {
+            return Err(
+                "recovery refused: binding evidence does not match the delete tombstone"
+                    .to_string(),
+            );
+        }
+    }
+
+    // Public CLI recovery can start without the delete handler having written
+    // a tombstone.  All rejection-only preflight checks above intentionally
+    // run before this journal write, so a bad operator request cannot leave a
+    // blocking Deleting tombstone behind.  Once the signed binding evidence
+    // has passed those checks, establish the same durable journal used by the
+    // delete handler before any archive mutation so a crash is recoverable.
+    if durable_tombstone.is_none() {
+        durable_tombstone = crate::agent::deletion_recovery::begin_from_binding(home, instance)?;
+        if durable_tombstone.is_none() {
+            return Err(
+                "recovery refused: signed binding evidence is required for operator recovery"
+                    .to_string(),
+            );
+        }
+    }
 
     let archive_root = home.join(".trash").join("worktrees");
     std::fs::create_dir_all(&archive_root)
@@ -133,6 +249,30 @@ pub(crate) fn recover_markerless_bound_worktree(
         return Err(format!("recovery archive collision: {}", archive.display()));
     }
 
+    // Publish the planned archive path before the rename.  A daemon crash at
+    // either side of the filesystem rename leaves a durable next action: the
+    // retry can finish the rename when the source remains, or finish the
+    // receipt when the archive already exists.
+    if durable_tombstone.is_some() {
+        crate::agent::deletion_recovery::mark_recovery_required(home, instance, Some(&archive))?;
+    }
+
+    // Prepare self-describing metadata inside the source before rename.  The
+    // rename then carries the signed evidence and manifest atomically with the
+    // payload, while retries can safely complete any interrupted metadata write.
+    archive::write_archive_metadata(
+        &target,
+        actor,
+        audit_reason,
+        instance,
+        branch,
+        &source,
+        &target,
+        &archive,
+        &binding_body,
+        &binding_signature,
+    )?;
+
     // Rename is the safety boundary: it is atomic on the normal same-filesystem
     // layout. Cross-device copy is deliberately refused so recovery never turns
     // into a partially copied destructive cleanup.
@@ -144,47 +284,22 @@ pub(crate) fn recover_markerless_bound_worktree(
         )
     })?;
 
-    let metadata_result = (|| {
-        crate::store::atomic_write(&archive.join(".agend-recovery-binding.json"), &binding_body)
-            .map_err(|e| e.to_string())?;
-        crate::store::atomic_write(
-            &archive.join(".agend-recovery-binding.json.sig"),
-            &binding_signature,
-        )
-        .map_err(|e| e.to_string())?;
-        let manifest = serde_json::json!({
-            "schema_version": 1,
-            "actor": actor,
-            "audit_reason": audit_reason,
-            "instance": instance,
-            "branch": branch,
-            "source_repo": source,
-            "original_worktree": target,
-            "archived_worktree": archive,
-            "binding_sha256": crate::daemon::utils::sha256_hex(&binding_body),
-        });
-        crate::store::atomic_write(
-            &archive.join(".agend-recovery-manifest.json"),
-            serde_json::to_string_pretty(&manifest)
-                .map_err(|e| e.to_string())?
-                .as_bytes(),
-        )
-        .map_err(|e| e.to_string())?;
-        Ok::<(), String>(())
-    })();
-    if let Err(error) = metadata_result {
-        let rollback = std::fs::rename(&archive, &target);
-        return Err(match rollback {
-            Ok(()) => format!("recovery metadata failed; archive rolled back: {error}"),
-            Err(rollback) => format!(
-                "recovery metadata failed and rollback failed ({rollback}); archive remains at {}: {error}",
-                archive.display()
-            ),
-        });
-    }
-
     match crate::binding::unbind_with_permit(home, instance, &permit) {
         crate::binding::BindingRemoval::Removed => {
+            remove_empty_dir_tree(
+                &crate::worktree_pool::daemon_managed_worktree_root(home).join(instance),
+            );
+            let _ = std::fs::remove_dir_all(crate::paths::runtime_dir(home).join(instance));
+            if durable_tombstone.is_some() {
+                if let Err(error) =
+                    crate::agent::deletion_recovery::mark_recovered(home, instance, &archive)
+                {
+                    return Err(format!(
+                        "archive created and binding cleared at {}, but recovery receipt failed: {error}",
+                        archive.display()
+                    ));
+                }
+            }
             crate::event_log::log(
                 home,
                 "markerless_worktree_recovered",
@@ -276,6 +391,199 @@ mod tests {
             .join(".agend-recovery-binding.json.sig")
             .is_file());
         assert!(crate::binding::read(&home, &instance).is_none());
+        assert_eq!(
+            crate::agent::deletion_recovery::read(&home, &instance)
+                .expect("read recovery receipt")
+                .expect("CLI recovery must journal signed binding")
+                .state,
+            crate::agent::deletion_recovery::State::Recovered
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn interrupted_deleting_tombstone_is_recoverable_after_restart() {
+        let home = temp_home("interrupted-delete");
+        let instance = format!("recovery-interrupted-{}", std::process::id());
+        let branch = "review/interrupted";
+        let source_repo = home.join("source-repo");
+        std::fs::create_dir_all(&source_repo).expect("create source repository fixture");
+        let worktree = crate::worktree_pool::daemon_managed_worktree_root(&home)
+            .join(&instance)
+            .join("review-interrupted");
+        std::fs::create_dir_all(&worktree).expect("create worktree fixture");
+        std::fs::write(worktree.join("leftover.txt"), b"survive restart")
+            .expect("write residual worktree fixture");
+        crate::binding::bind_full(&home, &instance, "", branch, &worktree, &source_repo, false)
+            .expect("bind recovery fixture");
+
+        crate::agent::deletion_recovery::begin_from_binding(&home, &instance)
+            .expect("persist interrupted deleting tombstone")
+            .expect("signed binding must enter recovery lane");
+
+        let report = recover_markerless_bound_worktree(
+            &home,
+            "operator",
+            "recover interrupted delete after restart",
+            &instance,
+            branch,
+            &worktree,
+            &source_repo,
+        )
+        .expect("operator recovery must accept an interrupted deleting tombstone");
+
+        assert!(!worktree.exists());
+        assert_eq!(
+            std::fs::read(report.archive.join("leftover.txt")).expect("read archived fixture"),
+            b"survive restart"
+        );
+        assert!(crate::binding::read(&home, &instance).is_none());
+        assert_eq!(
+            crate::agent::deletion_recovery::read(&home, &instance)
+                .expect("read recovery receipt")
+                .expect("receipt must persist")
+                .state,
+            crate::agent::deletion_recovery::State::Recovered
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn archived_recovery_receipt_retry_survives_binding_cleanup() {
+        let home = temp_home("receipt-retry");
+        let instance = format!("recovery-receipt-{}", std::process::id());
+        let branch = "review/receipt-retry";
+        let source_repo = home.join("source-repo");
+        std::fs::create_dir_all(&source_repo).expect("create source repository fixture");
+        let worktree = crate::worktree_pool::daemon_managed_worktree_root(&home)
+            .join(&instance)
+            .join("review-receipt-retry");
+        std::fs::create_dir_all(&worktree).expect("create worktree fixture");
+        crate::binding::bind_full(&home, &instance, "", branch, &worktree, &source_repo, false)
+            .expect("bind recovery fixture");
+        let binding_body = std::fs::read(crate::paths::binding_path(&home, &instance))
+            .expect("read binding fixture");
+        let binding_signature = std::fs::read(
+            crate::paths::runtime_dir(&home)
+                .join(&instance)
+                .join("binding.json.sig"),
+        )
+        .expect("read binding signature fixture");
+        crate::agent::deletion_recovery::begin_from_binding(&home, &instance)
+            .expect("persist deleting tombstone")
+            .expect("signed binding must enter recovery lane");
+
+        let archive = home
+            .join(".trash")
+            .join("worktrees")
+            .join(format!("{instance}-recovery-retry"));
+        std::fs::create_dir_all(&archive).expect("create recovery archive fixture");
+        std::fs::write(archive.join(".agend-recovery-binding.json"), &binding_body)
+            .expect("write archived binding fixture");
+        std::fs::write(
+            archive.join(".agend-recovery-binding.json.sig"),
+            &binding_signature,
+        )
+        .expect("write archived signature fixture");
+        std::fs::write(archive.join("leftover.txt"), b"archived before receipt")
+            .expect("write archived payload fixture");
+        crate::agent::deletion_recovery::mark_recovery_required(&home, &instance, Some(&archive))
+            .expect("persist archive before simulated crash");
+        std::fs::remove_dir_all(&worktree).expect("simulate archived worktree");
+        std::fs::remove_dir_all(crate::paths::runtime_dir(&home).join(&instance))
+            .expect("simulate binding cleanup before receipt");
+
+        let report = recover_markerless_bound_worktree(
+            &home,
+            "operator",
+            "retry recovery receipt after restart",
+            &instance,
+            branch,
+            &worktree,
+            &source_repo,
+        )
+        .expect("operator retry must complete an archived recovery receipt");
+
+        assert_eq!(report.archive, archive);
+        assert_eq!(
+            std::fs::read(report.archive.join("leftover.txt")).expect("read archived payload"),
+            b"archived before receipt"
+        );
+        assert_eq!(
+            crate::agent::deletion_recovery::read(&home, &instance)
+                .expect("read recovery receipt")
+                .expect("receipt must persist")
+                .state,
+            crate::agent::deletion_recovery::State::Recovered
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn archive_metadata_gap_is_recoverable_after_restart() {
+        let home = temp_home("metadata-gap");
+        let instance = format!("recovery-metadata-gap-{}", std::process::id());
+        let branch = "review/metadata-gap";
+        let source_repo = home.join("source-repo");
+        std::fs::create_dir_all(&source_repo).expect("create source repository fixture");
+        let worktree = crate::worktree_pool::daemon_managed_worktree_root(&home)
+            .join(&instance)
+            .join("review-metadata-gap");
+        std::fs::create_dir_all(&worktree).expect("create worktree fixture");
+        crate::binding::bind_full(&home, &instance, "", branch, &worktree, &source_repo, false)
+            .expect("bind recovery fixture");
+        crate::agent::deletion_recovery::begin_from_binding(&home, &instance)
+            .expect("persist deleting tombstone")
+            .expect("signed binding must enter recovery lane");
+
+        let archive = home
+            .join(".trash")
+            .join("worktrees")
+            .join(format!("{instance}-metadata-gap"));
+        std::fs::create_dir_all(&archive).expect("create partial archive fixture");
+        std::fs::write(
+            archive.join("leftover.txt"),
+            b"archive survived metadata crash",
+        )
+        .expect("write archived payload fixture");
+        crate::agent::deletion_recovery::mark_recovery_required(&home, &instance, Some(&archive))
+            .expect("persist archive path before simulated crash");
+        std::fs::remove_dir_all(&worktree).expect("simulate rename before metadata writes");
+
+        let report = recover_markerless_bound_worktree(
+            &home,
+            "operator",
+            "complete metadata after restart",
+            &instance,
+            branch,
+            &worktree,
+            &source_repo,
+        )
+        .expect("recovery must complete metadata after rename crash");
+
+        assert_eq!(
+            std::fs::read(report.archive.join("leftover.txt")).expect("read archived payload"),
+            b"archive survived metadata crash"
+        );
+        assert!(report
+            .archive
+            .join(".agend-recovery-binding.json")
+            .is_file());
+        assert!(report
+            .archive
+            .join(".agend-recovery-binding.json.sig")
+            .is_file());
+        assert!(report
+            .archive
+            .join(".agend-recovery-manifest.json")
+            .is_file());
+        assert_eq!(
+            crate::agent::deletion_recovery::read(&home, &instance)
+                .expect("read recovery receipt")
+                .expect("receipt must persist")
+                .state,
+            crate::agent::deletion_recovery::State::Recovered
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -311,6 +619,12 @@ mod tests {
         assert!(error.contains("managed marker"));
         assert!(worktree.exists());
         assert!(crate::binding::read(&home, &instance).is_some());
+        assert!(
+            crate::agent::deletion_recovery::read(&home, &instance)
+                .expect("read recovery state")
+                .is_none(),
+            "a rejected preflight must not leave a blocking tombstone"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -341,6 +655,12 @@ mod tests {
         assert!(error.contains("does not match binding"));
         assert!(worktree.exists());
         assert!(crate::binding::read(&home, &instance).is_some());
+        assert!(
+            crate::agent::deletion_recovery::read(&home, &instance)
+                .expect("read recovery state")
+                .is_none(),
+            "a rejected preflight must not leave a blocking tombstone"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
