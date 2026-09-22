@@ -2,13 +2,29 @@
 
 # AgEnD MCP Tools Reference (34 tools)
 
+> **Status:** Current exact schema reference
+> **Audience:** Agents and reviewers
+> **Authority:** Live tools/list schema and daemon registry
+> **Last verified:** 2026-09-22 at `main@62b28f36`
+
 The daemon registry and live `tools/list` schema are authoritative. Role filtering can expose a subset of these 34 registered tools to an instance.
 
 ## Action-based Tools
 
 ### `task`
 
-Manage task boards. Actions: `create`, `list`, `get`, `claim`, `done`, `update`, `sweep`, `health`, `activity`, `metadata_set`, `metadata_get`, `ack_plan`.
+Manage task boards. Actions: `create`, `list`, `get`, `claim`, `done`, `update`, `sweep`, `board_sweep`, `board_unretire`, `health`, `activity`, `metadata_set`, `metadata_get`, `ack_plan`, `orphan_reconcile_preview`, `orphan_reconcile_apply`.
+
+- **REQUIRED:** Every call supplies `action`. Orphan-reconcile preview requires the exact `decision_id`, `board`, a non-empty `audit_reason`, and the complete frozen seven-row `mappings` set. Apply consumes only the preview `confirmation` token; that token freezes the mappings and audit scope.
+- **STOP:** Never apply an orphan reconciliation without a matching preview confirmation.
+- **OPTIONAL:** Use `verbose`, `fields`, `include_history`, and filters to control list output.
+
+Preview, then apply only the frozen mapping:
+
+```json
+{"action":"orphan_reconcile_preview","decision_id":"d-20260922032524703479-91","board":"Hack_agend-terminal","audit_reason":"apply the approved seven-row orphan reconciliation","mappings":[{"predecessor_id":"t-20260907235055249429-95750-527","replacement_id":"t-20260911011514337302-80976-487"},{"predecessor_id":"t-20260914111234728581-87735-45","replacement_id":"t-20260914111408120558-87735-48"},{"predecessor_id":"t-20260914111259722658-87735-46","replacement_id":"t-20260914111408120558-87735-48"},{"predecessor_id":"t-20260914111332528060-87735-47","replacement_id":"t-20260914111408120558-87735-48"},{"predecessor_id":"t-20260915052051881509-87735-153","replacement_id":"t-20260915052412876647-87735-158"},{"predecessor_id":"t-20260914153935855471-87735-78","replacement_id":"t-20260914174754306925-87735-97"},{"predecessor_id":"t-20260921192747528323-35876-350","replacement_id":"t-20260921210143816824-35876-355"}]}
+{"action":"orphan_reconcile_apply","confirmation":"<preview confirmation UUID>"}
+```
 
 - Core fields include `id`/`task_id`, `title`, `description`, `assignee`, `priority`, `status`, `branch`, `depends_on`, `result`, `due_at`, `project`, and `scope`.
 - `list` returns actionable tasks by default; use `include_history:true` to include done/cancelled tasks and filters such as `filter_status` or `filter_assignee` to narrow it.
@@ -34,7 +50,12 @@ Manage teams. Actions: `create`, `delete`, `list`, `update`.
 
 ### `schedule`
 
-Manage timed delivery. Actions: `create`, `list`, `update`, `delete`.
+Manage timed delivery. Actions: `create`, `list`, `update`, `delete`, `runs`, `complete`, `deliver`, `resolve_recovery`.
+
+- **REQUIRED:** `attempt_id` is required for `complete` and `deliver`; those actions also use `run_id`.
+- **STOP:** Use `resolve_recovery` only after an operator confirms workers are stopped, delivery is reconciled, and cleanup is complete.
+
+The normal lifecycle is `create` or `list`, inspect `runs`, then `complete` or `deliver` the selected `run_id` and `attempt_id`.
 
 - Fields: `id`, `label`, `instance`, `message`, `cron`, `run_at`, `timezone`, `enabled`.
 - `list` returns the newest three history entries and `runs_total` by default; use `full_history:true` for all retained entries, up to 50.
@@ -48,7 +69,17 @@ Manage batch deployments. Actions: `deploy`, `teardown`, `list`.
 
 ### `ci`
 
-Manage CI watches. Actions: `watch`, `unwatch`, `status`.
+Manage CI watches. Actions: `watch`, `unwatch`, `status`, `defer`, `ack_handoff`.
+
+- **REQUIRED:** `watch` needs either an explicit `repository` or a valid caller binding with `source_repo`; `unwatch`, `defer`, and `ack_handoff` require explicit `repository`. `branch` is required for `defer` and `ack_handoff`; `episode` is required for `defer` and `ack_handoff`.
+- **REQUIRED for `defer`:** `wake_task_id`, `reason`, and bounded `defer_secs` (60–3600).
+- **OPTIONAL:** `notification_only`, `head_sha`, `subject_head_sha`, `review_class`, and provider fields.
+- **STOP:** Protected exact-head watches fail closed without the required full SHA, task, authorization, and continuation fields.
+
+```json
+{"action":"defer","repository":"owner/repo","episode":"episode-...","wake_task_id":"t-...","reason":"waiting for task","defer_secs":600}
+{"action":"ack_handoff","repository":"owner/repo","branch":"feat/example","episode":"episode-..."}
+```
 
 - Fields: `repository`, `branch`, `interval_secs`, `next_after_ci`, `review_class`, `ci_provider`, `ci_provider_url`, `task_id`, `head_sha`, `subject_head_sha`.
 - Use `repository` (GitHub `owner/repo`), not `repo`. `watch` may derive it from the caller's binding; `unwatch` requires it explicitly.

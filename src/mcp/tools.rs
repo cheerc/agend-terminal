@@ -49,7 +49,7 @@ pub(crate) fn def_download_attachment() -> Value {
 }
 
 pub(crate) fn def_send() -> Value {
-    json!({"name": "send", "description": "Send a message to another instance or broadcast to multiple. Replaces send_to_instance/delegate_task/report_result/request_information/broadcast. Sprint 58 Wave 4 PR-1: kind=task dispatches MUST include task_id (call task action=create first to obtain a 't-...' id).",
+    json!({"name": "send", "description": "Send a message to another instance or broadcast to multiple. Replaces send_to_instance/delegate_task/report_result/request_information/broadcast. Sprint 58 Wave 4 PR-1: broadcast kind=task dispatches MUST include task_id; the current single-target compatibility path may auto-create one when omitted (explicit task action=create remains the stable contract).",
         "inputSchema": {"type": "object", "properties": {
             "instance": {"type": "string", "description": "Name of the existing instance to send to (single recipient)"},
             "instances": {"type": "array", "items": {"type": "string"}, "description": "Names of existing instances to broadcast to (broadcast mode)"},
@@ -57,7 +57,7 @@ pub(crate) fn def_send() -> Value {
             "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags filter (broadcast mode)"},
             "message": {"type": "string", "description": "Canonical message text routed to the corresponding task, report, or query handler. Required unless message_from_file is provided."},
             "message_from_file": {"type": "string", "description": "Path to a text file whose contents become the message. Overrides 'message' when both are provided. Must be an absolute path to a regular UTF-8 text file (max 1 MiB)."},
-            "request_kind": {"type": "string", "enum": ["query", "task", "report", "update"], "description": "Message kind (determines behavior). NOTE: kind=task requires task_id (Sprint 58 Wave 4 PR-1 anti-stall contract)."},
+            "request_kind": {"type": "string", "enum": ["query", "task", "report", "update"], "description": "Message kind (determines behavior). Broadcast kind=task requires task_id; single-target kind=task may auto-create one when omitted (Sprint 58 Wave 4 PR-1 anti-stall contract)."},
             "report_purpose": {"type": "string", "enum": ["task_result", "analysis_decision", "source_spike", "rca", "code_review"], "description": "Typed purpose for request_kind=report. New report callers should always set it. Missing legacy values remain ordinary LegacyUntyped reports with zero code-review authority."},
             "code_review": {"type": "object", "additionalProperties": false, "properties": {
                 "assignment_id": {"type": "string", "description": "Exact assignment generation UUID delivered by a typed review_assignment."},
@@ -66,7 +66,7 @@ pub(crate) fn def_send() -> Value {
             }, "required": ["assignment_id", "verdict", "evidence_digest"], "description": "Non-authoritative code-review request. Valid only with report_purpose=code_review; the API sink derives and validates the exact repo/PR/task/full-head/class/slot/reviewer subject from the still-active assignment."},
             "success_criteria": {"type": "string", "description": "For task delegation"},
             "context": {"type": "string"},
-            "task_id": {"type": "string", "description": "Task board ID for correlation. REQUIRED when request_kind=task — caller must obtain via `task action=create` and reference the resulting `t-...` id, closing the Wave 3 PR-1 dispatch protocol gap."},
+            "task_id": {"type": "string", "description": "Task board ID for correlation. REQUIRED for broadcast request_kind=task. Single-target task dispatch may auto-create one when omitted; callers should use task action=create first for the stable, auditable flow."},
             "correlation_id": {"type": "string"},
             "parent_id": {"type": "string"},
             "thread_id": {"type": "string"},
@@ -393,8 +393,8 @@ pub(crate) fn def_ci() -> Value {
     json!({"name": "ci", "description": "Manage CI watching and handoff pickup. Actions: watch, unwatch, status, defer, ack_handoff.",
         "inputSchema": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["watch", "unwatch", "status", "defer", "ack_handoff"]},
-            "repository": {"type": "string", "description": "GitHub `owner/repo` slug. Required for watch/unwatch/ack_handoff; optional filter for status."},
-            "branch": {"type": "string", "description": "Branch to watch (default: main); required for ack_handoff; optional filter for status."},
+            "repository": {"type": "string", "description": "GitHub `owner/repo` slug. For watch, provide this explicitly or use a valid caller binding with `source_repo`; unwatch/defer/ack_handoff require it explicitly. Optional filter for status."},
+            "branch": {"type": "string", "description": "Branch to watch (default: main); required for defer and ack_handoff; optional filter for status."},
             "interval_secs": {"type": "number", "description": "Poll interval in seconds (default: 60)"},
             "next_after_ci": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}], "description": "Instance or instances to auto-notify when CI passes. Daemon sends [ci-ready-for-action] to each target."},
             "review_class": {"type": "string", "enum": ["single", "dual"], "description": "#972: review threshold for the daemon's PR-state aggregator. `single` (default) — §3.6 one VERIFIED unlocks the merge gate. `dual` — §3.5 two distinct VERIFIED required before `[pr-ready-for-merge]` fires."},
@@ -549,6 +549,19 @@ mod tests {
                 .is_some_and(|s| s.contains("ack_handoff")),
             "#2817: top-level CI description must name the settlement action"
         );
+    }
+
+    #[test]
+    fn ci_schema_describes_repository_and_branch_requirements_3708() {
+        let d = def_ci();
+        let props = &d["inputSchema"]["properties"];
+        let repository = props["repository"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(repository.contains("valid caller binding"));
+        assert!(repository.contains("unwatch/defer/ack_handoff require it explicitly"));
+        let branch = props["branch"]["description"].as_str().unwrap_or_default();
+        assert!(branch.contains("required for defer and ack_handoff"));
     }
 
     /// #2453 R2 P1: the restart_daemon schema must describe app-mode IN-PLACE re-exec
