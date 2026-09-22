@@ -440,29 +440,59 @@ pub(crate) fn dispatch_restart_daemon_with_requester(
 // handler. Unknown actions produce tool-specific error JSON.
 // ---------------------------------------------------------------------
 
-/// #2454 Slice 5: task health/sweep are runtime-backed reads.  They must use
-/// the live registry forwarded through the in-process MCP ingress and must
-/// fail closed when that runtime is absent; all other task actions preserve
-/// the existing public `tasks::handle` path.
+/// #2454/#3584: task health/sweep and orphan reconciliation are runtime-backed
+/// actions. They use the live registry forwarded through the in-process MCP
+/// ingress and fail closed when that runtime is absent; all other task actions
+/// preserve the existing public `tasks::handle` path.
 pub(crate) fn dispatch_task(ctx: &HandlerCtx<'_>) -> Value {
     let action = ctx.args["action"].as_str().unwrap_or("");
-    if !matches!(action, "health" | "sweep") {
+    if !matches!(
+        action,
+        "health" | "sweep" | "orphan_reconcile_preview" | "orphan_reconcile_apply"
+    ) {
         return task::handle_task(ctx.home, ctx.args, ctx.instance_name);
     }
     let Some(runtime) = ctx.runtime else {
         return json!({
-            "error": "runtime unavailable: task health/sweep requires the in-process daemon runtime"
+            "error": "runtime unavailable: runtime-backed task action requires the in-process daemon runtime"
         });
     };
-    let live_instances =
-        crate::agent_ops::list_snapshot(ctx.home, &runtime.registry, &runtime.externals)["result"]
-            ["agents"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|agent| agent["name"].as_str().map(String::from))
-            .collect::<std::collections::HashSet<_>>();
-    crate::tasks::handle_with_live_instances(ctx.home, ctx.instance_name, ctx.args, &live_instances)
+    let live_refresh = || {
+        let snapshot =
+            crate::agent_ops::list_snapshot(ctx.home, &runtime.registry, &runtime.externals);
+        if snapshot["ok"] != true {
+            return None;
+        }
+        snapshot["result"]["agents"].as_array().map(|agents| {
+            agents
+                .iter()
+                .filter_map(|agent| agent["name"].as_str().map(String::from))
+                .collect::<std::collections::HashSet<_>>()
+        })
+    };
+    dispatch_task_with_live_refresh(ctx, &live_refresh)
+}
+
+fn dispatch_task_with_live_refresh(
+    ctx: &HandlerCtx<'_>,
+    live_refresh: &dyn Fn() -> Option<std::collections::HashSet<String>>,
+) -> Value {
+    let live_instances = match live_refresh() {
+        Some(live_instances) => live_instances,
+        None => {
+            return json!({
+                "error":"live owner authority unavailable",
+                "code":"owner_authority_unavailable"
+            });
+        }
+    };
+    crate::tasks::handle_with_live_instances_and_refresh(
+        ctx.home,
+        ctx.instance_name,
+        ctx.args,
+        &live_instances,
+        &live_refresh,
+    )
 }
 pub(crate) fn dispatch_usage_limit_takeover(ctx: &HandlerCtx<'_>) -> Value {
     usage_limit_takeover::handle_usage_limit_takeover(ctx)
@@ -894,7 +924,16 @@ mod tests {
             (
                 "task",
                 &[
-                    "create", "list", "claim", "update", "done", "sweep", "health", "activity",
+                    "create",
+                    "list",
+                    "claim",
+                    "update",
+                    "done",
+                    "sweep",
+                    "health",
+                    "activity",
+                    "orphan_reconcile_preview",
+                    "orphan_reconcile_apply",
                 ],
             ),
             ("ci", &["watch", "unwatch", "status", "defer"]),
@@ -1426,6 +1465,36 @@ mod tests {
                 "task action={action} with runtime=None must fail explicitly, never socket-fallback: {result}"
             );
         }
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn orphan_reconcile_missing_live_snapshot_fails_closed_before_preview_3584() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-orphan-dispatch-authority-outage-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        let args = json!({
+            "action": "orphan_reconcile_preview",
+            "decision_id": "d-20260922032524703479-91",
+            "board": "Hack_agend-terminal",
+            "audit_reason": "authority outage regression",
+        });
+        let runtime = runtime_with_external("unused-live-agent");
+        let ctx = task_runtime_ctx(&home, &args, &runtime);
+        let response = dispatch_task_with_live_refresh(&ctx, &|| None);
+        assert_eq!(
+            response["code"], "owner_authority_unavailable",
+            "{response}"
+        );
+        assert!(
+            std::fs::read_dir(&home)
+                .expect("read temp home")
+                .next()
+                .is_none(),
+            "authority outage must not write a confirmation or task event"
+        );
         std::fs::remove_dir_all(home).ok();
     }
 

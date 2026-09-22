@@ -145,6 +145,42 @@ fn operator_settlement_3553_real_socket_reaches_preview_not_agent() {
 
 #[test]
 #[serial_test::serial]
+fn orphan_reconciliation_3584_real_socket_fences_forged_operator_instance() {
+    let server = Server::start();
+    std::fs::write(server.home.join("fleet.yaml"), "instances: {}\n").unwrap();
+    let request = json!({"method":"mcp_tool", "params":{
+        "instance":"operator",
+        "tool":"task",
+        "arguments":{
+            "action":"orphan_reconcile_preview",
+            "mappings":[]
+        }
+    }});
+
+    let denied = server.request(false, request.clone());
+    assert_eq!(
+        denied["ok"], false,
+        "agent transport must be denied: {denied}"
+    );
+    assert_eq!(denied["code"], "operator_only", "got: {denied}");
+
+    let trusted = server.request(true, request);
+    assert_eq!(
+        trusted["ok"], true,
+        "operator transport must reach MCP: {trusted}"
+    );
+    let trusted_code = trusted["result"]["code"].as_str().unwrap_or("");
+    assert!(
+        matches!(
+            trusted_code,
+            "invalid_request" | "owner_authority_unavailable"
+        ),
+        "trusted transport must reach the reconciliation handler: {trusted}"
+    );
+}
+
+#[test]
+#[serial_test::serial]
 fn operator_settlement_3553_preview_is_nonmutating_and_exact() {
     let server = Server::start();
     let created = serde_json::from_value(json!({
