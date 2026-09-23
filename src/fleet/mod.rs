@@ -9,9 +9,10 @@ pub use watchdog::WatchdogConfig;
 #[allow(unused_imports)]
 pub use persist::{
     add_instance_to_yaml, add_instances_to_yaml, add_team_to_yaml, duplicate_identity_owner_before,
-    migrate_teams_json_to_yaml, remove_instance_from_yaml, remove_instances_from_yaml,
-    remove_team_from_yaml, update_channel_telegram_group_id, update_instance_field,
-    update_team_in_yaml, workspace_identity_collision, TeamWriteOutcome,
+    insert_new_instances_to_yaml, migrate_teams_json_to_yaml, remove_instance_from_yaml,
+    remove_instances_from_yaml, remove_instances_from_yaml_for_generation, remove_team_from_yaml,
+    update_channel_telegram_group_id, update_instance_field, update_team_in_yaml,
+    workspace_identity_collision, TeamWriteOutcome,
 };
 
 use crate::backend::Backend;
@@ -541,6 +542,9 @@ pub struct InstanceConfig {
     /// Drives the `delete_instance` creator-ACL path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
+    /// Opaque deployment generation used to guard rollback and owned-workdir cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_generation: Option<String>,
     /// Backend preset name — overrides defaults.backend.
     pub backend: Option<Backend>,
     pub command: Option<String>,
@@ -757,6 +761,20 @@ impl FleetConfig {
     /// deep clone.
     pub fn load(path: &Path) -> Result<Self> {
         Ok((*Self::load_arc(path)?).clone())
+    }
+
+    /// Load a normalized fleet snapshot without performing ID backfill writes.
+    /// The caller must hold [`persist::acquire_fleet_lock`] across this read
+    /// and any dependent mutation. This avoids recursively acquiring the fleet
+    /// lock from `backfill_ids` when a caller needs one atomic read/decide/write.
+    pub fn load_snapshot_under_lock(path: &Path) -> Result<Self> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read fleet config: {}", path.display()))?;
+        let mut config: FleetConfig = serde_yaml_ng::from_str(&content)
+            .with_context(|| format!("Failed to parse fleet config: {}", path.display()))?;
+        config.normalize();
+        config.home = path.parent().map(|p| p.to_path_buf());
+        Ok(config)
     }
 
     /// #1989: resolved schema version — an omitted `schema_version:` means 1.
@@ -1130,6 +1148,8 @@ pub struct InstanceYamlEntry {
     /// Mirror of [`InstanceConfig::created_by`] — the identified caller that
     /// ran `create_instance`, written at spawn time.
     pub created_by: Option<String>,
+    /// Opaque token tying a deployed fleet row to its materialization generation.
+    pub deployment_generation: Option<String>,
     /// Mirror of [`InstanceConfig::context_alert_pct`].
     pub context_alert_pct: Option<f32>,
     /// Mirror of [`InstanceConfig::context_handoff_pct`].

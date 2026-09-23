@@ -117,6 +117,24 @@ pub fn add_instance_to_yaml(home: &Path, name: &str, config: &InstanceYamlEntry)
 }
 
 pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]) -> Result<()> {
+    add_instances_to_yaml_with_existing_policy(home, entries, false)
+}
+
+/// Insert deployment entries only when every requested instance name is absent.
+/// The check and insertion share the fleet mutation lock, so a concurrent
+/// deployment cannot turn rollback into deletion of a pre-existing member.
+pub fn insert_new_instances_to_yaml(
+    home: &Path,
+    entries: &[(&str, &InstanceYamlEntry)],
+) -> Result<()> {
+    add_instances_to_yaml_with_existing_policy(home, entries, true)
+}
+
+fn add_instances_to_yaml_with_existing_policy(
+    home: &Path,
+    entries: &[(&str, &InstanceYamlEntry)],
+    reject_existing: bool,
+) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
@@ -128,6 +146,14 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
             .get_mut("instances")
             .and_then(|v| v.as_mapping_mut())
             .context("instances is not a mapping")?;
+
+        if reject_existing {
+            if let Some((name, _)) = entries.iter().find(|(name, _)| {
+                instances.contains_key(serde_yaml_ng::Value::String((*name).to_string()))
+            }) {
+                anyhow::bail!("instance '{name}' already exists in fleet.yaml");
+            }
+        }
 
         // 1. Apply every insert/merge first.
         let mut conflicts: Vec<super::merge::FieldConflict> = Vec::new();
@@ -175,9 +201,9 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
                 find_workspace_identity_collision(home, instances, name, &candidate_wd)
             {
                 return Err(anyhow::anyhow!(
-                    "workspace identity collision: instance '{name}' would resolve to the same \
-                     canonical working directory as existing instance '{collider}' ({}). Refusing \
-                     to admit a duplicate workspace identity (fail-closed).",
+                    "workspace identity collision: instance '{name}' would overlap the canonical \
+                     working directory of existing instance '{collider}' ({}). Refusing \
+                     workspace overlap (fail-closed).",
                     candidate_wd.display()
                 ));
             }
@@ -186,8 +212,8 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
     })
 }
 
-/// Return the name of an existing instance whose EFFECTIVE working directory shares
-/// `candidate_wd`'s canonical identity ([`crate::paths::workspace_identity`]), else `None`.
+/// Return the name of an existing instance whose EFFECTIVE working directory overlaps
+/// `candidate_wd` after canonicalization, else `None`.
 /// Excludes `candidate_name` itself (a same-name merge/update is not a duplicate). Read-only
 /// over the parsed fleet mapping; the caller holds the fleet lock, so this is atomic w.r.t.
 /// concurrent admissions.
@@ -201,7 +227,11 @@ fn find_workspace_identity_collision(
     candidate_name: &str,
     candidate_wd: &Path,
 ) -> Option<String> {
-    let candidate_id = crate::paths::workspace_identity(&expand_tilde(candidate_wd));
+    let candidate_path = expand_tilde(candidate_wd);
+    let candidate_canonical = match crate::paths::validate_workspace_root(home, &candidate_path) {
+        Ok(path) => path,
+        Err(error) => return Some(format!("workspace path admission refused: {error}")),
+    };
     for (k, v) in instances {
         let Some(existing_name) = k.as_str() else {
             continue;
@@ -211,8 +241,15 @@ fn find_workspace_identity_collision(
         }
         let explicit = v.get("working_directory").and_then(|x| x.as_str());
         let existing_wd = crate::paths::effective_working_dir(home, existing_name, explicit);
-        if crate::paths::workspace_identity(&expand_tilde(&existing_wd)) == candidate_id {
-            return Some(existing_name.to_string());
+        let existing_wd = expand_tilde(&existing_wd);
+        match crate::paths::workspace_paths_overlap(&candidate_canonical, &existing_wd) {
+            Ok(true) => return Some(existing_name.to_string()),
+            Ok(false) => {}
+            Err(error) => {
+                return Some(format!(
+                    "workspace path for existing instance '{existing_name}' is ambiguous: {error}"
+                ));
+            }
         }
     }
     None
@@ -270,7 +307,11 @@ pub fn duplicate_identity_owner_before(
     name: &str,
     candidate_wd: &Path,
 ) -> Option<String> {
-    let candidate_id = crate::paths::workspace_identity(&expand_tilde(candidate_wd));
+    let candidate_path = expand_tilde(candidate_wd);
+    let candidate_canonical = match crate::paths::validate_workspace_root(home, &candidate_path) {
+        Ok(path) => path,
+        Err(error) => return Some(format!("workspace path admission refused: {error}")),
+    };
     let mapping = match load_instances_mapping(home) {
         Ok(m) => m,
         Err(e) => return Some(format!("fleet unreadable — refusing boot admission: {e}")),
@@ -280,16 +321,29 @@ pub fn duplicate_identity_owner_before(
         let Some(existing_name) = k.as_str() else {
             continue;
         };
-        // Only an EARLIER-sorting instance can preempt this boot.
-        if existing_name >= name {
+        if existing_name == name {
             continue;
         }
         let explicit = v.get("working_directory").and_then(|x| x.as_str());
         let existing_wd = crate::paths::effective_working_dir(home, existing_name, explicit);
-        if crate::paths::workspace_identity(&expand_tilde(&existing_wd)) == candidate_id
-            && earliest.as_deref().is_none_or(|e| existing_name < e)
-        {
-            earliest = Some(existing_name.to_string());
+        let existing_wd = expand_tilde(&existing_wd);
+        match crate::paths::workspace_paths_overlap(&candidate_canonical, &existing_wd) {
+            Ok(false) => {}
+            Err(error) => {
+                return Some(format!(
+                    "workspace path for existing instance '{existing_name}' is ambiguous: {error}"
+                ));
+            }
+            Ok(true) => {
+                let exact = crate::paths::workspace_identity(&existing_wd)
+                    == crate::paths::workspace_identity(&candidate_canonical);
+                if !exact {
+                    return Some(existing_name.to_string());
+                }
+                if existing_name < name && earliest.as_deref().is_none_or(|e| existing_name < e) {
+                    earliest = Some(existing_name.to_string());
+                }
+            }
         }
     }
     earliest
@@ -317,6 +371,37 @@ pub fn remove_instances_from_yaml(home: &Path, names: &[String]) -> Result<()> {
         }
         Ok(true)
     })
+}
+
+/// Remove only fleet rows owned by the exact deployment generation. A name may
+/// have been deleted and re-admitted while an older deployment is rolling back.
+pub fn remove_instances_from_yaml_for_generation(
+    home: &Path,
+    entries: &[(&str, &str)],
+) -> Result<Vec<String>> {
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut preserved = Vec::new();
+    mutate_fleet_yaml(home, "", |doc| {
+        if let Some(instances) = doc.get_mut("instances").and_then(|v| v.as_mapping_mut()) {
+            for (name, generation) in entries {
+                let key = serde_yaml_ng::Value::String((*name).to_string());
+                let owned = instances
+                    .get(&key)
+                    .and_then(|entry| entry.get("deployment_generation"))
+                    .and_then(serde_yaml_ng::Value::as_str)
+                    == Some(*generation);
+                if owned {
+                    instances.remove(&key);
+                } else if instances.contains_key(&key) {
+                    preserved.push((*name).to_string());
+                }
+            }
+        }
+        Ok(true)
+    })?;
+    Ok(preserved)
 }
 
 fn mapping_is_telegram(m: &serde_yaml_ng::Mapping) -> bool {
@@ -886,6 +971,24 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    #[test]
+    fn duplicate_identity_owner_before_refuses_nested_workspace_overlap_3721() {
+        let home = tmp_home("nested-owner-3721");
+        let parent = home.join("shared");
+        let child = parent.join("child");
+        let yaml = format!(
+            "instances:\n  alpha:\n    working_directory: '{p}'\n  beta:\n    working_directory: '{c}'\n",
+            p = parent.display(),
+            c = child.display()
+        );
+        std::fs::write(fleet_yaml_path(&home), yaml).unwrap();
+
+        assert!(duplicate_identity_owner_before(&home, "alpha", &parent).is_some());
+        assert!(duplicate_identity_owner_before(&home, "beta", &child).is_some());
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// §3.9 (MED-3): a channels-only (plural) fleet must persist a telegram
     /// supergroup migration. Pre-fix, `update_channel_telegram_group_id` only
     /// handled the singular `channel:` form and returned a silent `Ok(false)`
@@ -979,6 +1082,65 @@ mod tests {
             "structured refusal expected: {msg}"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn add_instance_refuses_ancestor_and_descendant_workspace_overlap_3721() {
+        let home = tmp_home("overlap-3721");
+        let parent = crate::paths::workspace_dir(&home).join("owner");
+        add_instance_to_yaml(
+            &home,
+            "owner",
+            &InstanceYamlEntry {
+                working_directory: Some(parent.display().to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let descendant = parent.join("nested");
+        let error = add_instance_to_yaml(
+            &home,
+            "nested-agent",
+            &InstanceYamlEntry {
+                working_directory: Some(descendant.display().to_string()),
+                ..Default::default()
+            },
+        )
+        .expect_err("a workspace nested under another instance must be refused");
+        assert!(
+            error.to_string().contains("owner") && error.to_string().contains("nested-agent"),
+            "refusal should name both overlapping instances: {error}"
+        );
+
+        let child_home = tmp_home("ancestor-overlap-3721");
+        let nested = crate::paths::workspace_dir(&child_home)
+            .join("owner")
+            .join("nested");
+        add_instance_to_yaml(
+            &child_home,
+            "owner",
+            &InstanceYamlEntry {
+                working_directory: Some(nested.display().to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let error = add_instance_to_yaml(
+            &child_home,
+            "parent-agent",
+            &InstanceYamlEntry {
+                working_directory: Some(nested.parent().unwrap().display().to_string()),
+                ..Default::default()
+            },
+        )
+        .expect_err("a workspace that contains another instance must be refused");
+        assert!(
+            error.to_string().contains("owner") && error.to_string().contains("parent-agent"),
+            "refusal should name both overlapping instances: {error}"
+        );
+        std::fs::remove_dir_all(home).ok();
+        std::fs::remove_dir_all(child_home).ok();
     }
 
     /// Admission guard: two instances with the SAME explicit working_directory refuse.

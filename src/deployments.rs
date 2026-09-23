@@ -9,9 +9,13 @@ pub struct Deployment {
     pub name: String,
     pub template: String,
     pub instances: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cleanup_instances: Vec<String>,
     pub team: Option<String>,
     pub directory: String,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_id: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -177,6 +181,7 @@ fn validate_context_threshold(
 #[allow(clippy::type_complexity)]
 fn create_instance_entries(
     params: &DeployParams,
+    generation_id: &str,
 ) -> Result<(Vec<String>, Vec<(String, crate::fleet::InstanceYamlEntry)>), serde_json::Value> {
     for (name_val, inst_val) in &params.instances_def {
         let inst_suffix = name_val.as_str().unwrap_or("?");
@@ -303,14 +308,10 @@ fn create_instance_entries(
             .or(params.template_source_repo.clone());
 
         let inst_dir = dir.join(&inst_name);
-        let work_dir = prepare_work_dir(
-            &inst_dir,
-            &dir,
-            &params.deploy_name,
-            inst_suffix,
-            &inst_name,
-            params.branch.as_deref(),
-        );
+        // Keep entry construction side-effect free. Fleet admission below is
+        // the authority for workspace identity; materialize only after it has
+        // accepted every intended working directory.
+        let work_dir = inst_dir.display().to_string();
 
         yaml_entries.push((
             inst_name.clone(),
@@ -350,6 +351,7 @@ fn create_instance_entries(
                     .filter(|s| matches!(*s, "skip" | "deferred"))
                     .map(String::from),
                 created_by: None, // no single ACL creator for templated instances
+                deployment_generation: Some(generation_id.to_string()),
                 context_alert_pct: validate_context_threshold(inst_val, "context_alert_pct")
                     .map_err(|e| {
                         serde_json::json!({
@@ -381,14 +383,30 @@ fn create_instance_entries(
     Ok((created, yaml_entries))
 }
 
+enum WorkDirPreparation {
+    Ready,
+    Failed { residual: Option<String> },
+}
+
 fn prepare_work_dir(
     inst_dir: &std::path::Path,
     parent_dir: &std::path::Path,
     deploy_name: &str,
+    generation_id: &str,
     inst_suffix: &str,
     inst_name: &str,
     branch: Option<&str>,
-) -> String {
+) -> WorkDirPreparation {
+    let absent_before_create = matches!(
+        std::fs::symlink_metadata(inst_dir),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    if !absent_before_create {
+        tracing::warn!(%inst_name, path = %inst_dir.display(), "deployment workdir already exists; preserving unowned path");
+        return WorkDirPreparation::Failed {
+            residual: Some(inst_dir.display().to_string()),
+        };
+    }
     if let Some(br) = branch {
         let branch_name = format!("{deploy_name}/{inst_suffix}");
         // W1.2: LOCAL `git worktree add` via the bypass+bounded helper. The 3-way
@@ -409,6 +427,17 @@ fn prepare_work_dir(
         ) {
             Ok(_) => {
                 tracing::info!(%inst_name, %branch_name, "created worktree");
+                if write_deployment_owner_marker(
+                    inst_dir,
+                    deploy_name,
+                    inst_name,
+                    Some(generation_id),
+                ) {
+                    return WorkDirPreparation::Ready;
+                }
+                return WorkDirPreparation::Failed {
+                    residual: Some(failed_workdir_residual(inst_dir, Some(&branch_name))),
+                };
             }
             Err(crate::git_helpers::GitError::NonZero { stderr, .. }) => {
                 tracing::warn!(%inst_name, error = %stderr, "worktree failed");
@@ -418,9 +447,104 @@ fn prepare_work_dir(
             }
         }
     } else {
-        std::fs::create_dir_all(inst_dir).ok();
+        if let Some(parent) = inst_dir.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                tracing::warn!(%inst_name, %error, "deployment workdir parent creation failed");
+                return WorkDirPreparation::Failed { residual: None };
+            }
+        }
+        if let Err(error) = std::fs::create_dir(inst_dir) {
+            tracing::warn!(%inst_name, %error, "deployment workdir creation failed");
+            return WorkDirPreparation::Failed { residual: None };
+        }
+        if write_deployment_owner_marker(inst_dir, deploy_name, inst_name, Some(generation_id)) {
+            return WorkDirPreparation::Ready;
+        }
+        return WorkDirPreparation::Failed {
+            residual: Some(failed_workdir_residual(inst_dir, None)),
+        };
     }
-    inst_dir.display().to_string()
+    WorkDirPreparation::Failed { residual: None }
+}
+
+fn failed_workdir_residual(inst_dir: &Path, branch_name: Option<&str>) -> String {
+    if cfg!(test) {
+        run_before_failed_workdir_residual_test_hook();
+    }
+    let path = inst_dir.display().to_string();
+    if let Some(branch_name) = branch_name {
+        tracing::error!(%path, %branch_name, "deployment owner marker failed; preserving worktree and branch residual");
+        format!("{path} (branch {branch_name}; inspect/remove worktree and branch)")
+    } else {
+        tracing::error!(%path, "deployment owner marker failed; preserving directory residual");
+        path
+    }
+}
+
+const DEPLOYMENT_OWNER_MARKER: &str = ".agend-deployment-owner";
+
+fn deployment_owner_marker_contents(
+    directory: &Path,
+    deploy_name: &str,
+    instance: &str,
+    generation_id: Option<&str>,
+) -> Option<Vec<u8>> {
+    let canonical = crate::paths::canonical_workspace_path(directory).ok()?;
+    let mut marker = serde_json::json!({
+        "schema_version": if generation_id.is_some() { 2 } else { 1 },
+        "deployment": deploy_name,
+        "instance": instance,
+        "directory": canonical,
+    });
+    if let Some(generation_id) = generation_id {
+        marker["generation_id"] = serde_json::Value::String(generation_id.to_string());
+    }
+    serde_json::to_vec(&marker).ok()
+}
+
+fn write_deployment_owner_marker(
+    directory: &Path,
+    deploy_name: &str,
+    instance: &str,
+    generation_id: Option<&str>,
+) -> bool {
+    use std::io::Write;
+    if cfg!(test) && fail_deployment_owner_marker_test_hook() {
+        return false;
+    }
+    let Some(contents) =
+        deployment_owner_marker_contents(directory, deploy_name, instance, generation_id)
+    else {
+        return false;
+    };
+    let marker = directory.join(DEPLOYMENT_OWNER_MARKER);
+    let result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+        .and_then(|mut file| file.write_all(&contents));
+    if let Err(error) = result {
+        tracing::warn!(path = %marker.display(), %error, "deployment ownership marker creation failed; cleanup will preserve path");
+        return false;
+    }
+    true
+}
+
+fn deployment_owner_marker_matches(
+    directory: &Path,
+    deploy_name: &str,
+    instance: &str,
+    generation_id: Option<&str>,
+) -> bool {
+    let Some(expected) =
+        deployment_owner_marker_contents(directory, deploy_name, instance, generation_id)
+    else {
+        return false;
+    };
+    match std::fs::read(directory.join(DEPLOYMENT_OWNER_MARKER)) {
+        Ok(actual) => actual == expected,
+        Err(_) => false,
+    }
 }
 
 fn persist_to_fleet_yaml(
@@ -434,7 +558,7 @@ fn persist_to_fleet_yaml(
     }
     let refs: Vec<(&str, &crate::fleet::InstanceYamlEntry)> =
         yaml_entries.iter().map(|(n, e)| (n.as_str(), e)).collect();
-    crate::fleet::add_instances_to_yaml(home, &refs).map_err(|e| {
+    crate::fleet::insert_new_instances_to_yaml(home, &refs).map_err(|e| {
         tracing::error!(error = %e, template, deploy_name, count = yaml_entries.len(),
             "deploy: Phase 2 add_instances_to_yaml failed — aborting before Phase 3 spawn");
         serde_json::json!({
@@ -728,7 +852,8 @@ pub(crate) fn deploy_with_runtime(
         return duplicate_deploy_error(&params.deploy_name);
     }
 
-    let (created, yaml_entries) = match create_instance_entries(&params) {
+    let generation_id = uuid::Uuid::new_v4().to_string();
+    let (created, yaml_entries) = match create_instance_entries(&params, &generation_id) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -737,6 +862,60 @@ pub(crate) fn deploy_with_runtime(
         persist_to_fleet_yaml(home, &yaml_entries, &params.template, &params.deploy_name)
     {
         return e;
+    }
+
+    let directory = std::path::PathBuf::from(&params.directory);
+    let mut materialized = Vec::with_capacity(yaml_entries.len());
+    for (inst_name, _) in &yaml_entries {
+        let suffix = inst_name
+            .strip_prefix(&format!("{}-", params.deploy_name))
+            .unwrap_or(inst_name);
+        let inst_dir = directory.join(inst_name);
+        let preparation = prepare_work_dir(
+            &inst_dir,
+            &directory,
+            &params.deploy_name,
+            &generation_id,
+            suffix,
+            inst_name,
+            params.branch.as_deref(),
+        );
+        if let WorkDirPreparation::Failed { residual } = preparation {
+            let cleanup = Deployment {
+                name: params.deploy_name.clone(),
+                template: params.template.clone(),
+                instances: materialized,
+                cleanup_instances: Vec::new(),
+                team: None,
+                directory: params.directory.clone(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                generation_id: Some(generation_id.clone()),
+            };
+            let mut residuals = residual.clone().into_iter().collect::<Vec<_>>();
+            let rollback_entries = created
+                .iter()
+                .map(|name| (name.as_str(), generation_id.as_str()))
+                .collect::<Vec<_>>();
+            match crate::fleet::remove_instances_from_yaml_for_generation(home, &rollback_entries) {
+                Ok(preserved) => residuals.extend(preserved.into_iter().map(|name| {
+                    format!(
+                        "preserved newer fleet generation for '{name}' during deployment rollback"
+                    )
+                })),
+                Err(error) => residuals.push(format!(
+                    "fleet rollback failed for deployment '{}': {error}",
+                    params.deploy_name
+                )),
+            }
+            residuals.extend(cleanup_deployment_dirs_impl(home, &cleanup, false));
+            return serde_json::json!({
+                "error": format!("deployment '{}' could not safely materialize working directory for '{inst_name}'", params.deploy_name),
+                "code": "deploy_workdir_materialization_failed",
+                "residual": residual,
+                "residuals": residuals,
+            });
+        }
+        materialized.push(inst_name.clone());
     }
 
     // #3624 症狀 1：先 CREATE_TEAM（members 用 entries 建好的預期名單）
@@ -761,6 +940,7 @@ pub(crate) fn deploy_with_runtime(
         name: params.deploy_name.to_string(),
         template: params.template.to_string(),
         instances: created.clone(),
+        cleanup_instances: Vec::new(),
         team: if team_created {
             Some(params.deploy_name.to_string())
         } else {
@@ -768,6 +948,7 @@ pub(crate) fn deploy_with_runtime(
         },
         directory: params.directory,
         created_at: chrono::Utc::now().to_rfc3339(),
+        generation_id: Some(generation_id),
     };
     // #1629: narrow the deployment-store flock to JUST the load-modify-save (its
     // C1 lost-update purpose). spawn_instances (api::call SPAWN) and
@@ -846,6 +1027,9 @@ pub(crate) fn teardown_with_runtime(
     // The legacy (runtime=None) transport path cannot observe refusal, so
     // its contract is unchanged.
     let mut residuals: Vec<String> = Vec::new();
+    let mut preserved_generations: Vec<String> = Vec::new();
+    let remove_legacy_fleet_rows =
+        runtime.is_none() && crate::daemon::find_active_run_dir(home).is_none();
     if let Some(runtime) = runtime {
         let delete_context = crate::agent_ops::DeleteContext {
             registry: runtime.registry,
@@ -854,15 +1038,50 @@ pub(crate) fn teardown_with_runtime(
             notifier: runtime.notifier,
         };
         for inst in &deployment.instances {
-            let (_outcome, observed_exit) = crate::agent_ops::delete_instance_with_exit_status(
-                home,
-                inst,
-                &delete_context,
-                false,
-            );
-            if !observed_exit {
+            let mut fleet_remove_error = None;
+            let generation = deployment.generation_id.as_deref();
+            let delete_result =
+                crate::agent_ops::delete_instance_with_exit_status_and_post_for_deployment_generation(
+                    home,
+                    inst,
+                    &delete_context,
+                    false,
+                    generation,
+                    |observed_exit| {
+                        if observed_exit {
+                            if let Some(generation) = generation {
+                                match crate::fleet::remove_instances_from_yaml_for_generation(
+                                    home,
+                                    &[(inst.as_str(), generation)],
+                                ) {
+                                    Ok(preserved) if preserved.is_empty() => {}
+                                    Ok(_) => {
+                                        fleet_remove_error = Some(
+                                            "a newer fleet generation was preserved".into(),
+                                        );
+                                    }
+                                    Err(error) => {
+                                        fleet_remove_error = Some(error.to_string())
+                                    }
+                                }
+                            }
+                        }
+                    },
+                );
+            let Some((_outcome, observed_exit)) = delete_result else {
+                preserved_generations.push(inst.clone());
+                residuals.push(inst.clone());
+                continue;
+            };
+            if let Some(error) = fleet_remove_error {
+                tracing::warn!(instance = %inst, %error, "failed to remove deleted fleet row under delete fence");
+                residuals.push(inst.clone());
+            } else if !observed_exit {
                 residuals.push(inst.clone());
             }
+        }
+        if cfg!(test) {
+            run_after_runtime_instance_deletes_test_hook();
         }
     } else {
         delete_instances_legacy(home, &deployment.instances);
@@ -877,25 +1096,33 @@ pub(crate) fn teardown_with_runtime(
         .filter(|i| !residuals.contains(i))
         .cloned()
         .collect();
-    let deleted_deployment = Deployment {
-        instances: deleted.clone(),
-        ..deployment.clone()
-    };
+    // Managed runtime deletes removed each confirmed-deleted row while its
+    // DeleteFence remained held, so a same-name generation cannot be erased
+    // by a later name-only batch mutation. Offline cleanup has no active
+    // spawner; it retains the legacy batch removal. An active legacy daemon's
+    // DELETE path owns row removal under its lifecycle fence.
+    if remove_legacy_fleet_rows {
+        if let Err(e) = crate::fleet::remove_instances_from_yaml(home, &deleted) {
+            tracing::warn!(error = %e, "failed to clean up fleet.yaml on teardown");
+        }
+    }
 
     // Smoke 2 fix: filesystem cleanup of every spawned subdir, including
     // custom-`directory` deployments that the prior inline
     // `home/workspace/<inst>` loop missed.
     // #3505: only clean what was actually deleted — a refused instance is
     // still alive and its workspace must survive for the retry.
-    cleanup_deployment_dirs(home, &deleted_deployment);
-
-    // Symmetrical with `deploy`: we wrote entries into fleet.yaml so
-    // pane_factory could render identity; teardown must remove them or
-    // daemon restart would resurrect dead agents via auto_start_fleet.
-    // #3505: only remove deleted entries — refused instances stay live.
-    if let Err(e) = crate::fleet::remove_instances_from_yaml(home, &deleted) {
-        tracing::warn!(error = %e, "failed to clean up fleet.yaml on teardown");
-    }
+    let cleanup_instances = deployment
+        .cleanup_instances
+        .iter()
+        .chain(deleted.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let cleanup_deployment = Deployment {
+        instances: cleanup_instances.clone(),
+        ..deployment.clone()
+    };
+    let cleanup_residuals = cleanup_deployment_dirs_impl(home, &cleanup_deployment, true);
 
     // Delete team if exists — but only on FULL teardown. A partial teardown
     // still has live residual members; deleting their team would strand them.
@@ -914,12 +1141,17 @@ pub(crate) fn teardown_with_runtime(
     let mut store = load(home);
     // #3505: partial teardown NARROWS the record to the residuals (retry
     // stays possible via the same name); full teardown removes it.
-    if residuals.is_empty() {
+    if residuals.is_empty() && cleanup_residuals.is_empty() {
         // Remove from store
         store.deployments.retain(|d| d.name != name);
     } else {
         for d in store.deployments.iter_mut().filter(|d| d.name == name) {
             d.instances = residuals.clone();
+            d.cleanup_instances = if cleanup_residuals.is_empty() {
+                Vec::new()
+            } else {
+                cleanup_instances.clone()
+            };
         }
     }
     // #bughunt2: if the record-removal save fails, the instances are already
@@ -939,20 +1171,33 @@ pub(crate) fn teardown_with_runtime(
     // #3505 P0(a): partial teardown surfaces the refused names instead of
     // a silent clean `torn_down` — the operator can retry the same name
     // once the residual exits. Full teardown keeps the exact prior shape.
-    if residuals.is_empty() {
-        serde_json::json!({"status": "torn_down", "name": name, "instances": deployment.instances})
+    if residuals.is_empty() && cleanup_residuals.is_empty() {
+        let mut result = serde_json::json!({"status": "torn_down", "name": name, "instances": deployment.instances});
+        if !preserved_generations.is_empty() {
+            result["preserved_generations"] = serde_json::json!(preserved_generations);
+        }
+        result
     } else {
-        serde_json::json!({
+        let mut result = serde_json::json!({
             "status": "torn_down_partial",
             "name": name,
             "instances": deployment.instances,
             "deleted": deleted,
             "residuals": residuals,
+            "cleanup_residuals": cleanup_residuals,
             "hint": format!(
-                "teardown refused for {} — still live, registry + port + workspace retained; retry `teardown name={name}` once they exit",
-                residuals.join(", "),
+                "{}; retry `teardown name={name}` after addressing the residual",
+                if residuals.is_empty() {
+                    "workspace cleanup left residuals"
+                } else {
+                    "teardown refused for live instances; their registry, port, and workspace are retained"
+                },
             ),
-        })
+        });
+        if !preserved_generations.is_empty() {
+            result["preserved_generations"] = serde_json::json!(preserved_generations);
+        }
+        result
     }
 }
 
@@ -990,10 +1235,66 @@ pub fn list(home: &Path) -> Value {
 ///   `cleanup_working_dir`, so the AGEND_HOME/workspace branch handles
 ///   default-directory deployments correctly.
 ///
-/// All filesystem ops are best-effort (`let _ = ...` / matched and logged);
-/// a single per-instance failure doesn't abort the rest of the sweep.
+/// All filesystem ops are best-effort; failures are returned as actionable
+/// residuals, and a single per-instance failure doesn't abort the sweep.
+#[cfg(test)]
 fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
+    for residual in cleanup_deployment_dirs_impl(home, deployment, true) {
+        tracing::warn!(%residual, deployment = %deployment.name, "deployment cleanup left a residual");
+    }
+}
+
+fn cleanup_deployment_dirs_impl(
+    home: &Path,
+    deployment: &Deployment,
+    remove_parent: bool,
+) -> Vec<String> {
+    // Serialize the fleet snapshot + filesystem deletion with all workspace
+    // admissions. Otherwise a newly admitted instance could claim a path after
+    // this snapshot and have its directory removed based on stale ownership.
+    cleanup_deployment_dirs_with_wait_hook(home, deployment, remove_parent, || {})
+}
+
+fn cleanup_deployment_dirs_with_wait_hook(
+    home: &Path,
+    deployment: &Deployment,
+    remove_parent: bool,
+    mut on_lock_contention: impl FnMut(),
+) -> Vec<String> {
+    let mut residuals = Vec::new();
+    let lock_path = home.join(".fleet.yaml.lock");
+    let _fleet_lock = loop {
+        match crate::store::try_acquire_file_lock(&lock_path) {
+            Ok(Some(lock)) => break lock,
+            Ok(None) => {
+                on_lock_contention();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => {
+                tracing::warn!(%error, "deployment cleanup refused: fleet lock unavailable");
+                return vec![format!(
+                    "deployment cleanup could not acquire fleet lock: {error}"
+                )];
+            }
+        }
+    };
     let custom_root = std::path::Path::new(&deployment.directory);
+    let fleet_path = crate::fleet::fleet_yaml_path(home);
+    let fleet = match crate::fleet::FleetConfig::load_snapshot_under_lock(&fleet_path) {
+        Ok(config) => Some(config),
+        Err(_)
+            if std::fs::symlink_metadata(&fleet_path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Some(crate::fleet::FleetConfig::default())
+        }
+        Err(error) => {
+            return vec![format!(
+                "deployment cleanup could not read fleet snapshot; preserved members {:?}: {error}",
+                deployment.instances
+            )];
+        }
+    };
     // MED-4: a branch-mode deploy creates a git worktree per instance via
     // `git worktree add -b {deploy}/{suffix}` in the deploy directory (which IS
     // the source repo in branch mode). A bare `remove_dir_all` left a prunable
@@ -1004,10 +1305,43 @@ fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
     // best-effort: harmless no-ops for a non-branch deploy (subdir isn't a
     // worktree, branch doesn't exist).
     let dir_is_repo = crate::worktree::is_git_repo(custom_root);
+    let registered_worktrees = if dir_is_repo {
+        crate::git_worktree::list_porcelain_exact(custom_root)
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .filter_map(|(path, _)| path.canonicalize().ok())
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|error| error.to_string())
+    } else {
+        Ok(Vec::new())
+    };
     for inst in &deployment.instances {
         // Custom-directory branch: deploy()'s `inst_dir = dir.join(&inst_name)`.
         let custom_subdir = custom_root.join(inst);
-        if dir_is_repo {
+        let custom_owned = deployment_owner_marker_matches(
+            &custom_subdir,
+            &deployment.name,
+            inst,
+            deployment.generation_id.as_deref(),
+        );
+        let custom_admitted = custom_owned
+            && deployment_member_cleanup_admitted(
+                fleet.as_ref(),
+                home,
+                inst,
+                &custom_subdir,
+                &custom_subdir,
+            );
+        if !custom_admitted && custom_subdir.exists() {
+            residuals.push(format!(
+                "deployment cleanup preserved workspace for '{inst}' at {} because ownership or cleanup admission refused it",
+                custom_subdir.display()
+            ));
+        }
+        let mut remove_custom_tree = true;
+        if custom_admitted && dir_is_repo {
             // Instances are named `{deploy_name}-{suffix}`; the worktree branch
             // is `{deploy_name}/{suffix}` (see prepare_work_dir).
             let suffix = inst
@@ -1015,28 +1349,83 @@ fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
                 .unwrap_or(inst);
             let branch = format!("{}/{}", deployment.name, suffix);
             let subdir_str = custom_subdir.display().to_string();
-            // worktree remove unregisters + deletes the dir; branch -D drops the
-            // orphan; prune sweeps any dangling entry if the remove failed.
-            let _ = crate::git_helpers::git_bypass(
-                custom_root,
-                &["worktree", "remove", "--force", &subdir_str],
-            );
-            let _ = crate::git_helpers::git_bypass(custom_root, &["branch", "-D", &branch]);
-            let _ = crate::git_helpers::git_bypass(custom_root, &["worktree", "prune"]);
+            match &registered_worktrees {
+                Err(error) => {
+                    remove_custom_tree = false;
+                    residuals.push(format!(
+                        "deployment cleanup preserved '{inst}' at {subdir_str}: could not inspect Git worktrees: {error}"
+                    ));
+                }
+                Ok(paths) => {
+                    let is_registered = custom_subdir
+                        .canonicalize()
+                        .ok()
+                        .is_some_and(|candidate| paths.iter().any(|path| path == &candidate));
+                    if is_registered {
+                        // Worktree removal unregisters and deletes the directory;
+                        // only remove the branch after Git confirms that step.
+                        match crate::git_helpers::git_bypass(
+                            custom_root,
+                            &["worktree", "remove", "--force", &subdir_str],
+                        ) {
+                            Ok(output) if output.status.success() => {
+                                for (args, operation) in [
+                                    (
+                                        &["branch", "-D", branch.as_str()][..],
+                                        "remove deployment branch",
+                                    ),
+                                    (&["worktree", "prune"][..], "prune worktree metadata"),
+                                ] {
+                                    match crate::git_helpers::git_bypass(custom_root, args) {
+                                        Ok(output) if output.status.success() => {}
+                                        Ok(output) => residuals.push(format!(
+                                            "deployment cleanup could not {operation} for '{inst}' (exit {})",
+                                            output.status
+                                        )),
+                                        Err(error) => residuals.push(format!(
+                                            "deployment cleanup could not {operation} for '{inst}': {error}"
+                                        )),
+                                    }
+                                }
+                                remove_custom_tree = false;
+                            }
+                            Ok(output) => {
+                                remove_custom_tree = false;
+                                residuals.push(format!(
+                                    "deployment cleanup preserved worktree for '{inst}' at {subdir_str}: git worktree remove exited {}",
+                                    output.status
+                                ));
+                            }
+                            Err(error) => {
+                                remove_custom_tree = false;
+                                residuals.push(format!(
+                                    "deployment cleanup preserved worktree for '{inst}' at {subdir_str}: {error}"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
         }
-        if custom_subdir.exists() {
+        if custom_admitted && remove_custom_tree && custom_subdir.exists() {
             match std::fs::remove_dir_all(&custom_subdir) {
                 Ok(()) => tracing::info!(
                     inst = %inst,
                     path = %custom_subdir.display(),
                     "deployment cleanup: removed custom subdir"
                 ),
-                Err(e) => tracing::warn!(
-                    inst = %inst,
-                    path = %custom_subdir.display(),
-                    error = %e,
-                    "deployment cleanup: remove_dir_all failed"
-                ),
+                Err(e) => {
+                    tracing::warn!(
+                        inst = %inst,
+                        path = %custom_subdir.display(),
+                        error = %e,
+                        "deployment cleanup: remove_dir_all failed"
+                    );
+                    residuals.push(format!(
+                        "deployment cleanup could not remove workspace for '{inst}' at {}: {e}",
+                        custom_subdir.display()
+                    ));
+                }
             }
         }
         // Default-path branch: covers deployments whose `directory` defaulted
@@ -1044,8 +1433,45 @@ fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
         // `home/workspace/<deploy_name>/<inst>`) AND covers historical
         // teardown semantics that cleaned `home/workspace/<inst>` directly.
         let default_subdir = crate::paths::workspace_dir(home).join(inst);
-        if default_subdir.exists() {
-            let _ = crate::agent_ops::cleanup_working_dir(home, inst, &default_subdir);
+        let default_owned = default_subdir.exists()
+            && deployment_owner_marker_matches(
+                &default_subdir,
+                &deployment.name,
+                inst,
+                deployment.generation_id.as_deref(),
+            );
+        let default_admitted = default_owned
+            && deployment_member_cleanup_admitted(
+                fleet.as_ref(),
+                home,
+                inst,
+                &default_subdir,
+                &default_subdir,
+            );
+        if default_subdir.exists() && !default_admitted {
+            residuals.push(format!(
+                "deployment cleanup preserved workspace for '{inst}' at {} because ownership or cleanup admission refused it",
+                default_subdir.display()
+            ));
+        }
+        if default_admitted {
+            if let Ok(canonical) = crate::paths::canonical_workspace_path(&default_subdir) {
+                let admission =
+                    crate::agent_ops::cleanup_admission::CleanupAdmission::RemoveOwned {
+                        canonical,
+                    };
+                if let Some(error) = crate::agent_ops::cleanup_working_dir_admitted(
+                    home,
+                    inst,
+                    &default_subdir,
+                    &admission,
+                ) {
+                    residuals.push(format!(
+                        "deployment cleanup could not remove default workspace for '{inst}' at {}: {error}",
+                        default_subdir.display()
+                    ));
+                }
+            }
         }
     }
     // Sprint 54 P1-5: best-effort rmdir of the custom-directory parent.
@@ -1054,7 +1480,102 @@ fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
     // don't leak `/tmp/team-foo/` shells behind. `remove_dir` (NOT
     // `remove_dir_all`) errors on non-empty, which is exactly what we
     // want: any operator-dropped file preserves the parent.
-    rmdir_if_empty(custom_root);
+    if remove_parent
+        && deployment_path_cleanup_admitted(
+            fleet.as_ref(),
+            home,
+            custom_root,
+            custom_root,
+            &deployment.instances,
+        )
+    {
+        rmdir_if_empty(custom_root);
+    }
+    residuals
+}
+
+/// Admit a deployment-owned child only when its exact canonical location is
+/// still disjoint from every effective fleet workspace. This also works after
+/// orphan reconciliation has already removed the member from fleet.yaml.
+fn deployment_member_cleanup_admitted(
+    fleet: Option<&crate::fleet::FleetConfig>,
+    home: &Path,
+    instance: &str,
+    candidate: &Path,
+    owned_path: &Path,
+) -> bool {
+    if fleet.is_some_and(|fleet| fleet.instances.contains_key(instance)) {
+        tracing::warn!(instance, path = %candidate.display(), "deployment cleanup refused: instance name has been re-admitted");
+        return false;
+    }
+    if !deployment_path_cleanup_admitted(fleet, home, candidate, owned_path, &[]) {
+        return false;
+    }
+    true
+}
+
+fn deployment_path_cleanup_admitted(
+    fleet: Option<&crate::fleet::FleetConfig>,
+    home: &Path,
+    candidate: &Path,
+    owned_path: &Path,
+    ignored_instances: &[String],
+) -> bool {
+    let canonical = match crate::paths::canonical_workspace_path(candidate) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(path = %candidate.display(), %error, "deployment cleanup refused: candidate path is ambiguous");
+            return false;
+        }
+    };
+    let expected_canonical = match crate::paths::canonical_workspace_path(owned_path) {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+    if canonical != expected_canonical {
+        return false;
+    }
+    let reserved_roots = [
+        crate::paths::canonical_workspace_path(home),
+        crate::paths::canonical_workspace_path(&crate::paths::workspace_dir(home)),
+    ];
+    if reserved_roots
+        .iter()
+        .any(|root| root.as_ref().is_ok_and(|root| root == &canonical))
+    {
+        tracing::warn!(path = %canonical.display(), "deployment cleanup refused: reserved root");
+        return false;
+    }
+    let Some(fleet) = fleet else {
+        tracing::warn!(path = %canonical.display(), "deployment cleanup refused: fleet snapshot unavailable");
+        return false;
+    };
+    for (name, entry) in &fleet.instances {
+        if ignored_instances.iter().any(|ignored| ignored == name) {
+            continue;
+        }
+        let survivor = entry
+            .working_directory
+            .as_deref()
+            .map(crate::fleet::resolve::expand_tilde_path)
+            .unwrap_or_else(|| crate::paths::workspace_dir(home).join(name));
+        match crate::paths::canonical_workspace_path(&survivor) {
+            Ok(path)
+                if matches!(
+                    crate::paths::workspace_paths_overlap(&canonical, &path),
+                    Ok(false)
+                ) => {}
+            Ok(path) => {
+                tracing::warn!(path = %canonical.display(), survivor = %path.display(), "deployment cleanup preserved overlapping active workspace");
+                return false;
+            }
+            Err(error) => {
+                tracing::warn!(survivor = %survivor.display(), %error, "deployment cleanup refused: survivor path is ambiguous");
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Best-effort rmdir of an empty directory (Sprint 54 P1-5).
@@ -1124,54 +1645,69 @@ pub(crate) fn reconcile_orphan_deployments(home: &Path) -> Vec<String> {
         }
     };
 
-    // Collect the pruned `Deployment` records (not just names) so we can
-    // hand each one to `cleanup_deployment_dirs` after the store is saved.
-    // Smoke 2 fix: without this we lose the `directory` + `instances` info
-    // needed to remove custom-directory subdirs.
-    let mut pruned_names = Vec::new();
-    let mut pruned_teams = Vec::new();
-    let mut pruned_deployments: Vec<Deployment> = Vec::new();
-    store.deployments.retain(|d| {
-        let any_live = d.instances.iter().any(|i| live_instances.contains(i));
+    // Persist cleanup-only state before touching directories. If filesystem
+    // cleanup fails, the deployment remains addressable and can be retried by
+    // name; successful cleanup removes the record in the second save.
+    let mut cleanup_candidates = Vec::new();
+    for deployment in &mut store.deployments {
+        let any_live = deployment
+            .instances
+            .iter()
+            .any(|instance| live_instances.contains(instance));
         if any_live {
-            true
-        } else {
-            pruned_names.push(d.name.clone());
-            if let Some(t) = d.team.clone() {
-                pruned_teams.push(t);
-            }
-            pruned_deployments.push(d.clone());
-            false
+            continue;
         }
-    });
-
-    if pruned_names.is_empty() {
-        return pruned_names;
+        let mut cleanup_instances = deployment.cleanup_instances.clone();
+        cleanup_instances.extend(deployment.instances.iter().cloned());
+        cleanup_instances.sort();
+        cleanup_instances.dedup();
+        deployment.instances.clear();
+        deployment.cleanup_instances = cleanup_instances.clone();
+        cleanup_candidates.push(Deployment {
+            instances: cleanup_instances,
+            ..deployment.clone()
+        });
     }
 
-    // Persist pruned store first so a crash between save and team-delete
-    // doesn't leave the deployment-store in a more-stale state than the
-    // teams-store; teams without their parent deployment is the safer
-    // failure mode.
+    if cleanup_candidates.is_empty() {
+        return Vec::new();
+    }
     if let Err(e) = save(home, &mut store) {
         tracing::warn!(
             error = %e,
-            pruned = ?pruned_names,
-            "deployments reconcile: save failed — entries may resurface on next load"
+            "deployments reconcile: pending cleanup save failed — skipping filesystem cleanup"
         );
         return Vec::new();
     }
 
+    let mut pruned_names = Vec::new();
+    let mut pruned_teams = Vec::new();
+    for deployment in &cleanup_candidates {
+        let residuals = cleanup_deployment_dirs_impl(home, deployment, true);
+        if residuals.is_empty() {
+            pruned_names.push(deployment.name.clone());
+            if let Some(team) = deployment.team.as_ref() {
+                pruned_teams.push(team.clone());
+            }
+            store
+                .deployments
+                .retain(|record| record.name != deployment.name);
+        } else {
+            for residual in residuals {
+                tracing::warn!(%residual, deployment = %deployment.name, "deployment reconciliation cleanup left a residual");
+            }
+        }
+    }
+    if let Err(e) = save(home, &mut store) {
+        tracing::warn!(
+            error = %e,
+            pruned = ?pruned_names,
+            "deployments reconcile: final cleanup save failed — cleanup-only records remain for retry"
+        );
+        return Vec::new();
+    }
     for team in &pruned_teams {
         let _ = crate::teams::delete(home, &serde_json::json!({"name": team}));
-    }
-
-    // Smoke 2 fix: clean each pruned deployment's spawned subdirs. Runs
-    // AFTER the store save + team delete so a deployment store entry
-    // doesn't survive its filesystem cleanup (the safer failure mode is
-    // "files gone, store entry stays" not "store says clean, files leak").
-    for dep in &pruned_deployments {
-        cleanup_deployment_dirs(home, dep);
     }
 
     tracing::info!(
@@ -1204,6 +1740,56 @@ pub fn reconcile_after_close(home: &Path, removed_names: &[String]) -> Vec<Strin
 pub fn reconcile_orphans(home: &Path) -> Vec<String> {
     reconcile_orphan_deployments(home)
 }
+
+#[cfg(test)]
+std::thread_local! {
+    static AFTER_RUNTIME_INSTANCE_DELETES_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static FAIL_NEXT_DEPLOYMENT_OWNER_MARKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static BEFORE_FAILED_WORKDIR_RESIDUAL_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn fail_deployment_owner_marker_test_hook() -> bool {
+    #[cfg(test)]
+    return FAIL_NEXT_DEPLOYMENT_OWNER_MARKER.with(|fail| fail.replace(false));
+    #[cfg(not(test))]
+    false
+}
+
+#[cfg(test)]
+fn fail_next_deployment_owner_marker_for_test() {
+    FAIL_NEXT_DEPLOYMENT_OWNER_MARKER.with(|fail| fail.set(true));
+}
+
+#[cfg(test)]
+fn set_before_failed_workdir_residual_hook_for_test(hook: impl FnOnce() + 'static) {
+    BEFORE_FAILED_WORKDIR_RESIDUAL_HOOK.with(|slot| {
+        slot.borrow_mut().replace(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_before_failed_workdir_residual_test_hook() {
+    BEFORE_FAILED_WORKDIR_RESIDUAL_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_before_failed_workdir_residual_test_hook() {}
+
+#[cfg(test)]
+fn run_after_runtime_instance_deletes_test_hook() {
+    AFTER_RUNTIME_INSTANCE_DELETES_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_after_runtime_instance_deletes_test_hook() {}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

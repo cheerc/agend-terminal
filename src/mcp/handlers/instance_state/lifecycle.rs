@@ -14,10 +14,26 @@
 //!   future callers (e.g. `handle_spawn` rejection-message enrichment)
 //!   that want to surface the divergent-store list to the operator.
 
-use crate::agent_ops::{cleanup_admission, cleanup_working_dir_admitted};
+use crate::agent_ops::cleanup_admission;
 use crate::channel::telegram;
 use serde_json::json;
 use std::path::Path;
+
+mod workspace_cleanup;
+
+#[cfg(test)]
+std::thread_local! {
+    static AFTER_FLEET_DELETE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_after_fleet_delete_test_hook() {
+    AFTER_FLEET_DELETE_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
 
 /// #1907: remove `dir` and any empty subdirectories bottom-up, stopping at any
 /// non-empty dir. Used to drop a deleted agent's worktree root including the
@@ -268,6 +284,8 @@ pub(crate) fn full_delete_instance_with_precondition(
         step_errors.push(format!("fleet.yaml removal: {e}"));
         tracing::error!(name, error = %e, "full_delete_instance: fleet.yaml removal failed");
     }
+    #[cfg(test)]
+    run_after_fleet_delete_test_hook();
     if let Some(tid) = topic_id {
         // #3232/#2550: remove the durable record only when the topic is known
         // absent. On failure, preserve its id under a reserved orphan tombstone:
@@ -334,13 +352,13 @@ pub(crate) fn full_delete_instance_with_precondition(
     // corrupt/unreadable identity, or a lock-acquire failure) preserves the
     // foreign tree; surface it as a step error so the delete reports failure
     // instead of a false success while B's directory is (correctly) left intact.
-    if is_claude {
-        if let Err(error) = crate::mcp_config::remove_claude_channel_config(&working_dir) {
-            step_errors.push(format!("Claude ChannelBridge config cleanup: {error}"));
-        }
-    }
-    if let Some(reason) = cleanup_working_dir_admitted(home, name, &working_dir, &cleanup_admission)
-    {
+    if let Some(reason) = workspace_cleanup::cleanup_deleted_workspace(
+        home,
+        name,
+        &working_dir,
+        &cleanup_admission,
+        is_claude,
+    ) {
         step_errors.push(format!("working_dir cleanup refused: {reason}"));
     }
     // #1157: clean id-based metadata. Fleet.yaml is already removed above,

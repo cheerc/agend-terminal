@@ -14,6 +14,13 @@ fn tmp_home(tag: &str) -> std::path::PathBuf {
     dir
 }
 
+fn mark_deployment_member(path: &Path, deployment: &str, instance: &str) {
+    assert!(
+        super::write_deployment_owner_marker(path, deployment, instance, None),
+        "test fixture must carry daemon-created ownership evidence"
+    );
+}
+
 /// §3.9 (MED-2): the binary deploy's Phase-3 SPAWN must run a template's
 /// `command:` override, not the `backend:` preset. `resolve_spawn_backend`
 /// (which feeds `params["backend"]`, run AS the command by the SPAWN handler)
@@ -81,6 +88,368 @@ fn deploy_rejects_bad_template_name() {
         "expected template-name rejection, got: {out}"
     );
     std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn deploy_overlap_rejection_has_no_directory_side_effect() {
+    let home = tmp_home("overlap_no_side_effect_3721");
+    let root = std::env::temp_dir().join(format!("agend-deploy-overlap-{}", std::process::id()));
+    let candidate = root.join("team-worker");
+    std::fs::create_dir_all(&candidate).unwrap();
+    let sentinel = candidate.join("operator-data.txt");
+    std::fs::write(&sentinel, b"preserve").unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances:\n  owner:\n    backend: claude\n    working_directory: {}\n",
+            candidate.display()
+        ),
+    )
+    .unwrap();
+
+    let out = deploy(
+        &home,
+        "caller",
+        &serde_json::json!({"template":"tpl", "name":"team", "directory":root}),
+    );
+
+    assert!(
+        out.get("error").is_some(),
+        "overlap must be rejected: {out}"
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve");
+    assert!(
+        candidate.exists(),
+        "rejected deploy must not materialize or remove path"
+    );
+    assert!(!root.join("team-worker").join(".git").exists());
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn deploy_rolls_back_when_member_path_preexists_without_ownership_3721() {
+    let home = tmp_home("preexisting_member_3721");
+    let root = std::env::temp_dir().join(format!("agend-preexisting-{}", std::process::id()));
+    let candidate = root.join("team-worker");
+    std::fs::create_dir_all(&candidate).unwrap();
+    let sentinel = candidate.join("operator-data.txt");
+    std::fs::write(&sentinel, b"preserve").unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances: {}\n",
+    )
+    .unwrap();
+
+    let out = deploy(
+        &home,
+        "caller",
+        &serde_json::json!({"template":"tpl", "name":"team", "directory":root}),
+    );
+
+    assert_eq!(out["code"], "deploy_workdir_materialization_failed");
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve");
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    assert!(!fleet.instances.contains_key("team-worker"));
+    assert!(!load(&home)
+        .deployments
+        .iter()
+        .any(|deployment| deployment.name == "team"));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn deploy_reports_residual_when_owner_marker_fails_3721() {
+    let home = tmp_home("marker_failure_rollback_3721");
+    let root = std::env::temp_dir().join(format!(
+        "agend-marker-failure-{}-{}",
+        std::process::id(),
+        home.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances: {}\n",
+    )
+    .unwrap();
+    super::fail_next_deployment_owner_marker_for_test();
+
+    let out = deploy(
+        &home,
+        "caller",
+        &serde_json::json!({"template":"tpl", "name":"team", "directory":root}),
+    );
+
+    let candidate = root.join("team-worker");
+    assert_eq!(out["code"], "deploy_workdir_materialization_failed");
+    assert_eq!(
+        out["residual"],
+        candidate.display().to_string(),
+        "marker failure must report the retained directory residual"
+    );
+    assert!(
+        candidate.exists(),
+        "marker failure must preserve the directory rather than delete it by pathname"
+    );
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    assert!(!fleet.instances.contains_key("team-worker"));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn deploy_rollback_preserves_same_name_re_admission_generation_3721() {
+    let home = tmp_home("rollback_generation_3721");
+    let root = std::env::temp_dir().join(format!(
+        "agend-rollback-generation-{}-{}",
+        std::process::id(),
+        home.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances: {}\n",
+    )
+    .unwrap();
+    let replacement_wd = root.join("replacement-generation");
+    let replacement_home = home.clone();
+    let replacement_wd_for_hook = replacement_wd.clone();
+    super::fail_next_deployment_owner_marker_for_test();
+    super::set_before_failed_workdir_residual_hook_for_test(move || {
+        crate::fleet::remove_instance_from_yaml(&replacement_home, "team-worker").unwrap();
+        std::fs::create_dir_all(&replacement_wd_for_hook).unwrap();
+        crate::fleet::insert_new_instances_to_yaml(
+            &replacement_home,
+            &[(
+                "team-worker",
+                &crate::fleet::InstanceYamlEntry {
+                    backend: Some("claude".to_string()),
+                    role: Some("replacement-generation".to_string()),
+                    working_directory: Some(replacement_wd_for_hook.display().to_string()),
+                    ..Default::default()
+                },
+            )],
+        )
+        .unwrap();
+    });
+
+    let out = deploy(
+        &home,
+        "caller",
+        &serde_json::json!({"template":"tpl", "name":"team", "directory":root}),
+    );
+
+    assert_eq!(out["code"], "deploy_workdir_materialization_failed");
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    let replacement = fleet.instances.get("team-worker").expect(
+        "failed deployment rollback must not remove a replacement generation admitted in the meantime",
+    );
+    assert_eq!(replacement.role.as_deref(), Some("replacement-generation"));
+    assert_eq!(
+        replacement.working_directory.as_deref(),
+        Some(replacement_wd.to_str().unwrap())
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn deploy_reports_fleet_rollback_and_cleanup_residuals_3721() {
+    let home = tmp_home("rollback_residuals_3721");
+    let root = std::env::temp_dir().join(format!(
+        "agend-rollback-residuals-{}-{}",
+        std::process::id(),
+        home.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let fleet_path = crate::fleet::fleet_yaml_path(&home);
+    std::fs::write(
+        &fleet_path,
+        "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances: {}\n",
+    )
+    .unwrap();
+    let fleet_path_for_hook = fleet_path.clone();
+    super::fail_next_deployment_owner_marker_for_test();
+    super::set_before_failed_workdir_residual_hook_for_test(move || {
+        std::fs::write(&fleet_path_for_hook, "instances: [invalid").unwrap();
+    });
+
+    let out = deploy(
+        &home,
+        "caller",
+        &serde_json::json!({"template":"tpl", "name":"team", "directory":root}),
+    );
+
+    assert_eq!(out["code"], "deploy_workdir_materialization_failed");
+    let residuals = out["residuals"].as_array().expect(
+        "rollback must return a structured list containing the initial materialization residual and rollback/cleanup failures",
+    );
+    let residuals = residuals
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(residuals
+        .iter()
+        .any(|residual| residual.contains("team-worker")));
+    assert!(residuals.iter().any(|residual| residual.contains("fleet")));
+    assert!(residuals
+        .iter()
+        .any(|residual| residual.contains("cleanup")));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn deploy_marker_failure_preserves_replacement_after_identity_check_3721() {
+    let home = tmp_home("marker_swap_rollback_3721");
+    let root = std::env::temp_dir().join(format!(
+        "agend-marker-swap-{}-{}",
+        std::process::id(),
+        home.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances: {}\n",
+    )
+    .unwrap();
+    let candidate = root.join("team-worker");
+    let created_path = root.join("team-worker-created");
+    let sentinel = candidate.join("operator-data.txt");
+    let swap_candidate = candidate.clone();
+    let swap_created_path = created_path.clone();
+    let swap_sentinel = sentinel.clone();
+    super::fail_next_deployment_owner_marker_for_test();
+    super::set_before_failed_workdir_residual_hook_for_test(move || {
+        std::fs::rename(&swap_candidate, &swap_created_path).unwrap();
+        std::fs::create_dir(&swap_candidate).unwrap();
+        std::fs::write(&swap_sentinel, b"operator-owned replacement").unwrap();
+    });
+
+    let out = deploy(
+        &home,
+        "caller",
+        &serde_json::json!({"template":"tpl", "name":"team", "directory":root}),
+    );
+
+    assert_eq!(out["code"], "deploy_workdir_materialization_failed");
+    assert_eq!(
+        std::fs::read(&sentinel).ok().as_deref(),
+        Some(&b"operator-owned replacement"[..]),
+        "swap after identity check must not let rollback delete the replacement tree"
+    );
+    assert_eq!(
+        out["residual"],
+        candidate.display().to_string(),
+        "the retained replacement must be reported as an actionable residual"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn deploy_reports_branch_residual_when_owner_marker_fails_3721() {
+    fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+        crate::git_helpers::git_bypass(dir, args).expect("git")
+    }
+
+    let home = tmp_home("branch_marker_failure_rollback_3721");
+    let root = home.join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    git(&root, &["init", "-b", "main"]);
+    git(
+        &root,
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    );
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances: {}\n",
+    )
+    .unwrap();
+    super::fail_next_deployment_owner_marker_for_test();
+
+    let out = deploy(
+        &home,
+        "caller",
+        &serde_json::json!({"template":"tpl", "name":"team", "directory":root, "branch":"main"}),
+    );
+
+    let candidate = root.join("team-worker");
+    assert_eq!(out["code"], "deploy_workdir_materialization_failed");
+    assert!(
+        candidate.exists(),
+        "marker failure must preserve the branch worktree rather than remove it by pathname"
+    );
+    assert!(
+        git(&root, &["rev-parse", "--verify", "--quiet", "team/worker"])
+            .status
+            .success(),
+        "marker failure must preserve the generated branch"
+    );
+    let residual = out["residual"].as_str().unwrap();
+    assert!(residual.contains(candidate.to_str().unwrap()));
+    assert!(residual.contains("team/worker"));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn deploy_preserves_preexisting_same_name_fleet_entry_3721() {
+    let home = tmp_home("same_name_fleet_entry_3721");
+    let root = std::env::temp_dir().join(format!(
+        "agend-deploy-rollback-fleet-row-{}",
+        std::process::id()
+    ));
+    let candidate = root.join("team-worker");
+    std::fs::create_dir_all(&candidate).unwrap();
+    let sentinel = candidate.join("operator-data.txt");
+    std::fs::write(&sentinel, b"preserve").unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances:\n  team-worker:\n    backend: claude\n    role: operator-owned\n    working_directory: {}\n",
+            candidate.display()
+        ),
+    )
+    .unwrap();
+
+    let out = deploy(
+        &home,
+        "caller",
+        &serde_json::json!({"template":"tpl", "name":"team", "directory":root}),
+    );
+
+    assert_eq!(out["code"], "deploy_yaml_persist_failed");
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve");
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    let old = fleet.instances.get("team-worker").unwrap();
+    assert_eq!(old.role.as_deref(), Some("operator-owned"));
+    assert_eq!(
+        old.working_directory.as_deref(),
+        Some(candidate.to_str().unwrap())
+    );
+    let raw: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+        &std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(raw["instances"]["team-worker"]["backend"], "claude");
+    assert!(!load(&home)
+        .deployments
+        .iter()
+        .any(|deployment| deployment.name == "team"));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&root).ok();
 }
 
 #[test]
@@ -890,6 +1259,10 @@ templates:
         3,
         "every member must get a unique working_directory, got {workdirs:?}"
     );
+    let generation_id = load(&home).deployments[0]
+        .generation_id
+        .clone()
+        .expect("deployment must persist its generation token");
     for name in ["dev-lead", "dev-impl-1", "dev-impl-2"] {
         let wd = reloaded
             .instances
@@ -899,6 +1272,15 @@ templates:
         assert!(
             wd.ends_with(name),
             "{name}'s working_directory must end with its own name, got {wd}"
+        );
+        assert!(
+            super::deployment_owner_marker_matches(
+                Path::new(&wd),
+                "dev",
+                name,
+                Some(&generation_id),
+            ),
+            "freshly created deployment workdir must carry exact ownership evidence"
         );
     }
     std::fs::remove_dir_all(&home).ok();
@@ -969,9 +1351,7 @@ instances: {}
         "caller",
         &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
     );
-    // Create workspace dir (simulates what daemon would create).
-    let workspace = crate::paths::workspace_dir(&home).join("dev-worker");
-    std::fs::create_dir_all(&workspace).ok();
+    let workspace = home.join("dev-worker");
     std::fs::write(workspace.join("test.txt"), "data").ok();
     assert!(workspace.exists());
 
@@ -1157,6 +1537,73 @@ fn teardown_surfaces_record_save_failure_not_fake_torn_down() {
 }
 
 #[test]
+fn teardown_preserves_cleanup_residual_for_retry_by_deployment_name_3721() {
+    let home = tmp_home("teardown-cleanup-residual-3721");
+    let custom_root = tmp_home("teardown-cleanup-root-3721");
+    let member = "demo-worker";
+    let member_dir = custom_root.join(member);
+    std::fs::create_dir_all(&member_dir).unwrap();
+    std::fs::write(member_dir.join("operator-data"), "preserve").unwrap();
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+    let mut store = DeploymentStore::default();
+    store.deployments.push(Deployment {
+        name: "demo".into(),
+        template: "tpl".into(),
+        instances: vec![member.into()],
+        cleanup_instances: Vec::new(),
+        team: None,
+        directory: custom_root.display().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        generation_id: None,
+    });
+    save(&home, &mut store).unwrap();
+
+    let result = teardown(&home, &serde_json::json!({"name": "demo"}));
+
+    assert_eq!(result["status"], "torn_down_partial", "{result}");
+    assert!(
+        result["cleanup_residuals"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.as_str().is_some_and(|s| s.contains(member)))
+        }),
+        "cleanup residual must be visible to the caller: {result}"
+    );
+    let stored = load(&home);
+    let retained = stored.deployments.iter().find(|d| d.name == "demo");
+    assert!(
+        retained.is_some(),
+        "retryable cleanup state must retain deployment record"
+    );
+    assert!(
+        retained.unwrap().instances.is_empty(),
+        "deleted instances must not be retried as live deletes"
+    );
+    assert_eq!(retained.unwrap().cleanup_instances, vec![member]);
+    assert!(reconcile_orphan_deployments(&home).is_empty());
+    assert_eq!(
+        load(&home).deployments.len(),
+        1,
+        "boot reconciliation must preserve cleanup retry state"
+    );
+    let retry = teardown(&home, &serde_json::json!({"name": "demo"}));
+    assert_eq!(retry["status"], "torn_down_partial", "{retry}");
+    assert!(retry["instances"]
+        .as_array()
+        .is_some_and(|items| items.is_empty()));
+    assert!(retry["cleanup_residuals"]
+        .as_array()
+        .is_some_and(|items| !items.is_empty()));
+    assert!(
+        member_dir.join("operator-data").exists(),
+        "unowned path must be preserved"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&custom_root).ok();
+}
+
+#[test]
 fn close_last_instance_prunes_deployment_entry() {
     // Production smoke for the Issue #474 fix: deploy → simulate the
     // TUI close path (remove from fleet.yaml + reconcile_after_close)
@@ -1259,9 +1706,11 @@ fn reconcile_orphans_prunes_stale_entry_at_boot() {
         name: "ghost".into(),
         template: "tpl".into(),
         instances: vec!["ghost-instance-that-never-was".into()],
+        cleanup_instances: Vec::new(),
         team: None,
         directory: home.display().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
+        generation_id: None,
     });
     save(&home, &mut store).expect("save store");
 
@@ -1275,6 +1724,294 @@ fn reconcile_orphans_prunes_stale_entry_at_boot() {
         store.deployments.iter().all(|d| d.name != "ghost"),
         "stale entry must be gone from store"
     );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn reconcile_preserves_cleanup_residual_for_retry_by_deployment_name_3721() {
+    let home = tmp_home("reconcile-cleanup-residual-3721");
+    let custom_root = tmp_home("reconcile-cleanup-root-3721");
+    let member = "demo-worker";
+    let member_dir = custom_root.join(member);
+    std::fs::create_dir_all(&member_dir).unwrap();
+    std::fs::write(member_dir.join("operator-data"), "preserve").unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances: {}\n",
+    )
+    .unwrap();
+    let mut store = DeploymentStore::default();
+    store.deployments.push(Deployment {
+        name: "demo".into(),
+        template: "tpl".into(),
+        instances: vec![member.into()],
+        cleanup_instances: Vec::new(),
+        team: None,
+        directory: custom_root.display().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        generation_id: None,
+    });
+    save(&home, &mut store).unwrap();
+
+    assert!(reconcile_orphan_deployments(&home).is_empty());
+    let retained = load(&home).deployments;
+    assert_eq!(retained.len(), 1, "failed cleanup must retain retry state");
+    assert!(retained[0].instances.is_empty());
+    assert_eq!(retained[0].cleanup_instances, vec![member]);
+    assert!(reconcile_orphan_deployments(&home).is_empty());
+    assert_eq!(
+        load(&home).deployments.len(),
+        1,
+        "boot retry must not prune residual"
+    );
+    assert!(member_dir.join("operator-data").exists());
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&custom_root).ok();
+}
+
+#[test]
+fn teardown_preserves_newer_runtime_generation_after_stale_record_retry_3721() {
+    let home = tmp_home("teardown_stale_record_generation_3721");
+    let old_root = home.join("old-generation");
+    let new_root = home.join("new-generation");
+    let member = "svc-worker";
+    let old_member_dir = old_root.join(member);
+    std::fs::create_dir_all(&old_member_dir).unwrap();
+    std::fs::write(old_member_dir.join("old-generation.txt"), "old").unwrap();
+    let new_member_dir = new_root.join(member);
+    std::fs::create_dir_all(&new_member_dir).unwrap();
+    let sentinel = new_member_dir.join("live-generation.txt");
+    std::fs::write(&sentinel, "new").unwrap();
+
+    let stale_record = Deployment {
+        name: "svc".into(),
+        template: "tpl".into(),
+        instances: vec![member.into()],
+        cleanup_instances: Vec::new(),
+        team: None,
+        directory: old_root.display().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        generation_id: Some("old-generation-id".into()),
+    };
+    assert!(write_deployment_owner_marker(
+        &old_member_dir,
+        "svc",
+        member,
+        Some("old-generation-id")
+    ));
+    let mut store = DeploymentStore {
+        deployments: vec![stale_record],
+        ..Default::default()
+    };
+    save(&home, &mut store).unwrap();
+    crate::fleet::add_instance_to_yaml(
+        &home,
+        member,
+        &crate::fleet::InstanceYamlEntry {
+            backend: Some("claude".into()),
+            working_directory: Some(new_member_dir.display().to_string()),
+            deployment_generation: Some("new-generation-id".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let registry = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let configs = crate::api::ConfigRegistry::default();
+    let externals = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    externals.lock().insert(
+        member.to_string(),
+        crate::agent::ExternalAgentHandle {
+            backend_command: "remote".into(),
+            pid: 9912,
+        },
+    );
+    let runtime = DeploymentRuntime {
+        registry: &registry,
+        configs: &configs,
+        externals: &externals,
+        notifier: None,
+    };
+
+    let result = teardown_with_runtime(&home, &serde_json::json!({"name": "svc"}), Some(&runtime));
+
+    assert!(
+        externals.lock().contains_key(member),
+        "retry for stale generation must not delete the newer runtime instance: {result}"
+    );
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    assert_eq!(
+        fleet.instances[member].deployment_generation.as_deref(),
+        Some("new-generation-id")
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"new");
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn teardown_refuses_legacy_record_without_generation_identity_3721() {
+    let home = tmp_home("teardown_legacy_stale_record_generation_3721");
+    let old_root = home.join("old-generation");
+    let new_root = home.join("new-generation");
+    let member = "svc-worker";
+    let old_member_dir = old_root.join(member);
+    std::fs::create_dir_all(&old_member_dir).unwrap();
+    let new_member_dir = new_root.join(member);
+    std::fs::create_dir_all(&new_member_dir).unwrap();
+    let sentinel = new_member_dir.join("live-generation.txt");
+    std::fs::write(&sentinel, "new").unwrap();
+
+    let stale_record = Deployment {
+        name: "svc".into(),
+        template: "tpl".into(),
+        instances: vec![member.into()],
+        cleanup_instances: Vec::new(),
+        team: None,
+        directory: old_root.display().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        generation_id: None,
+    };
+    assert!(write_deployment_owner_marker(
+        &old_member_dir,
+        "svc",
+        member,
+        None
+    ));
+    let mut store = DeploymentStore {
+        deployments: vec![stale_record],
+        ..Default::default()
+    };
+    save(&home, &mut store).unwrap();
+    crate::fleet::add_instance_to_yaml(
+        &home,
+        member,
+        &crate::fleet::InstanceYamlEntry {
+            backend: Some("claude".into()),
+            working_directory: Some(new_member_dir.display().to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let registry = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let configs = crate::api::ConfigRegistry::default();
+    let externals = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    externals.lock().insert(
+        member.to_string(),
+        crate::agent::ExternalAgentHandle {
+            backend_command: "remote".into(),
+            pid: 9913,
+        },
+    );
+    let runtime = DeploymentRuntime {
+        registry: &registry,
+        configs: &configs,
+        externals: &externals,
+        notifier: None,
+    };
+
+    let result = teardown_with_runtime(&home, &serde_json::json!({"name": "svc"}), Some(&runtime));
+
+    assert!(
+        externals.lock().contains_key(member),
+        "legacy stale-record retry must not delete the newer runtime instance: {result}"
+    );
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    assert_eq!(fleet.instances[member].deployment_generation, None);
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"new");
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn teardown_team_cascade_preserves_newer_runtime_generation_3721() {
+    let home = tmp_home("teardown_team_cascade_generation_3721");
+    let old_root = home.join("old-generation");
+    let new_root = home.join("new-generation");
+    let member = "svc-worker";
+    let old_member_dir = old_root.join(member);
+    std::fs::create_dir_all(&old_member_dir).unwrap();
+    let new_member_dir = new_root.join(member);
+    std::fs::create_dir_all(&new_member_dir).unwrap();
+    let sentinel = new_member_dir.join("live-generation.txt");
+    std::fs::write(&sentinel, "new").unwrap();
+    assert_eq!(
+        crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "svc", "members": [member]})
+        )["status"],
+        "created"
+    );
+
+    let stale_record = Deployment {
+        name: "svc".into(),
+        template: "tpl".into(),
+        instances: vec![member.into()],
+        cleanup_instances: Vec::new(),
+        team: Some("svc".into()),
+        directory: old_root.display().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        generation_id: Some("old-generation-id".into()),
+    };
+    assert!(write_deployment_owner_marker(
+        &old_member_dir,
+        "svc",
+        member,
+        Some("old-generation-id")
+    ));
+    let mut store = DeploymentStore {
+        deployments: vec![stale_record],
+        ..Default::default()
+    };
+    save(&home, &mut store).unwrap();
+    crate::fleet::add_instance_to_yaml(
+        &home,
+        member,
+        &crate::fleet::InstanceYamlEntry {
+            backend: Some("claude".into()),
+            working_directory: Some(new_member_dir.display().to_string()),
+            deployment_generation: Some("new-generation-id".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let registry = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let configs = crate::api::ConfigRegistry::default();
+    let externals = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    externals.lock().insert(
+        member.to_string(),
+        crate::agent::ExternalAgentHandle {
+            backend_command: "remote".into(),
+            pid: 9914,
+        },
+    );
+    let runtime = DeploymentRuntime {
+        registry: &registry,
+        configs: &configs,
+        externals: &externals,
+        notifier: None,
+    };
+
+    let result = teardown_with_runtime(&home, &serde_json::json!({"name": "svc"}), Some(&runtime));
+
+    assert!(
+        externals.lock().contains_key(member),
+        "team cascade must not delete a newer runtime generation: {result}"
+    );
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    assert_eq!(
+        fleet.instances[member].deployment_generation.as_deref(),
+        Some("new-generation-id")
+    );
+    assert!(
+        fleet.teams.contains_key("svc"),
+        "partial teardown must retain team"
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"new");
+
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -1339,6 +2076,7 @@ fn deploy_with_custom_directory(
     for inst in &inst_names {
         let inst_dir = custom_root.join(inst);
         std::fs::create_dir_all(&inst_dir).unwrap();
+        mark_deployment_member(&inst_dir, deploy_name, inst);
         // Drop a sentinel file so we can tell the dir was actually
         // removed (vs e.g. moved or never created).
         std::fs::write(inst_dir.join("sentinel.txt"), "fixture").unwrap();
@@ -1347,9 +2085,11 @@ fn deploy_with_custom_directory(
         name: deploy_name.to_string(),
         template: "tpl".to_string(),
         instances: inst_names.clone(),
+        cleanup_instances: Vec::new(),
         team: None,
         directory: custom_root.display().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
+        generation_id: None,
     });
     save(&home, &mut store).unwrap();
     // Empty fleet.yaml — simulates the "all instances closed" state
@@ -1413,7 +2153,7 @@ fn close_last_instance_cleans_default_workspace_dir() {
     // Hand-create the workspace subdir (production's spawn path
     // would have created it; deploy_single_instance_for_test stops
     // short of spawning).
-    let wd = crate::paths::workspace_dir(&home).join("tpl-worker");
+    let wd = home.join("tpl-worker");
     std::fs::create_dir_all(&wd).unwrap();
     std::fs::write(wd.join("agent_data.txt"), "data").unwrap();
     assert!(wd.exists(), "test setup: workspace dir must exist");
@@ -1454,6 +2194,93 @@ fn teardown_cleans_custom_directory_subdirs() {
 }
 
 #[test]
+fn teardown_preserves_custom_member_nested_in_another_workspace_3721() {
+    let home = tmp_home("teardown_nested_custom_3721");
+    let owner_workspace = crate::paths::workspace_dir(&home).join("owner");
+    let custom_root = owner_workspace.join("custom-deployment");
+    let member = "demo-worker";
+    let member_dir = custom_root.join(member);
+    std::fs::create_dir_all(&member_dir).unwrap();
+    let sentinel = member_dir.join("operator-data.txt");
+    std::fs::write(&sentinel, b"must survive").unwrap();
+    mark_deployment_member(&member_dir, "demo", member);
+
+    let mut store = load(&home);
+    store.deployments.push(Deployment {
+        name: "demo".into(),
+        template: "tpl".into(),
+        instances: vec![member.into()],
+        cleanup_instances: Vec::new(),
+        team: None,
+        directory: custom_root.display().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        generation_id: None,
+    });
+    save(&home, &mut store).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  owner:\n    backend: claude\n    working_directory: {}\n  demo-worker:\n    backend: claude\n    working_directory: {}\n",
+            owner_workspace.display(),
+            member_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let _ = teardown(&home, &serde_json::json!({"name": "demo"}));
+
+    assert!(
+        std::fs::read(&sentinel).ok().as_deref() == Some(&b"must survive"[..]),
+        "teardown must not recursively delete a custom deployment member inside another live workspace"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn teardown_preserves_default_fallback_nested_in_another_workspace_3721() {
+    let home = tmp_home("teardown_nested_fallback_3721");
+    let default_member = crate::paths::workspace_dir(&home).join("demo-worker");
+    let survivor = default_member.join("nested-survivor");
+    std::fs::create_dir_all(&survivor).unwrap();
+    let sentinel = default_member.join("operator-data.txt");
+    std::fs::write(&sentinel, b"must survive").unwrap();
+    let custom_root = crate::paths::workspace_dir(&home).join("demo");
+    let custom_member = custom_root.join("demo-worker");
+    std::fs::create_dir_all(&custom_member).unwrap();
+    mark_deployment_member(&custom_member, "demo", "demo-worker");
+
+    let mut store = load(&home);
+    store.deployments.push(Deployment {
+        name: "demo".into(),
+        template: "tpl".into(),
+        instances: vec!["demo-worker".into()],
+        cleanup_instances: Vec::new(),
+        team: None,
+        directory: custom_root.display().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        generation_id: None,
+    });
+    save(&home, &mut store).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  owner:\n    backend: claude\n    working_directory: {}\n  demo-worker:\n    backend: claude\n    working_directory: {}\n",
+            survivor.display(),
+            default_member.display()
+        ),
+    )
+    .unwrap();
+
+    let _ = teardown(&home, &serde_json::json!({"name": "demo"}));
+
+    assert!(
+        std::fs::read(&sentinel).ok().as_deref() == Some(&b"must survive"[..]),
+        "default workspace cleanup fallback must honor nested live-workspace admission"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn cleanup_deployment_dirs_handles_missing_subdirs_gracefully() {
     // Pre-removed subdirs (e.g., manual cleanup, or a previous reconcile
     // already ran) must not panic the helper. Tests the
@@ -1469,15 +2296,64 @@ fn cleanup_deployment_dirs_handles_missing_subdirs_gracefully() {
         name: "ghost".to_string(),
         template: "tpl".to_string(),
         instances: vec!["ghost-a".to_string()],
+        cleanup_instances: Vec::new(),
         team: None,
         directory: custom_root.display().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
+        generation_id: None,
     };
 
     // Must not panic.
     cleanup_deployment_dirs(&home, &dep);
 
     std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn cleanup_preserves_preexisting_unmarked_deployment_member_3721() {
+    let home = tmp_home("unmarked_member_3721");
+    let custom_root = std::env::temp_dir().join(format!("agend-unmarked-{}", std::process::id()));
+    let member = "unmarked-worker";
+    let member_dir = custom_root.join(member);
+    std::fs::create_dir_all(&member_dir).unwrap();
+    let sentinel = member_dir.join("operator-data.txt");
+    std::fs::write(&sentinel, b"preserve").unwrap();
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+    let dep = make_deployment("unmarked", &["worker"], &custom_root);
+    std::fs::remove_file(member_dir.join(super::DEPLOYMENT_OWNER_MARKER)).unwrap();
+
+    cleanup_deployment_dirs(&home, &dep);
+
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve");
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&custom_root).ok();
+}
+
+#[test]
+fn cleanup_preserves_marked_member_when_same_name_uses_another_path_3721() {
+    let home = tmp_home("same_name_other_path_3721");
+    let custom_root = std::env::temp_dir().join(format!("agend-same-name-{}", std::process::id()));
+    let member = "same-worker";
+    let member_dir = custom_root.join(member);
+    std::fs::create_dir_all(&member_dir).unwrap();
+    let sentinel = member_dir.join("operator-data.txt");
+    std::fs::write(&sentinel, b"preserve").unwrap();
+    let active_elsewhere = home.join("active-workspace");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  {member}:\n    backend: claude\n    working_directory: {}\n",
+            active_elsewhere.display()
+        ),
+    )
+    .unwrap();
+    let dep = make_deployment("same", &["worker"], &custom_root);
+
+    cleanup_deployment_dirs(&home, &dep);
+
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve");
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&custom_root).ok();
 }
 
 /// §3.9 (MED-4): a branch-mode deploy creates a git worktree + branch per
@@ -1589,13 +2465,21 @@ fn teardown_removes_branch_mode_worktree_and_orphan_branch_med4() {
 
 fn make_deployment(name: &str, members: &[&str], directory: &Path) -> Deployment {
     let inst_names: Vec<String> = members.iter().map(|m| format!("{name}-{m}")).collect();
+    for instance in &inst_names {
+        let path = directory.join(instance);
+        if path.is_dir() {
+            mark_deployment_member(&path, name, instance);
+        }
+    }
     Deployment {
         name: name.to_string(),
         template: "tpl".to_string(),
         instances: inst_names,
+        cleanup_instances: Vec::new(),
         team: None,
         directory: directory.display().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
+        generation_id: None,
     }
 }
 
@@ -1657,6 +2541,136 @@ fn cleanup_deployment_dirs_preserves_parent_with_unrelated_file() {
         "operator-dropped file MUST remain on disk: {unrelated:?}"
     );
 
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&custom_root).ok();
+}
+
+#[test]
+fn cleanup_deployment_dirs_preserves_empty_parent_used_by_survivor_3721() {
+    let home = tmp_home("p15_live_empty_root_3721");
+    let custom_root =
+        std::env::temp_dir().join(format!("agend-p15-{}-live-root", std::process::id()));
+    std::fs::create_dir_all(&custom_root).unwrap();
+    std::fs::create_dir_all(custom_root.join("p15live-a")).unwrap();
+    let dep = make_deployment("p15live", &["a"], &custom_root);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  p15live-a:\n    backend: claude\n    working_directory: {}\n  survivor:\n    backend: claude\n    working_directory: {}\n",
+            custom_root.join("p15live-a").display(),
+            custom_root.display()
+        ),
+    )
+    .unwrap();
+
+    cleanup_deployment_dirs(&home, &dep);
+
+    assert!(
+        custom_root.exists(),
+        "empty deployment root that is an active workspace must survive"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&custom_root).ok();
+}
+
+#[test]
+fn cleanup_waits_for_fleet_admission_and_uses_fresh_snapshot_3721() {
+    let home = tmp_home("cleanup_fleet_race_3721");
+    let custom_root =
+        std::env::temp_dir().join(format!("agend-p15-{}-fleet-race", std::process::id()));
+    let member = "p15race-a";
+    let member_dir = custom_root.join(member);
+    std::fs::create_dir_all(&member_dir).unwrap();
+    let sentinel = member_dir.join("operator-data.txt");
+    std::fs::write(&sentinel, b"preserve").unwrap();
+    let dep = make_deployment("p15race", &["a"], &custom_root);
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+
+    // Hold the admission lock until cleanup reports a failed non-blocking lock
+    // attempt. Publish the newly admitted workspace before allowing cleanup to
+    // retry; it must then load this fresh snapshot.
+    let lock = crate::fleet::persist::acquire_fleet_lock(&home).unwrap();
+    let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let cleanup_home = home.clone();
+    let cleanup_dep = dep.clone();
+    let cleanup = std::thread::spawn(move || {
+        let mut reported = false;
+        cleanup_deployment_dirs_with_wait_hook(&cleanup_home, &cleanup_dep, true, || {
+            if !reported {
+                reported = true;
+                contended_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            }
+        });
+    });
+    contended_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("cleanup must observe fleet-lock contention before snapshot");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  survivor:\n    backend: claude\n    working_directory: {}\n",
+            member_dir.display()
+        ),
+    )
+    .unwrap();
+    drop(lock);
+    resume_tx.send(()).unwrap();
+    cleanup.join().unwrap();
+
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve");
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&custom_root).ok();
+}
+
+#[test]
+fn cleanup_preserves_same_name_re_admitted_at_same_path_3721() {
+    let (home, custom_root) =
+        deploy_with_custom_directory("same_name_readmitted_cleanup_3721", "reused", &["worker"]);
+    let member = "reused-worker";
+    let member_dir = custom_root.join(member);
+    let sentinel = member_dir.join("operator-data.txt");
+    std::fs::write(&sentinel, b"preserve").unwrap();
+    let dep = load(&home).deployments.into_iter().next().unwrap();
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+
+    // Simulate delete removing the old fleet row, followed by a new same-name
+    // instance being admitted at the same custom path before cleanup gets the
+    // fleet lock. The fresh row must be treated as active, not as the old
+    // deployment member whose marker still happens to be present.
+    let lock = crate::fleet::persist::acquire_fleet_lock(&home).unwrap();
+    let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let cleanup_home = home.clone();
+    let cleanup_dep = dep.clone();
+    let cleanup = std::thread::spawn(move || {
+        let mut reported = false;
+        cleanup_deployment_dirs_with_wait_hook(&cleanup_home, &cleanup_dep, true, || {
+            if !reported {
+                reported = true;
+                contended_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            }
+        });
+    });
+    contended_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("cleanup must contend before reading the fleet snapshot");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  {member}:\n    backend: claude\n    working_directory: {}\n",
+            member_dir.display()
+        ),
+    )
+    .unwrap();
+    drop(lock);
+    resume_tx.send(()).unwrap();
+    cleanup.join().unwrap();
+
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve");
+    assert!(member_dir.join(super::DEPLOYMENT_OWNER_MARKER).exists());
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&custom_root).ok();
 }
@@ -2422,7 +3436,7 @@ fn teardown_api_calls_not_under_flock() {
         .find(&["acquire_file", "_lock"].concat())
         .expect("teardown locks the record removal");
     let delete_at = body
-        .find("delete_instance_with_exit_status(")
+        .find("delete_instance_with_exit_status_and_post_for_deployment_generation(")
         .expect("teardown invokes the typed DELETE owner");
     assert!(
         delete_at < lock_at,
@@ -2488,7 +3502,7 @@ fn deployment_runtime_dispatch_forwards_typed_capability_slice14() {
     for needle in [
         "spawn_instance(",
         "team_ops::create",
-        "delete_instance_with_exit_status(",
+        "delete_instance_with_exit_status_and_post_for_deployment_generation(",
     ] {
         let body = source_function_containing(deployments, needle);
         assert!(
@@ -2795,6 +3809,10 @@ templates:
 #[test]
 fn teardown_runtime_path_names_refused_instances_3505() {
     let home = deploy_single_instance_for_test("teardown-partial-3505", "svc");
+    let generation = load(&home).deployments[0]
+        .generation_id
+        .clone()
+        .expect("deployment fixture has a generation id");
     // Plant a never-exiting child for svc-worker, wired through fleet.yaml
     // so `resolve_uuid` hits this registry entry (mirrors
     // `daemon::lifecycle::tests` refusal fixtures).
@@ -2803,8 +3821,9 @@ fn teardown_runtime_path_names_refused_instances_3505() {
     std::fs::write(
         crate::fleet::fleet_yaml_path(&home),
         format!(
-            "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances:\n  svc-worker:\n    backend: claude\n    id: {}\n",
+            "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances:\n  svc-worker:\n    backend: claude\n    id: {}\n    deployment_generation: {}\n",
             worker_id.full(),
+            generation,
         ),
     )
     .expect("write fleet.yaml with id");
@@ -2842,6 +3861,73 @@ fn teardown_runtime_path_names_refused_instances_3505() {
         load(&home).deployments.iter().any(|d| d.name == "svc"),
         "the deployment record must survive a partial teardown so retry stays possible"
     );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn teardown_same_name_readmission_between_delete_and_row_removal_3721() {
+    let home = tmp_home("teardown_same_name_generation_3721");
+    let custom_root = home.join("deployment-root");
+    let member = "svc-worker";
+    let member_dir = custom_root.join(member);
+    std::fs::create_dir_all(&member_dir).unwrap();
+    let sentinel = member_dir.join("live-generation.txt");
+    std::fs::write(&sentinel, b"new-generation").unwrap();
+    let deployment = make_deployment("svc", &["worker"], &custom_root);
+    let mut store = DeploymentStore {
+        deployments: vec![deployment.clone()],
+        ..Default::default()
+    };
+    save(&home, &mut store).unwrap();
+    crate::fleet::add_instance_to_yaml(
+        &home,
+        member,
+        &crate::fleet::InstanceYamlEntry {
+            backend: Some("claude".into()),
+            working_directory: Some(member_dir.display().to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let hook_home = home.clone();
+    let hook_member_dir = member_dir.clone();
+    super::AFTER_RUNTIME_INSTANCE_DELETES_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            assert!(
+                !crate::agent::deleting::is_deleting(&hook_home, member),
+                "test window must be after the instance delete fence drops"
+            );
+            crate::fleet::add_instance_to_yaml(
+                &hook_home,
+                member,
+                &crate::fleet::InstanceYamlEntry {
+                    backend: Some("claude".into()),
+                    working_directory: Some(hook_member_dir.display().to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }));
+    });
+
+    let registry = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let configs = crate::api::ConfigRegistry::default();
+    let externals = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let runtime = DeploymentRuntime {
+        registry: &registry,
+        configs: &configs,
+        externals: &externals,
+        notifier: None,
+    };
+    let result = teardown_with_runtime(&home, &serde_json::json!({"name":"svc"}), Some(&runtime));
+
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    assert!(
+        fleet.instances.contains_key(member),
+        "teardown must not remove a same-name generation admitted after delete: {result}"
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"new-generation");
     std::fs::remove_dir_all(&home).ok();
 }
 
