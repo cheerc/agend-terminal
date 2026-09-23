@@ -3190,6 +3190,52 @@ fn empty_branch_task_completes_without_binding_3706() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3707 rework pin: a whitespace-only `branch` keeps its original
+/// branch-bearing semantics — it is NOT normalized to branchless. Only the
+/// exact-empty string maps to None, using the same `!is_empty` predicate as
+/// the send contract (`comms_delegate` preflight, `messaging` checkout/link),
+/// so both sides agree on every input. A whitespace-only task therefore still
+/// enters the binding check and its assignee `done` without binding/receipt
+/// stays fail-closed with `assignee_completion_blocked`.
+#[test]
+fn create_whitespace_branch_keeps_branch_semantics_3707() {
+    let home = tmp_home("3707-whitespace-pin");
+    let r = handle(
+        &home,
+        "op",
+        &serde_json::json!({"action": "create", "title": "t", "assignee": "dev-agent", "branch": "   "}),
+    );
+    assert!(r.get("error").is_none(), "create must succeed: {r}");
+    let id = r["id"].as_str().expect("id").to_string();
+    let record = read_task_record(&home, &id).expect("task");
+    assert_eq!(
+        record.branch.as_deref(),
+        Some("   "),
+        "whitespace-only branch must persist verbatim (branch-bearing), got {:?}",
+        record.branch
+    );
+    handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    let result = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "done", "id": id}),
+    );
+    assert!(
+        result.get("error").is_some(),
+        "whitespace-only branch without binding must stay fail-closed: {result}"
+    );
+    assert_eq!(
+        result["code"].as_str(),
+        Some("assignee_completion_blocked"),
+        "must fail at the binding guard, not elsewhere: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn update_missing_assignee_unchanged() {
     let home = tmp_home("ap-t5");
