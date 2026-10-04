@@ -25,6 +25,8 @@
 
 本文件是完整的**目標設計提案**。歷史事故與逐行 source 索引留在 git 歷史；本檔不重述審查過程與修正史。凡曾出現互相矛盾的論述，本檔直接選定目標行為並說明其理由，不以「後面有一段更正」要求實作者自行仲裁。
 
+**本文件類別**：本文件屬 repo 的 foldable 類別（`docs/PROPOSAL-*.md`）。依 `CONTRIBUTING.md` 與 `tests/docs_bilingual_invariant.rs`，foldable 文件**豁免**雙語姊妹檔與 `docs/README.md` 索引（因它是作者自用、實作完成後會被 fold 的暫時性文件），但**位置必須直接位於 `docs/` 下**，且**新增或修改它的 commit 必須帶 `Approved-by: cheerc` trailer**（由 `.github/workflows/approved-proposal.yml` 檢查）。
+
 ## 1. 產品定位與不可偷換的裁決
 
 ### 1.1 這個 fork 要成為什麼 [O]
@@ -361,7 +363,7 @@ P2 的順序：先整理 operator CLI、managed bridge、external client 的入�
 
 ### 8.2 Actor 分類
 
-- managed instance：可解析到既有 instance identity 與 session；同 UID 可偽造的剩餘風險需明示。⚠️ **TUI（`src/app/rpc.rs:731`）經 `api::call_at` 走 loopback socket，並送空 `instance`（`:735`），與 bridge 同樣落進 `role_kind_for_instance` 的空值全開分支**（`mcp_proxy.rs:437-438`）；`Sender::from_env`（`handlers/mod.rs:214-215`）在 env 命中時會**改寫** `instance_name`、覆蓋 payload，但 TUI 行程不設 `AGEND_INSTANCE_NAME`（`src/app/` 0 命中），故此路徑**不存在** payload 覆蓋，問題是 anonymous fallback。P2 的 0c 必須覆蓋它。
+- managed instance：可解析到既有 instance identity 與 session；同 UID 可偽造的剩餘風險需明示。⚠️ **TUI（`src/app/rpc.rs:731`）經 `api::call_at` 走 loopback socket，並送空 `instance`（`:735`），與 bridge 同樣落進 `role_kind_for_instance` 的空值全開分支**（`mcp_proxy.rs:437-438`）；`Sender::from_env`（`src/mcp/handlers/mod.rs:214-215`）在 env 命中時會**改寫** `instance_name`、覆蓋 payload，但 TUI 行程不設 `AGEND_INSTANCE_NAME`（`src/app/` 0 命中），故此路徑**不存在** payload 覆蓋，問題是 anonymous fallback。P2 的 0c 必須覆蓋它。
 - operator：使用既有可信 transport 分類，不靠 payload 自稱。
 - external client：A-9 的自報名是 display/audit label；有明確 external surface，不能藉 `external-agent:` 前綴取得 managed／governance 能力。
 - system action：記 daemon 的 execution actor，同時保留 initiating caller／operation provenance；不能只留下 `system:task_sweep` 抹掉誰要求。
@@ -499,7 +501,7 @@ External implementation／review 的 claims 不直接變成 daemon receipt。內
 
 | 工作包 | 交付（全貌） | v1 最小切面（其餘為後續） | 前置 | v1 完成門檻 |
 |---|---|---|---|---|
-| **W0：fork 基線與隔離** | canonical fork identity、獨立測試環境、load-bearing 事實重驗與 release/rollback 基線 | 確認 owning team、source_repo 與 baseline；隔離 `AGEND_HOME`＋獨立 source clone＋關閉正式 channel；選定 base；只重驗 v1 各包改動所依賴的 source 事實；**已演練、可退回前一 daemon 版本並繼續工作的 rollback 程序**（V6-4，手冊級即可）；**upstream open issue 全數分類**（§12.1）；**確認 repo 解析指向 `cheerc/agend-terminal`**（§13 執行前置）；**選定 base 並證明該 base 含本文引用清單中的全部 source 錨點**（as-of 2026-10-04：`184a5fe` 不是 fork `origin/main` 的祖先，fork main 停在 2026-05-29，落後 1641 commits，running baseline 不在 fork 任何既有 branch 上）。後續：release manifest 自動化、手冊以外的 rollback 工具 | 本提案接受、owning team/repo baseline 確認 | 不碰正式 state；**base 涵蓋本文引用的每個機制**（逐項以 symbol／doc-comment 定位，**不以行號定位**；本文的 source 行號綁 `184a5fe`，選定其他 base 須以 symbol 重新定位後才可引用本文的 source 事實）；未查證項有 owner；當下 upstream open issue 每一個都有分類與理由、零未處置；T16 |
+| **W0：fork 基線與隔離** | canonical fork identity、獨立測試環境、load-bearing 事實重驗與 release/rollback 基線 | 確認 owning team、source_repo 與 baseline；隔離 `AGEND_HOME`＋獨立 source clone＋關閉正式 channel；選定 base；只重驗 v1 各包改動所依賴的 source 事實；**已演練、可退回前一 daemon 版本並繼續工作的 rollback 程序**（V6-4，手冊級即可）；**upstream open issue 全數分類**（§12.1）；**確認 repo 解析指向 `cheerc/agend-terminal`**（§13 執行前置）；**選定 base 並證明該 base 含本文引用清單中的全部 source 錨點**。後續：release manifest 自動化、手冊以外的 rollback 工具 | 本提案接受、owning team/repo baseline 確認 | 不碰正式 state；**base 涵蓋本文引用的每個機制**（逐項以 symbol／doc-comment 定位，**不以行號定位**；本文的 source 行號綁 `184a5fe`，選定其他 base 須以 symbol 重新定位後才可引用本文的 source 事實）；未查證項有 owner；當下 upstream open issue 每一個都有分類與理由、零未處置；T16 |
 | **W1：caller 與 authority** | P2 operator/managed/external 入口遷移、anonymous fail-closed、action applicability 基礎 | 完整 P2：0a→0b→0c 子順序，含「未知 instance 名」同樣 fail-closed，**並重新確認 `orphan_reconcile` 的 actor 檢查與 0a 不脫節**。後續：action applicability、unknown write key 拒收 | W0 | T13；且至少涵蓋早期分析的三個案例（空值／不在 fleet.yaml 的未知名／真實具名 instance；不可用 `general` 當正向案例）與早期分析記錄的**三個**已知缺陷（驗收可能在未修時通過；修法不可擋住 operator 自己的 CLI；**改動 actor 來源會讓 `orphan_reconcile` 的 `actor != "operator"` 字串比對脫節**——W1 v1 的 0a 正是此變更，驗收須含：(a) agent transport 送 `params.instance="operator"` → 被 `trusted_operator` 擋；(b) operator CLI 走 0a 新路徑（送保留字）→ `orphan_reconcile_preview/apply` **必須仍可通過**，證明 0a 沒把 operator 自己關在門外）。**誠實邊界：此驗收只測得到無心之失，測不到 agent 自設 `AGEND_INSTANCE_NAME` 的 env 偽造** |
 | **W2：instruction／skill 契約** | 小 kernel、official workflow phase package、custom source ownership、effective manifest 與 activation | **V6-3：v1 切面待 spec 階段單項討論後決定**；本檔不預定 | W0；authority query 整合依 W1 | **v1 不適用（V6-4）**；由 spec 定義 |
 | **W3：no-CI 閉環** | §6 policy、全部 consumer、宣告事件與 post-merge 行為 | 核心閉環必須一次做完（只做一半會重現「靜默健康」），但**下列三項介面由 spec 定義，W3 不得在三者未定前宣稱閉環完成**：(a) declared eligibility 進入 `merge_readiness` 的介面契約；(b) per-generation 宣告紀錄的儲存位置；(c) post-merge 觀察對象的 policy key（現況 arm 寫死 `branch:"main"`，與 feature-branch 的 policy key 不同）。⚠️ 另註：`ci watch` 空 caller 現況被視為已授權（`ci/watch.rs:97-99`），屬 P2／W1 範圍：開關解析到 canonical repo、衝突 fail-closed；不記成一般 Green 的獨立宣告狀態；五個 consumer（含 §6.2 第 7 條的 CI truth 寫入）、post-merge arm 的 policy 解析、宣告事件與 merge 回應的 basis 一起改；宣告涵蓋含 failed 的一切 CI deficit 並列出 failed checks（V6-1）；HEAD 前進產生新 generation；關閉宣告後在 action 當下重驗；post-merge 接受宣告結果。後續：receipt 層的 evidence context 標註、已排隊事件的追溯清理 | W0；policy identity 凍結 | T04、T05 |
