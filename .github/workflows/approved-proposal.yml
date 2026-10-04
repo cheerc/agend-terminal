@@ -1,0 +1,90 @@
+name: Approved-by
+
+# Verifies that every commit which ADDS or MODIFIES a foldable document
+# (`docs/PROPOSAL-*.md` / `docs/SPEC-*.md`) carries an `Approved-by: cheerc`
+# trailer. Other commits are unaffected.
+#
+# The gate lives here rather than in a Rust integration test because a trailer
+# is commit metadata: a test reading the working tree cannot see which commits
+# touched a path. `.github/workflows/dco.yml` already gates `Signed-off-by`
+# the same way, so this is the same mechanism applied to a second trailer — no
+# new trust boundary, and no way to pass it by editing the document itself.
+#
+# How the pairing works: the job checks out the PR's commits (not the GitHub
+# `pulls/{n}/files` endpoint — that endpoint's `sha` is a per-file BLOB sha,
+# not a commit sha, so it can never be matched against commits) and walks each
+# non-merge, non-bot commit with `git diff-tree --name-only`, checking the
+# commit message for the trailer. Editing an APPROVED document to sneak past
+# the gate fails the same way: the modification commit still needs its own
+# `Approved-by: cheerc`.
+#
+# A local test COULD enforce a weaker, different thing: that the document
+# declares its own approval inline (an `<!-- approved-by: cheerc -->` marker).
+# That is deliberately NOT done — see CONTRIBUTING.md for why a marker a
+# committer writes into the same file is not owner approval.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: approved-by-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  approved-by:
+    name: Approved-by cheerc
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the PR head
+        uses: actions/checkout@v5
+        with:
+          # Full history of the PR range is needed to walk each commit with
+          # `git rev-list`. The default shallow fetch (depth 1) would leave
+          # `diff-tree` blind to every commit except the tip.
+          fetch-depth: 0
+
+      - name: Verify Approved-by on commits touching foldable documents
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          offenders="$(git rev-list "${BASE_SHA}..HEAD" \
+            | while IFS= read -r c; do
+                [ -z "$c" ] && continue
+                # Skip merge commits (>=2 parents) and drop bot-authored
+                # commits — same exemptions as dco.yml.
+                [ "$(git rev-list --parents -n1 "$c" | wc -w)" -gt 2 ] && continue
+                case "$(git log -1 --format='%ae' "$c")" in *[Bb][Oo][Tt]*) continue;; esac
+                if git diff-tree --no-commit-id --name-only -r "$c" \
+                   | grep -qE '^docs/(PROPOSAL|SPEC)-[^/]+\.md$'; then
+                  # Trailer match is case-sensitive (cheerc is a GitHub login);
+                  # grep anchors per line so no (?m) is needed.
+                  git log -1 --format='%B' "$c" \
+                    | grep -qE '^[ \t]*Approved-by:[ \t]+cheerc[ \t]*$' \
+                    || echo "  - ${c:0:12}  $(git log -1 --format='%s' "$c")"
+                fi
+              done)"
+
+          if [ -n "$offenders" ]; then
+            echo "::error::A commit touching docs/PROPOSAL-*.md or docs/SPEC-*.md is missing 'Approved-by: cheerc'."
+            echo "Commits touching those paths without approval:"
+            printf '%s\n' "$offenders"
+            echo ""
+            echo "Those documents are exempt from the bilingual-pair and index rules"
+            echo "because they are point-in-time and folded away, not maintained."
+            echo "Owner approval is a commit-level fact, so it is checked at the commit level."
+            echo "Fix it:"
+            echo "  - amend the last:  git commit --amend -s --trailer 'Approved-by: cheerc' --no-edit"
+            echo "See CONTRIBUTING.md for details."
+            exit 1
+          fi
+
+          echo "Every commit touching a foldable document carries 'Approved-by: cheerc'. ✓"
