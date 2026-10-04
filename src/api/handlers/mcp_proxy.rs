@@ -333,6 +333,12 @@ fn handle_mcp_tool_counted(
     action: Option<String>,
     exec: impl FnOnce(&str, &Value, &str) -> Value + Send + 'static,
 ) -> Value {
+    // `AtomicUsize::try_update` is the upstream rename of `fetch_update`, but
+    // it is only stable since Rust 1.95 (`atomic_try_update`) while this crate
+    // supports MSRV 1.88 (`Cargo.toml`). Switching would break every build on
+    // 1.88–1.94, so keep the old name and silence its deprecation until the
+    // MSRV moves. Delete this allow in the same PR that raises MSRV to >= 1.95.
+    #[allow(deprecated)]
     if counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
             if cur >= MAX_MCP_WORKERS {
