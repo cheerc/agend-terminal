@@ -272,9 +272,14 @@ Real-PTY captures grow the regression corpus in `tests/fixtures/state-replay/` a
 - New CLI command → update `docs/CLI.md` and `README.md` command table.
 - New MCP tool → update `docs/MCP-TOOLS.md` and the MCP Tools table in `README.md`.
 - Major user-facing change → add an entry to `CHANGELOG.md` under `## [Unreleased]`.
-- Plan / eval docs (`docs/PLAN-*.md`, `docs/EVAL-*.md`) represent intent at a point in time — when work ships, update status or fold the doc.
+- Foldable documents come in two kinds, both directly under `docs/`:
+  - `docs/PROPOSAL-*.md` — an architectural or directional proposal. It records intent at a point in time and does **not** describe current behavior. It enters the repo only with owner approval (`Approved-by: cheerc`), and is deleted once the work it proposes has landed; the decision trail lives in git history, the issue, and the PR.
+  - `docs/SPEC-*.md` — the current specification contract for one topic. Implementation PRs update it in step; it is folded away when its topic closes.
+  - Both are exempt from the bilingual-pair and index rules (see below) because they are temporary and author-facing, not maintained reference material.
+- We do not use `docs/PLAN-*.md`. Execution plans are local to the work: written where the work happens and discarded when it ships. Only the proposal and its outcome are worth keeping.
 - English is canonical for normative behavior — `docs/FLEET-DEV-PROTOCOL.md` is compiled into the binary by `include_str!` in `src/protocol.rs`, so where the two languages disagree, the English file is correct and the zh-TW file is the bug.
-- Every tracked Markdown file is a mandatory bilingual pair — `tests/docs_bilingual_invariant.rs` fails on a missing sibling, and on divergent heading, code-fence, table, link, release-key, or `AGEND_*` structure. It compares structure, not prose, so keeping the wording in sync stays a human responsibility.
+- Every other tracked Markdown file is a mandatory bilingual pair — `tests/docs_bilingual_invariant.rs` fails on a missing sibling, and on divergent heading, code-fence, table, link, release-key, or `AGEND_*` structure. It compares structure, not prose, so keeping the wording in sync stays a human responsibility. Foldable documents (`PROPOSAL-*` / `SPEC-*`) are the sole exception: they need neither a translation pair nor a `docs/README.md` index entry. Their placement is still enforced — directly under `docs/`, never in a subdirectory.
+- A commit that adds or modifies `docs/PROPOSAL-*.md` or `docs/SPEC-*.md` must carry an `Approved-by: cheerc` trailer, checked by `.github/workflows/approved-proposal.yml`. This is a commit-level fact, so it cannot be satisfied by a marker inside the document: anyone who can write the file can write the marker. The check is deliberately narrow — it fires only for commits that actually touch those paths, and an edit to an already-approved document needs its own approval just like the original.
 - A translation-only correction needs no English counterpart.
 
 ## Releasing

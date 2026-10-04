@@ -35,6 +35,28 @@ fn is_chinese(path: &Path) -> bool {
         .is_some_and(|name| name.ends_with(".zh-TW.md"))
 }
 
+/// Point-in-time, author-facing documents that live directly under `docs/`
+/// and are folded away once the work lands.
+///
+/// These describe intent or a spec at a moment in time, for their author, and
+/// are deleted rather than maintained. They therefore need neither a
+/// translation pair nor an index entry — a `PROPOSAL-*.md` with zero Markdown
+/// links cannot satisfy the sibling-link check by any means short of editing
+/// the document, which defeats the point of submitting it byte-for-byte.
+///
+/// What they do NOT get: placement is still canonical-only (see
+/// [`canonical_location`]), the `Approved-by: cheerc` gate still applies
+/// (`.github/workflows/approved-proposal.yml`), and every other check in this
+/// test still runs against them.
+fn is_foldable_document(path: &Path) -> bool {
+    if path.parent() != Some(Path::new("docs")) {
+        return false;
+    }
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.starts_with("PROPOSAL-") || stem.starts_with("SPEC-"))
+}
+
 fn english_path(path: &Path) -> PathBuf {
     if !is_chinese(path) {
         return path.to_path_buf();
@@ -298,7 +320,8 @@ fn markdown_is_bilingual_and_follows_the_information_architecture() {
 
         let english = english_path(path);
         let chinese = chinese_path(path);
-        if !markdown.contains(&english) || !markdown.contains(&chinese) {
+        let foldable = is_foldable_document(path);
+        if !foldable && (!markdown.contains(&english) || !markdown.contains(&chinese)) {
             errors.push(format!(
                 "missing bilingual sibling for {} (expected {} and {})",
                 path.display(),
@@ -332,18 +355,22 @@ fn markdown_is_bilingual_and_follows_the_information_architecture() {
             .file_name()
             .and_then(|name| name.to_str())
             .expect("UTF-8 sibling filename");
-        let sibling_target =
-            fs::canonicalize(root.join(sibling)).expect("bilingual sibling exists");
-        if !link_targets.iter().any(|target| {
-            resolved_local_target(&root, path, target)
-                .and_then(|target| fs::canonicalize(target).ok())
-                .is_some_and(|target| target == sibling_target)
-        }) {
-            errors.push(format!(
-                "{} does not link to sibling {}",
-                path.display(),
-                sibling_name
-            ));
+        // A foldable document has no sibling by design, so there is nothing to
+        // link to and nothing to canonicalize.
+        if !foldable {
+            let sibling_target =
+                fs::canonicalize(root.join(sibling)).expect("bilingual sibling exists");
+            if !link_targets.iter().any(|target| {
+                resolved_local_target(&root, path, target)
+                    .and_then(|target| fs::canonicalize(target).ok())
+                    .is_some_and(|target| target == sibling_target)
+            }) {
+                errors.push(format!(
+                    "{} does not link to sibling {}",
+                    path.display(),
+                    sibling_name
+                ));
+            }
         }
         for target in &link_targets {
             if let Some(resolved) = resolved_local_target(&root, path, target) {
@@ -357,7 +384,7 @@ fn markdown_is_bilingual_and_follows_the_information_architecture() {
             }
         }
 
-        if !is_chinese(path) {
+        if !is_chinese(path) && !foldable {
             let chinese_content =
                 fs::read_to_string(root.join(&chinese)).expect("read Chinese Markdown");
             let english_shape = document_shape(&content);
@@ -408,7 +435,7 @@ fn markdown_is_bilingual_and_follows_the_information_architecture() {
             }
         }
 
-        if !is_chinese(path) && path.parent() == Some(Path::new("docs")) {
+        if !is_chinese(path) && path.parent() == Some(Path::new("docs")) && !foldable {
             let english_name = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -433,4 +460,54 @@ fn markdown_is_bilingual_and_follows_the_information_architecture() {
         "documentation invariant violations:\n{}",
         errors.join("\n")
     );
+}
+
+#[cfg(test)]
+mod unit {
+    use super::*;
+
+    fn p(path: &str) -> PathBuf {
+        PathBuf::from(path)
+    }
+
+    /// The exemption is deliberately narrow: only the two prefixes, only
+    /// directly under `docs/`. A nested `docs/proposals/PROPOSAL-x.md` is still
+    /// non-canonical, so the exemption cannot be used to smuggle in a
+    /// subdirectory tree.
+    #[test]
+    fn foldable_classification_is_prefix_and_depth_scoped() {
+        assert!(is_foldable_document(&p("docs/PROPOSAL-v6.md")));
+        assert!(is_foldable_document(&p("docs/SPEC-no-ci.md")));
+
+        // Wrong directory — canonical_location already rejects these, and the
+        // exemption must not pre-empt that error.
+        assert!(!is_foldable_document(&p("docs/proposals/PROPOSAL-v6.md")));
+        assert!(!is_foldable_document(&p("PROPOSAL-v6.md")));
+        assert!(!is_foldable_document(&p("skills/x/PROPOSAL-v6.md")));
+
+        // Wrong prefix — a near-miss must not inherit the exemption, otherwise
+        // `PROPOSAL.md` or `SPECIFICATION.md` would silently opt out.
+        assert!(!is_foldable_document(&p("docs/PROPOSAL.md")));
+        assert!(!is_foldable_document(&p("docs/SPECIFICATION-notes.md")));
+        assert!(!is_foldable_document(&p("docs/FEATURE-proposal.md")));
+        assert!(!is_foldable_document(&p("docs/PROPOSAL_v6.md")));
+    }
+
+    /// `file_stem` drops the extension, so a Chinese sibling named
+    /// `PROPOSAL-v6.zh-TW.md` also classifies as foldable. That is intended:
+    /// the pair requirement is dropped for the whole family, and nothing else
+    /// changes for it.
+    #[test]
+    fn foldable_classification_covers_the_zh_sibling_name_too() {
+        assert!(is_foldable_document(&p("docs/PROPOSAL-v6.zh-TW.md")));
+    }
+
+    /// The exemption removes three checks and no more. Placement still routes
+    /// through canonical_location, so a misplaced foldable document is still
+    /// caught by the non-canonical error.
+    #[test]
+    fn exemption_does_not_relax_placement() {
+        assert!(!canonical_location(&p("docs/proposals/PROPOSAL-v6.md")));
+        assert!(canonical_location(&p("docs/PROPOSAL-v6.md")));
+    }
 }

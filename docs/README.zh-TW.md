@@ -27,7 +27,10 @@ section、table、code block 或 link target。
 - `vendor/agentic-git` 是 repository 內的獨立 Cargo workspace，其 crate
   文件不納入上層文件索引。
 - Plan、audit、review snapshot 與已完成 incident note 不留在 active tree；
-  仍有效的規則必須併入真正擁有該主題的維護中文件。
+  仍有效的規則必須併入真正擁有該主題的維護中文件。唯一的例外是 foldable
+  類別 —— `PROPOSAL-*` 與 `SPEC-*` 刻意留在這裡，因為主題的方向與契約就是靠它們
+  在實作之前（與之中）寫下來的。交付後即刪除；屆時 durable 規則併入對應的
+  `FEATURE-*` / `architecture.md`。
 
 `docs_bilingual_invariant` integration test 會強制 placement、pairing、
 navigation、heading、code fence、table、link target 與 index 規則。自然語言品質
@@ -110,6 +113,12 @@ artifact 內提到的 issue/PR，或執行 `git log -- <former-path>`。歷史�
 | 已知問題 | [EN](KNOWN_ISSUES.md) | [中文](KNOWN_ISSUES.zh-TW.md) | 刻意延後的 user-visible issue |
 | Skills 參考 | [EN](SKILLS.md) | [中文](SKILLS.zh-TW.md) | Skill catalog 與 lock format |
 | Source of Truth | [EN](SOURCE-OF-TRUTH.md) | [中文](SOURCE-OF-TRUTH.zh-TW.md) | Code、docs 與 evidence authority |
+| 提案 | `PROPOSAL-*.md` | 無 | 該時點的架構或方向提案，須 owner 核准，交付後 fold |
+| 規格 | `SPEC-*.md` | 無 | 單一主題的現行規格契約，實作 PR 同步更新，主題完成後 fold |
+
+兩者皆為 foldable、作者自用的暫時性文件：豁免雙語姊妹檔與索引規則，但仍須直接
+放在 `docs/` 下，且只有帶 `Approved-by: cheerc` 的 commit 才能納入。詳見
+CONTRIBUTING.md。
 
 ## 維運與治理
 

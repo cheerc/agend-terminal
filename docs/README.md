@@ -32,7 +32,11 @@ section, table, code block, or link target.
   crate documentation. Its files are outside the parent documentation index.
 - Plans, audits, review snapshots, and completed incident notes do not remain
   in the active tree. Durable current rules belong in the maintained document
-  that owns the topic.
+  that owns the topic. The one exception is the foldable class — `PROPOSAL-*`
+  and `SPEC-*` live here on purpose, because they are how a topic's direction
+  and contract get written down before (and while) they are implemented. They
+  are deleted when the work lands; the durable rules go into the owning
+  `FEATURE-*` / `architecture.md` document at that point.
 
 The `docs_bilingual_invariant` integration test enforces the placement,
 pairing, navigation, heading, code-fence, table, link-target, and index rules.
@@ -116,6 +120,12 @@ believed then, not a current contract.
 | Known Issues | [EN](KNOWN_ISSUES.md) | [中文](KNOWN_ISSUES.zh-TW.md) | Deliberately deferred user-visible issues |
 | Skills Reference | [EN](SKILLS.md) | [中文](SKILLS.zh-TW.md) | Skill catalog and lock format |
 | Source of Truth | [EN](SOURCE-OF-TRUTH.md) | [中文](SOURCE-OF-TRUTH.zh-TW.md) | Code, docs, and evidence authority |
+| Proposals | `PROPOSAL-*.md` | none | Point-in-time architecture or direction proposals, owner-approved, folded when the work lands |
+| Specifications | `SPEC-*.md` | none | Current specification contract per topic, updated with the implementation PR, folded when the topic closes |
+
+Both are foldable, author-facing documents: exempt from the bilingual-pair and
+index rules, still required to sit directly in `docs/`, and admitted only by a
+commit carrying `Approved-by: cheerc`. See CONTRIBUTING.md.
 
 ## Operations and governance
 
