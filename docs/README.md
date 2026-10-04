@@ -30,8 +30,7 @@ section, table, code block, or link target.
   structure.
 - `vendor/agentic-git` is an in-tree Cargo workspace with independent
   crate documentation. Its files are outside the parent documentation index.
-- Plans never enter the tree; audits, review snapshots, and completed incident notes do not remain in it.
-  in the active tree. Durable current rules belong in the maintained document
+- Plans never enter the tree; audits, review snapshots, and completed incident notes do not remain in it. Durable current rules belong in the maintained document
   that owns the topic. The one exception is the foldable class — `PROPOSAL-*`
   and `SPEC-*` live here on purpose, because they are how a topic's direction
   and contract get written down before (and while) they are implemented. They
