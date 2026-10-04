@@ -336,8 +336,16 @@ fn handle_mcp_tool_counted(
     // `AtomicUsize::try_update` is the upstream rename of `fetch_update`, but
     // it is only stable since Rust 1.95 (`atomic_try_update`) while this crate
     // supports MSRV 1.88 (`Cargo.toml`). Switching would break every build on
-    // 1.88–1.94, so keep the old name and silence its deprecation until the
-    // MSRV moves. Delete this allow in the same PR that raises MSRV to >= 1.95.
+    // 1.88–1.94, so keep the old name and silence its deprecation.
+    //
+    // Removal condition: delete this allow once MSRV >= 1.99 — NOT 1.95.
+    // `try_update` becomes available in 1.95, but `fetch_update` is not
+    // deprecated until 1.99 (`atomic.rs`: `#[deprecated(since = "1.99.0")]`),
+    // so the 1.95–1.98 window still needs this allow; removing it at 1.95 would
+    // reintroduce this exact CI failure when stable reaches 1.99.
+    //
+    // The MSRV bump must also update the `1.88` pins in `ci.yml` and
+    // `release.yml` in the same PR (see docs/RELEASING.md, "MSRV bumps").
     #[allow(deprecated)]
     if counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
