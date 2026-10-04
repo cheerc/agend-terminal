@@ -26,7 +26,7 @@ section、table、code block 或 link target。
   language navigation 與一致結構。
 - `vendor/agentic-git` 是 repository 內的獨立 Cargo workspace，其 crate
   文件不納入上層文件索引。
-- Plan、audit、review snapshot 與已完成 incident note 不留在 active tree；
+- Plan 從不進 active tree；audit、review snapshot 與已完成 incident note 不留在其中；
   仍有效的規則必須併入真正擁有該主題的維護中文件。唯一的例外是 foldable
   類別 —— `PROPOSAL-*` 與 `SPEC-*` 刻意留在這裡，因為主題的方向與契約就是靠它們
   在實作之前（與之中）寫下來的。交付後即刪除；屆時 durable 規則併入對應的

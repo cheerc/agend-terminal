@@ -265,7 +265,7 @@ Fleet provenance trailer 會先驗證 branch。在 repository 的 main worktree 
   - `docs/PROPOSAL-*.md` —— 架構或方向提案。它記錄的是某個時間點的意圖,**不**描述現行行為。經 owner 核准（`Approved-by: cheerc`）後才進 repo,等它提出的工作落地即刪除；決策軌跡留在 git 歷史、issue 與 PR。
   - `docs/SPEC-*.md` —— 單一主題的現行規格契約。實作 PR 同步更新,主題完成後 fold 掉。
   - 兩者都豁免雙語配對與索引規則(見下),因為它們是暫時性、作者自用的文件,不是維護中的參考資料。
-- 我們不使用 `docs/PLAN-*.md`。執行計畫屬於該工作本身:在哪裡做就在哪裡寫,交付即作廢。值得留下來的只有提案與它的結果。
+- 我們不使用 `docs/PLAN-*.md`。執行計畫屬於該工作本身:在哪裡做就在哪裡寫,交付即作廢。值得留下來的只有提案與它的結果。同理,`docs/EVAL-*.md` 屬於產出它的工作本身:從不進 repo。
 - 規範性行為以英文為準——`docs/FLEET-DEV-PROTOCOL.md` 由 `src/protocol.rs` 的 `include_str!` 編譯進 binary,因此兩種語言不一致時,以英文檔為正確,zh-TW 檔即是待修的錯誤。
 - 其餘每份納管的 Markdown 都是強制的雙語配對——`tests/docs_bilingual_invariant.rs` 會在缺少對應檔時失敗,標題、code fence、表格、連結、release key 或 `AGEND_*` 結構不一致時亦然。它比對的是結構而非散文,因此讓文字語意保持同步仍是人的責任。Foldable 文件(`PROPOSAL-*` / `SPEC-*`)是唯一的例外:它們既不需要翻譯配對,也不需要進 `docs/README.md` 索引。位置仍然受約束——直接放在 `docs/` 下,不得放進子目錄。
 - 新增或修改 `docs/PROPOSAL-*.md`、`docs/SPEC-*.md` 的 commit 必須帶 `Approved-by: cheerc` trailer,由 `.github/workflows/approved-proposal.yml` 檢查。這是 commit 層級的事實,無法用文件內的標記取代:能寫入檔案的人同樣能寫入那個標記。這項檢查刻意做得很窄——只對真正碰觸那些路徑的 commit 生效,而修改一份已核准的文件,仍需要它自己的核准。
