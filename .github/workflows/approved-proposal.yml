@@ -56,34 +56,35 @@ jobs:
         run: |
           set -euo pipefail
 
-          offenders="$(git rev-list \"${BASE_SHA}..HEAD\" \
+          offenders="$(git rev-list "${BASE_SHA}..HEAD" \
             | while IFS= read -r c; do
-                [ -z \"$c\" ] && continue
-                # Skip merge commits (>=2 parents) and let the author check below
-                # drop bot-authored commits — same exemptions as dco.yml.
-                [ \"$(git rev-list --parents -n1 \"$c\" | wc -w)\" -gt 2 ] && continue
-                case \"$(git log -1 --format='%ae' \"$c\")\" in *[Bb][Oo][Tt]*) continue;; esac
-                if git diff-tree --no-commit-id --name-only -r \"$c\" \
-                   | grep -qE '^docs/(PROPOSAL|SPEC)-[^/]+\\.md$'; then
-                  # Trailer match is case-sensitive (cheerc is a GitHub login); grep anchors per line so no (?m) needed.
-                  git log -1 --format='%B' \"$c\" \
-                    | grep -qE '^[ \\t]*Approved-by:[ \\t]+cheerc[ \\t]*$' \\
-                    || echo \"  - ${c:0:12}  $(git log -1 --format='%s' \"$c\")\"
+                [ -z "$c" ] && continue
+                # Skip merge commits (>=2 parents) and drop bot-authored
+                # commits — same exemptions as dco.yml.
+                [ "$(git rev-list --parents -n1 "$c" | wc -w)" -gt 2 ] && continue
+                case "$(git log -1 --format='%ae' "$c")" in *[Bb][Oo][Tt]*) continue;; esac
+                if git diff-tree --no-commit-id --name-only -r "$c" \
+                   | grep -qE '^docs/(PROPOSAL|SPEC)-[^/]+\.md$'; then
+                  # Trailer match is case-sensitive (cheerc is a GitHub login);
+                  # grep anchors per line so no (?m) is needed.
+                  git log -1 --format='%B' "$c" \
+                    | grep -qE '^[ \t]*Approved-by:[ \t]+cheerc[ \t]*$' \
+                    || echo "  - ${c:0:12}  $(git log -1 --format='%s' "$c")"
                 fi
               done)"
 
-          if [ -n \"$offenders\" ]; then
-            echo \"::error::A commit touching docs/PROPOSAL-*.md or docs/SPEC-*.md is missing 'Approved-by: cheerc'.\"
-            echo \"Commits touching those paths without approval:\"
-            printf '%s\\n' \"$offenders\"
-            echo \"\"
-            echo \"Those documents are exempt from the bilingual-pair and index rules\"
-            echo \"because they are point-in-time and folded away, not maintained.\"
-            echo \"Owner approval is a commit-level fact, so it is checked at the commit level.\"
-            echo \"Fix it:\"
-            echo \"  - amend the last:  git commit --amend -s --trailer 'Approved-by: cheerc' --no-edit\"
-            echo \"See CONTRIBUTING.md for details.\"
+          if [ -n "$offenders" ]; then
+            echo "::error::A commit touching docs/PROPOSAL-*.md or docs/SPEC-*.md is missing 'Approved-by: cheerc'."
+            echo "Commits touching those paths without approval:"
+            printf '%s\n' "$offenders"
+            echo ""
+            echo "Those documents are exempt from the bilingual-pair and index rules"
+            echo "because they are point-in-time and folded away, not maintained."
+            echo "Owner approval is a commit-level fact, so it is checked at the commit level."
+            echo "Fix it:"
+            echo "  - amend the last:  git commit --amend -s --trailer 'Approved-by: cheerc' --no-edit"
+            echo "See CONTRIBUTING.md for details."
             exit 1
           fi
 
-          echo \"Every commit touching a foldable document carries 'Approved-by: cheerc'. ✓\"
+          echo "Every commit touching a foldable document carries 'Approved-by: cheerc'. ✓"
