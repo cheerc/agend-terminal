@@ -683,7 +683,1203 @@ fn cross_branch_to_non_protected_target_never_exempted() {
     }
 }
 
+// ── #12: the cross-branch fence must survive flag-prefixed checkout/switch ──
+//
+// Pre-#12 the fence read `args.get(1)` verbatim, so ANY option token in the
+// first position made it bail out (`!target_branch.starts_with('-')`) and the
+// branch switch sailed through. Every case below is a real bypass shape: the
+// fence must DENY, naming the real target.
+
 #[test]
+fn checkout_quiet_sha_is_fenced_12() {
+    // `git checkout -q <sha>` — the #12 canonical shape. Pre-#12 args[1] was
+    // `-q`, so the `starts_with('-')` bail-out fired and the detached-HEAD
+    // switch was allowed.
+    let binding = bound_binding("sprint57-track-a", "/tmp/.worktrees/dev");
+    let action = classify(
+        "checkout",
+        &["checkout".into(), "-q".into(), "0a1b2c3".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    match action {
+        Action::Deny(reason) => {
+            assert!(
+                reason.contains("cross-branch"),
+                "`checkout -q <sha>` must trip the cross-branch fence: {reason}"
+            );
+            assert!(
+                reason.contains("0a1b2c3"),
+                "deny must name the real target, not the `-q` option: {reason}"
+            );
+        }
+        other => panic!("`checkout -q <sha>` must deny, got {other:?}"),
+    }
+}
+
+#[test]
+fn checkout_force_branch_is_fenced_12() {
+    // `git checkout -f <branch>` — discards local changes AND switches
+    // branch; pre-#12 the `-f` first position disabled the fence.
+    let binding = bound_binding("sprint57-track-b", "/tmp/.worktrees/dev");
+    let action = classify(
+        "checkout",
+        &["checkout".into(), "-f".into(), "main".into()],
+        &binding,
+        false, // parent_is_gh — interactive, so the Track-D exemption
+        // must not apply even though the target is protected.
+        false,
+        false,
+    );
+    match action {
+        Action::Deny(reason) => assert!(
+            reason.contains("cross-branch"),
+            "`checkout -f <branch>` must trip the cross-branch fence: {reason}"
+        ),
+        other => panic!("`checkout -f <branch>` must deny, got {other:?}"),
+    }
+}
+
+#[test]
+fn switch_detach_sha_is_fenced_12() {
+    // `git switch --detach <sha>` — leaves the bound branch for a detached
+    // HEAD; pre-#12 args[1] was `--detach` and the fence bailed.
+    let binding = bound_binding("sprint57-track-c", "/tmp/.worktrees/dev");
+    let action = classify(
+        "switch",
+        &["switch".into(), "--detach".into(), "0a1b2c3".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    match action {
+        Action::Deny(reason) => {
+            assert!(
+                reason.contains("cross-branch"),
+                "`switch --detach <sha>` must trip the cross-branch fence: {reason}"
+            );
+            assert!(
+                reason.contains("0a1b2c3"),
+                "deny must name the detached commit: {reason}"
+            );
+        }
+        other => panic!("`switch --detach <sha>` must deny, got {other:?}"),
+    }
+}
+
+#[test]
+fn switch_create_branch_is_fenced_12() {
+    // `git switch -c <new>` creates AND lands on a new branch. The name is
+    // consumed as the option's value, so a naive "first non-flag token"
+    // parser would see nothing and let it through.
+    let binding = bound_binding("sprint57-track-d", "/tmp/.worktrees/dev");
+    let action = classify(
+        "switch",
+        &["switch".into(), "-c".into(), "tmp-scratch".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    match action {
+        Action::Deny(reason) => {
+            assert!(
+                reason.contains("cross-branch"),
+                "`switch -c <new>` must trip the cross-branch fence: {reason}"
+            );
+            assert!(
+                reason.contains("tmp-scratch"),
+                "deny must name the branch being created: {reason}"
+            );
+        }
+        other => panic!("`switch -c <new>` must deny, got {other:?}"),
+    }
+}
+
+#[test]
+fn flag_prefixed_same_branch_checkout_still_allowed_12() {
+    // Over-guard check: `-q` is noise, so `checkout -q <assigned>` stays on
+    // the bound branch and must still PASS. Without this the #12 fix would
+    // just deny every flag-prefixed checkout and break normal use.
+    let binding = bound_binding("sprint57-track-e", "/tmp/.worktrees/dev");
+    let action = classify(
+        "checkout",
+        &["checkout".into(), "-q".into(), "sprint57-track-e".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    assert!(
+        matches!(action, Action::ChdirPass(_)),
+        "same-branch `checkout -q <assigned>` must still pass, got {action:?}"
+    );
+}
+
+#[test]
+fn bundled_option_does_not_hide_attached_branch_name_12() {
+    // `switch -qd` is a bundleable short: `d` is a DETACH flag here, not an
+    // attached branch name (proved against real git — `git switch -qd` detaches
+    // instead of creating a branch named `d`). It must therefore deny as a
+    // detach, NOT be read as a branch switch to a branch named `d`.
+    let binding = bound_binding("sprint57-track-f", "/tmp/.worktrees/dev");
+    let action = classify(
+        "switch",
+        &["switch".into(), "-qd".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    match action {
+        Action::Deny(reason) => {
+            assert!(
+                reason.contains("cross-branch"),
+                "`switch -qd` leaves the bound branch and must be fenced: {reason}"
+            );
+            assert!(
+                !reason.contains("switch to 'd'"),
+                "`-qd` must not be parsed as a branch named `d`: {reason}"
+            );
+        }
+        other => panic!("`switch -qd` must deny, got {other:?}"),
+    }
+}
+
+#[test]
+fn attached_option_branch_name_is_fenced_12() {
+    // `git switch -catt` really does create a branch named `att` (verified
+    // against real git), so the attached form must be parsed the same way as
+    // the separated one — otherwise `-c<name>` stays a bypass.
+    let binding = bound_binding("sprint57-track-g", "/tmp/.worktrees/dev");
+    let action = classify(
+        "switch",
+        &["switch".into(), "-catt".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    match action {
+        Action::Deny(reason) => {
+            assert!(
+                reason.contains("cross-branch"),
+                "`switch -catt` (attached -c value) must be fenced: {reason}"
+            );
+            assert!(
+                reason.contains("att"),
+                "deny must name the attached branch value `att`: {reason}"
+            );
+        }
+        other => panic!("`switch -catt` must deny, got {other:?}"),
+    }
+}
+
+#[test]
+fn bare_detach_options_still_fenced_12() {
+    // `checkout -d` / `switch -d` detach with no argument at all. There is no
+    // target token to name, but leaving the bound branch is still a
+    // cross-branch move, so the fence must fire.
+    for (subcmd, args) in [
+        ("checkout", vec!["checkout".to_string(), "-d".to_string()]),
+        ("switch", vec!["switch".to_string(), "-d".to_string()]),
+    ] {
+        let binding = bound_binding("sprint57-track-h", "/tmp/.worktrees/dev");
+        let action = classify(subcmd, &args, &binding, false, false, false);
+        match action {
+            Action::Deny(reason) => assert!(
+                reason.contains("cross-branch"),
+                "bare `{subcmd} -d` leaves the bound branch and must be fenced: {reason}"
+            ),
+            other => panic!("bare `{subcmd} -d` must deny, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn pathspec_restore_exemption_survives_leading_flag_12() {
+    // The `checkout <tree-ish> -- <pathspec>` restore exemption must keep
+    // working when a noise flag leads: `checkout -q <snapshot> -- .` restores
+    // working-tree files without switching branches. Denying this would
+    // re-break the recovery layer's own documented restore.
+    let binding = bound_binding("sprint57-track-i", "/tmp/.worktrees/dev");
+    let action = classify(
+        "checkout",
+        &[
+            "checkout".into(),
+            "-q".into(),
+            "snapshot-ref".into(),
+            "--".into(),
+            ".".into(),
+        ],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    assert!(
+        matches!(action, Action::ChdirPass(_)),
+        "`checkout -q <ref> -- .` is a restore, must still pass, got {action:?}"
+    );
+}
+
+#[test]
+fn double_dash_terminator_stops_option_parsing_12() {
+    // After a bare `--` every token is a pathspec, never an option. `--`
+    // itself must not be mistaken for a detach-shaped option.
+    let binding = bound_binding("sprint57-track-j", "/tmp/.worktrees/dev");
+    let action = classify(
+        "checkout",
+        &["checkout".into(), "--".into(), "src".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    assert!(
+        matches!(action, Action::ChdirPass(_)),
+        "`checkout -- <path>` is a restore shape, must pass, got {action:?}"
+    );
+}
+
+#[test]
+fn pathspec_from_file_option_is_not_a_branch_12() {
+    // Regression guard for the impl-review round-2 (fugu) reachability case
+    // snapshots.rs `checkout_pathspec_from_file_is_recoverable_review2`
+    // pins: `checkout --pathspec-from-file=ps.txt` is a worktree-discard op
+    // that must REACH the snapshotting layer. An early #12 draft read the
+    // `=`-attached value as a branch name and re-denied it, breaking that
+    // documented recovery path. The value is an operand, not a target.
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "--pathspec-from-file=ps.txt"])),
+        Some(CheckoutTarget::Stay)
+    );
+    // Bare form consumes the following token rather than reading it as one.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "--pathspec-from-file", "ps.txt"])),
+        Some(CheckoutTarget::Stay)
+    );
+
+    // And the real shim path still lets the op through.
+    let binding = bound_binding("sprint57-track-l", "/tmp/.worktrees/dev");
+    let action = classify(
+        "checkout",
+        &["checkout".into(), "--pathspec-from-file=ps.txt".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    assert!(
+        matches!(action, Action::ChdirPass(_)),
+        "`checkout --pathspec-from-file=<f>` must pass through to the snapshot layer, got {action:?}"
+    );
+}
+
+// ── PR #17 rework: three under-deny shapes the dual review found ───────
+//
+// The first #12 revision closed the four reported bypasses but a dual review
+// (real-git-verified) found three more, all reachable with one extra token.
+// Each test below names the finding and cites the observed git behaviour.
+
+// Finding A — the resolver used to return at the FIRST positional, so a
+// trailing detach flag was never parsed. Real git (2.50.1):
+// `git checkout assigned --detach` → HEAD detached.
+#[test]
+fn trailing_detach_after_assigned_branch_is_fenced_a17() {
+    for args in [
+        vec!["checkout", "assigned-br", "--detach"],
+        vec!["checkout", "assigned-br", "-d"],
+        vec!["checkout", "assigned-br", "-qd"],
+        vec!["checkout", "-q", "assigned-br", "--detach"],
+        vec!["switch", "assigned-br", "-d"],
+        vec!["switch", "-q", "assigned-br", "--detach"],
+    ] {
+        let sub = args[0];
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let binding = bound_binding("assigned-br", "/tmp/.worktrees/dev");
+        let action = classify(sub, &argv, &binding, false, false, false);
+        match action {
+            Action::Deny(reason) => assert!(
+                reason.contains("detach HEAD"),
+                "`{}` leaves the bound branch and must be fenced as a detach: {reason}",
+                args.join(" ")
+            ),
+            other => panic!(
+                "`{}` MUST deny (git detaches here), got {other:?}",
+                args.join(" ")
+            ),
+        }
+    }
+}
+
+// The resolver half of finding A, pinned directly.
+#[test]
+fn resolver_reads_trailing_detach_after_positional_a17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "br", "--detach"])),
+        Some(CheckoutTarget::Detach(None))
+    );
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "br", "-d"])),
+        Some(CheckoutTarget::Detach(None))
+    );
+    // A commit-ish after the trailing flag is recorded as the detach point.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "br", "-d", "abc"])),
+        Some(CheckoutTarget::Detach(Some("abc".into())))
+    );
+    // Detach still wins even when a branch-naming option came first.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "-b", "new", "--detach"])),
+        Some(CheckoutTarget::Detach(None))
+    );
+}
+
+// Control: with NO trailing detach, `checkout <assigned>` is still a
+// same-branch no-op and must keep passing.
+#[test]
+fn plain_assigned_branch_checkout_still_allowed_a17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "assigned-br"])),
+        Some(CheckoutTarget::Branch("assigned-br".into()))
+    );
+    let binding = bound_binding("assigned-br", "/tmp/.worktrees/dev");
+    let action = classify(
+        "checkout",
+        &["checkout".into(), "assigned-br".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    assert!(
+        matches!(action, Action::ChdirPass(_)),
+        "same-branch checkout must still pass, got {action:?}"
+    );
+}
+
+// Finding B — `--track <ref>` DWIMs: git creates a local branch from the
+// ref's short name AND switches to it. The first revision classified `--track`
+// as a pathspec-valued option and returned `Stay`, under-denying the switch.
+// Real git (2.50.1): `git checkout --track origin/other` → "Switched to a new
+// branch 'other'".
+#[test]
+fn track_dwim_is_fenced_b17() {
+    // Long form (was `Stay` → pass) and short form must agree.
+    for (sub, args) in [
+        ("checkout", vec!["checkout", "--track", "origin/other"]),
+        ("switch", vec!["switch", "--track", "origin/topic"]),
+        ("switch", vec!["switch", "-t", "origin/topic"]),
+        ("checkout", vec!["checkout", "-t", "origin/other"]),
+    ] {
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let binding = bound_binding("agent/live", "/tmp/.worktrees/dev");
+        let action = classify(sub, &argv, &binding, false, false, false);
+        match action {
+            Action::Deny(reason) => assert!(
+                reason.contains("cross-branch"),
+                "`{}` DWIMs onto a new branch and must be fenced: {reason}",
+                args.join(" ")
+            ),
+            other => panic!(
+                "`{}` MUST deny (git switches branch here), got {other:?}",
+                args.join(" ")
+            ),
+        }
+    }
+}
+
+// The resolver half of finding B.
+//
+// PR #17 R3 superseded the round-1 expectation: `--track`/`-t` are VALUELESS
+// DWIM triggers, so the landed branch is derived from the positional, not
+// passed through. `origin/other` DWIMs to `other` (measured: real git
+// `git switch --track origin/topic` → `Switched to a new branch 'topic'`).
+#[test]
+fn resolver_reads_track_value_as_the_branch_b17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "--track", "origin/other"])),
+        Some(CheckoutTarget::Branch("other".into()))
+    );
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["switch", "-t", "origin/topic"])),
+        Some(CheckoutTarget::Branch("topic".into()))
+    );
+    // `--track=<v>` attached: modern git REJECTS this form
+    // (`option '--track' expects "direct" or "inherit"`), so the value is an
+    // operand, not a branch, and nothing lands off-branch.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["switch", "--track=direct"])),
+        Some(CheckoutTarget::Stay)
+    );
+}
+
+// Finding C — the pathspec-restore exemption was target-blind, so a bare
+// TRAILING `--` satisfied it and the new detach deny was unreachable.
+// Real git (2.50.1): `git checkout --detach HEAD --` → HEAD detached.
+#[test]
+fn trailing_double_dash_does_not_exempt_a_detach_c17() {
+    for args in [
+        vec!["checkout", "--detach", "HEAD", "--"],
+        vec!["checkout", "-q", "--detach", "HEAD", "--"],
+    ] {
+        let sub = args[0];
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let binding = bound_binding("assigned-br", "/tmp/.worktrees/dev");
+        let action = classify(sub, &argv, &binding, false, false, false);
+        match action {
+            Action::Deny(reason) => assert!(
+                reason.contains("detach HEAD"),
+                "`{}` detaches in real git; the trailing `--` must not exempt it: {reason}",
+                args.join(" ")
+            ),
+            other => panic!(
+                "`{}` MUST deny (git detaches here), got {other:?}",
+                args.join(" ")
+            ),
+        }
+    }
+}
+
+// Control for finding C: a genuine restore with a trailing `--` must STILL be
+// exempt. This is the recovery layer's documented snapshot restore
+// (`git checkout <snapshot-ref> -- .`) and the
+// snapshots.rs `checkout_pathspec_from_file_is_recoverable_review2` guard
+// depends on ops reaching the snapshotting layer.
+#[test]
+fn genuine_pathspec_restore_stays_exempt_c17() {
+    let binding = bound_binding("assigned-br", "/tmp/.worktrees/dev");
+    for args in [
+        vec!["checkout", "snapshot-ref", "--", "."],
+        vec!["checkout", "-q", "snapshot-ref", "--", "."],
+        vec!["checkout", "assigned-br", "--", "f.txt"],
+    ] {
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let action = classify("checkout", &argv, &binding, false, false, false);
+        assert!(
+            matches!(action, Action::ChdirPass(_)),
+            "`{}` is a restore and must stay exempt, got {action:?}",
+            args.join(" ")
+        );
+    }
+    // And `--pathspec-from-file` keeps its snapshot-layer reachability
+    // (snapshots.rs:973 guard).
+    let action = classify(
+        "checkout",
+        &["checkout".into(), "--pathspec-from-file=ps.txt".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    assert!(
+        matches!(action, Action::ChdirPass(_)),
+        "`checkout --pathspec-from-file=<f>` must reach the snapshot layer, got {action:?}"
+    );
+}
+
+// ── PR #17 rework round 2: F4, a valueless DWIM option ────────────────
+//
+// `--no-track` carries no operand, so the resolver treated it as an unknown
+// valueless flag and read the FOLLOWING POSITIONAL as the target. But git
+// routes `--no-track` through the same DWIM path as `--track`: it creates a
+// local branch from the positional's BASENAME and switches there. So the
+// branch git lands on is `live`, not the `agent/live` that was compared —
+// and since they compared EQUAL, the fence passed.
+
+// F4 — the fence must see the DWIM'd basename, not the raw positional.
+#[test]
+fn no_track_dwim_is_fenced_f4_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+
+    // assigned = `agent/live`; git lands on `live`, so this must NOT read as
+    // a same-branch no-op.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "--no-track", "agent/live"])),
+        Some(CheckoutTarget::Branch("live".into())),
+        "--no-track must DWIM to the basename, not pass the positional through"
+    );
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["switch", "--no-track", "agent/live"])),
+        Some(CheckoutTarget::Branch("live".into()))
+    );
+    // A noise flag in front must not change that.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "-q", "--no-track", "agent/live"])),
+        Some(CheckoutTarget::Branch("live".into()))
+    );
+
+    // End to end through classify(): assigned `agent/live`, so the DWIM'd
+    // `live` differs and the fence must fire.
+    let binding = bound_binding("agent/live", "/tmp/.worktrees/dev");
+    for args in [
+        vec!["checkout", "--no-track", "agent/live"],
+        vec!["switch", "--no-track", "agent/live"],
+        vec!["checkout", "-q", "--no-track", "agent/live"],
+    ] {
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let action = classify("checkout", &argv, &binding, false, false, false);
+        match action {
+            Action::Deny(reason) => assert!(
+                reason.contains("cross-branch"),
+                "`{}` DWIMs onto `live` and must be fenced: {reason}",
+                args.join(" ")
+            ),
+            other => panic!(
+                "`{}` MUST deny (git lands on `live`), got {other:?}",
+                args.join(" ")
+            ),
+        }
+    }
+}
+
+// F4 boundary: `--no-track` with NO positional names nothing — real git
+// errors (`fatal: --track needs a branch name`), so `Stay` is correct and
+// must not become a spurious deny.
+#[test]
+fn no_track_without_positional_stays_f4_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "--no-track"])),
+        Some(CheckoutTarget::Stay)
+    );
+}
+
+// F4 control: WITHOUT `--no-track`, the positional IS the branch, so the
+// same-branch case must still pass. This pins that the DWIM rewrite did not
+// break the ordinary path.
+#[test]
+fn plain_positional_without_no_track_still_compares_f4_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "agent/live"])),
+        Some(CheckoutTarget::Branch("agent/live".into()))
+    );
+    let binding = bound_binding("agent/live", "/tmp/.worktrees/dev");
+    let action = classify(
+        "checkout",
+        &["checkout".into(), "agent/live".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    assert!(
+        matches!(action, Action::ChdirPass(_)),
+        "plain same-branch checkout must still pass, got {action:?}"
+    );
+}
+
+// ── PR #17 R3: basename-DWIM across all six trigger shapes ─────────────
+//
+// Round 1's F4 fix modelled `--no-track` only. `--track` / `-t` are the SAME
+// DWIM path and were still passing: the resolver read the positional as the
+// target, compared `agent/live` against assigned `agent/live`, found them
+// equal, and passed — while git had moved HEAD to `live`.
+//
+// Note the test values use the daemon's real binding shape `<agent>/<slug>`:
+// a synthetic single-token branch would make the wrong comparison produce the
+// right answer by accident, which is exactly how this slipped through.
+
+// All six trigger shapes must DENY when the DWIM'd name differs from assigned.
+#[test]
+fn basename_dwim_all_six_shapes_fenced_r3_17() {
+    // assigned = `agent/live`; real git lands on `live` for every one of these.
+    for args in [
+        vec!["checkout", "--track", "agent/live"],
+        vec!["switch", "--track", "agent/live"],
+        vec!["checkout", "-t", "agent/live"],
+        vec!["switch", "-t", "agent/live"],
+        vec!["checkout", "--no-track", "agent/live"],
+        vec!["switch", "--no-track", "agent/live"],
+        // bundled short form
+        vec!["checkout", "-qt", "agent/live"],
+    ] {
+        let sub = args[0];
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let binding = bound_binding("agent/live", "/tmp/.worktrees/dev");
+        let action = classify(sub, &argv, &binding, false, false, false);
+        match action {
+            Action::Deny(reason) => assert!(
+                reason.contains("cross-branch"),
+                "`{}` DWIMs onto `live` and must be fenced: {reason}",
+                args.join(" ")
+            ),
+            other => panic!(
+                "`{}` MUST deny (git lands on `live`), got {other:?}",
+                args.join(" ")
+            ),
+        }
+    }
+}
+
+// The resolver half: every trigger shape must produce the DWIM'd name.
+#[test]
+fn resolver_derives_dwim_name_for_all_triggers_r3_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    for args in [
+        vec!["checkout", "--track", "agent/live"],
+        vec!["checkout", "-t", "agent/live"],
+        vec!["checkout", "--no-track", "agent/live"],
+    ] {
+        assert_eq!(
+            resolve_checkout_target_branch(&s(&args)),
+            Some(CheckoutTarget::Branch("live".into())),
+            "`{}` must derive the DWIM basename, not pass the positional through",
+            args.join(" ")
+        );
+    }
+}
+
+// The derivation rules themselves, each pinned against measured git 2.50.1
+// behaviour (see `derive_dwim_branch_name`'s doc).
+#[test]
+fn dwim_derivation_rules_r3_17() {
+    // `<remote>/X` strips only the remote segment, keeping the rest.
+    assert_eq!(
+        derive_dwim_branch_name("origin/team/feature"),
+        Some("team/feature".into())
+    );
+    assert_eq!(
+        derive_dwim_branch_name("origin/topic"),
+        Some("topic".into())
+    );
+    // Anything else with slashes falls back to the basename.
+    assert_eq!(derive_dwim_branch_name("agent/live"), Some("live".into()));
+    // A 40-hex commit-ish does NOT DWIM — git errors, so nothing is named.
+    assert_eq!(
+        derive_dwim_branch_name("0a1b2c3d4e5f60718293a4b5c6d7e8f901234567"),
+        None
+    );
+    assert_eq!(derive_dwim_branch_name("deadbeef"), None);
+    // A bare name has nothing to strip.
+    assert_eq!(derive_dwim_branch_name("live"), Some("live".into()));
+}
+
+// Rule 4 — a 40-hex positional after `--track` names nothing (git errors),
+// so it must NOT become a spurious deny.
+#[test]
+fn track_with_sha_names_nothing_r3_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&[
+            "checkout",
+            "--track",
+            "0a1b2c3d4e5f60718293a4b5c6d7e8f901234567"
+        ])),
+        Some(CheckoutTarget::Stay)
+    );
+}
+
+// Rule 5 — an explicit `-b`/`-c` wins over the DWIM, verbatim.
+#[test]
+fn explicit_branch_option_beats_dwim_r3_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&[
+            "checkout",
+            "--track",
+            "-b",
+            "my/custom",
+            "agent/live"
+        ])),
+        Some(CheckoutTarget::Branch("my/custom".into()))
+    );
+}
+
+// Rule 6 — `--track` with no positional names nothing (git: `--track needs a
+// branch name`), so `Stay`, not a deny.
+#[test]
+fn track_without_positional_names_nothing_r3_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "--track"])),
+        Some(CheckoutTarget::Stay)
+    );
+}
+
+// `--track=<v>` stays skipped — modern git rejects the attached form.
+#[test]
+fn track_attached_form_still_skipped_r3_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["switch", "--track=direct"])),
+        Some(CheckoutTarget::Stay)
+    );
+}
+
+// R3 acceptance criterion 2 — the three recovery paths must stay usable.
+#[test]
+fn recovery_paths_still_usable_r3_17() {
+    let binding = bound_binding("agent/live", "/tmp/.worktrees/dev");
+    // (a) `checkout <tree-ish> -- <pathspec>` restore
+    for args in [
+        vec!["checkout", "snapshot-ref", "--", "."],
+        vec!["checkout", "-q", "snapshot-ref", "--", "."],
+    ] {
+        let argv: Vec<String> = args.iter().map(|x| x.to_string()).collect();
+        let action = classify("checkout", &argv, &binding, false, false, false);
+        assert!(
+            matches!(action, Action::ChdirPass(_)),
+            "`{}` is a restore and must pass, got {action:?}",
+            args.join(" ")
+        );
+    }
+    // (b) `--pathspec-from-file` snapshot-layer reachability (snapshots.rs:973)
+    let action = classify(
+        "checkout",
+        &["checkout".into(), "--pathspec-from-file=ps.txt".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    assert!(
+        matches!(action, Action::ChdirPass(_)),
+        "`--pathspec-from-file` must reach the snapshot layer, got {action:?}"
+    );
+    // (c) plain same-branch checkout — the trigger refactor must not disturb it
+    let action = classify(
+        "checkout",
+        &["checkout".into(), "agent/live".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    assert!(
+        matches!(action, Action::ChdirPass(_)),
+        "same-branch checkout must pass, got {action:?}"
+    );
+}
+
+// Control: WITHOUT any trigger option the positional IS the branch, so the
+// same-branch case must still pass. Passes on both the pre-R3 and post-R3
+// resolver.
+#[test]
+fn plain_positional_without_trigger_still_compares_r3_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "agent/live"])),
+        Some(CheckoutTarget::Branch("agent/live".into()))
+    );
+}
+
+// ── PR #17 R4: `--` means different things to `switch` and `checkout` ───
+//
+// reviewer1's F1. `git switch -- <x>` is a BRANCH SWITCH in git, not a
+// pathspec restore; only `git switch`'s counterpart `git checkout -- <x>`
+// restores paths. The resolver broke out of its scan on `--` for BOTH
+// subcommands, so for `switch` it saw no positional at all and returned
+// `Stay` — passing a command that moves a bound agent off its branch.
+//
+// Measured with git 2.50.1 (Apple Git-155), a fresh repo per case, with
+// branch `team/feature` present and HEAD on `live`:
+//
+//   git switch -- team/feature            → Switched to branch 'team/feature'
+//   git switch --track -- team/feature    → Switched to a new branch 'feature'
+//   git switch --no-track -- team/feature → Switched to a new branch 'feature'
+//   git switch -t -- team/feature         → Switched to a new branch 'feature'
+//   git checkout -- f.txt                 → (restore; stays)
+//   git checkout -- team/feature          → error: pathspec ... ; stays
+//   git checkout --track -- team/feature  → fatal: --track needs a branch name
+
+// The three reported variants must DENY.
+#[test]
+fn switch_double_dash_positional_is_a_branch_f1_17() {
+    for args in [
+        vec!["switch", "--track", "--", "team/feature"],
+        vec!["switch", "--no-track", "--", "team/feature"],
+        vec!["switch", "-t", "--", "team/feature"],
+    ] {
+        let sub = args[0];
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let binding = bound_binding("live", "/tmp/.worktrees/dev");
+        let action = classify(sub, &argv, &binding, false, false, false);
+        match action {
+            Action::Deny(reason) => assert!(
+                reason.contains("cross-branch"),
+                "`{}` DWIMs onto `feature` in real git and must be fenced: {reason}",
+                args.join(" ")
+            ),
+            other => panic!(
+                "`{}` MUST deny (git lands on `feature`), got {other:?}",
+                args.join(" ")
+            ),
+        }
+    }
+}
+
+// The same shape with NO DWIM trigger also escapes — reviewer1 described it
+// only as the trigger variants, but `git switch -- <branch>` is a plain
+// branch switch on its own.
+#[test]
+fn switch_double_dash_bare_branch_is_a_switch_f1_17() {
+    let argv: Vec<String> = ["switch", "--", "team/feature"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let binding = bound_binding("live", "/tmp/.worktrees/dev");
+    let action = classify("switch", &argv, &binding, false, false, false);
+    match action {
+        Action::Deny(reason) => assert!(
+            reason.contains("cross-branch"),
+            "`switch -- <branch>` is a branch switch in real git and must be fenced: {reason}"
+        ),
+        other => panic!("`switch -- <branch>` MUST deny, got {other:?}"),
+    }
+}
+
+// The resolver half: `switch` continues past `--`, deriving the DWIM name.
+#[test]
+fn resolver_switch_reads_positional_after_double_dash_f1_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    // DWIM variants derive the basename of the post-`--` positional.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["switch", "--track", "--", "team/feature"])),
+        Some(CheckoutTarget::Branch("feature".into()))
+    );
+    // Without a trigger the positional IS the branch.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["switch", "--", "team/feature"])),
+        Some(CheckoutTarget::Branch("team/feature".into()))
+    );
+}
+
+// Control A: `checkout -- <pathspec>` must KEEP terminating the scan — this
+// is the recovery layer's documented snapshot restore
+// (`git checkout <snapshot-ref> -- .`) that #3479 was filed over.
+#[test]
+fn checkout_double_dash_still_terminates_f1_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "--", "README.md"])),
+        Some(CheckoutTarget::Stay)
+    );
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "snapshot-ref", "--", "."])),
+        Some(CheckoutTarget::Branch("snapshot-ref".into()))
+    );
+    // And the fence still exempts them.
+    let binding = bound_binding("live", "/tmp/.worktrees/dev");
+    for args in [
+        vec!["checkout", "--", "README.md"],
+        vec!["checkout", "snapshot-ref", "--", "."],
+        vec!["checkout", "-q", "snapshot-ref", "--", "."],
+    ] {
+        let argv: Vec<String> = args.iter().map(|x| x.to_string()).collect();
+        let action = classify("checkout", &argv, &binding, false, false, false);
+        assert!(
+            matches!(action, Action::ChdirPass(_)),
+            "`{}` is a restore and must stay exempt, got {action:?}",
+            args.join(" ")
+        );
+    }
+}
+
+// Control B: `switch -- <assigned>` is a no-op in git ("Already on 'live'")
+// and must keep passing.
+#[test]
+fn switch_double_dash_assigned_still_allowed_f1_17() {
+    let argv: Vec<String> = ["switch", "--", "live"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let binding = bound_binding("live", "/tmp/.worktrees/dev");
+    let action = classify("switch", &argv, &binding, false, false, false);
+    assert!(
+        matches!(action, Action::ChdirPass(_)),
+        "`switch -- <assigned>` stays on the branch in git and must pass, got {action:?}"
+    );
+}
+
+// The full `switch --` rule, not just reviewer1's three variants.
+//
+// `git switch` has NO pathspec-restore form: after `--` the first token is
+// always the branch start, never a path. Measured with git 2.50.1
+// (Apple Git-155), a fresh repo per case, with `f.txt` tracked and branches
+// `team/feature` / `other` present, HEAD on `live`:
+//
+//   git switch -- f.txt                 → fatal: invalid reference: f.txt
+//   git switch -- nosuchbranch          → fatal: invalid reference: nosuchbranch
+//   git switch -- other                 → Switched to branch 'other'
+//   git switch -- team/feature          → Switched to branch 'team/feature'
+//   git switch --detach -- other        → HEAD is now at ... two   (detached)
+//   git switch --detach -- team/feature → HEAD is now at ...       (detached)
+//   git switch -c newbr -- other        → Switched to a new branch 'newbr'
+//   git switch --track -- f.txt         → fatal: missing branch name; try -c
+//
+// So the rule is: `--` is transparent for `switch`; an explicit `--detach`
+// or `-c` still wins over whatever follows. This is why the resolver keeps
+// scanning for `switch` instead of terminating on `--`.
+#[test]
+fn switch_double_dash_full_rule_f1_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    // An existing branch after `--` is the target.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["switch", "--", "other"])),
+        Some(CheckoutTarget::Branch("other".into()))
+    );
+    // DWIM trigger before `--` still derives from the post-`--` token.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["switch", "--track", "--", "f.txt"])),
+        Some(CheckoutTarget::Branch("f.txt".into())),
+        "a 40-hex-style name is not derived here; `f.txt` is a plain basename"
+    );
+    // `--detach` wins over the post-`--` token — git detaches.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["switch", "--detach", "--", "team/feature"])),
+        Some(CheckoutTarget::Detach(Some("team/feature".into())))
+    );
+    // `-c` wins too: git creates and lands on `newbr`.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["switch", "-c", "newbr", "--", "other"])),
+        Some(CheckoutTarget::Branch("newbr".into()))
+    );
+}
+
+// A real file after `switch --` is NOT a restore — git rejects it outright.
+// The fence must still not treat it as a same-branch pass-through of a
+// checkout; denying is the safe direction and matches "switch never restores".
+#[test]
+fn switch_double_dash_file_is_not_a_restore_f1_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    let binding = bound_binding("live", "/tmp/.worktrees/dev");
+    // `--track -- f.txt`: git errors (missing branch name), but the derived
+    // name is `f.txt` ≠ assigned, so the fence denies. Fail-closed.
+    let argv: Vec<String> = ["switch", "--track", "--", "f.txt"]
+        .iter()
+        .map(|x| x.to_string())
+        .collect();
+    let action = classify("switch", &argv, &binding, false, false, false);
+    assert!(
+        matches!(action, Action::Deny(_)),
+        "`switch --track -- f.txt` must not pass as a no-op, got {action:?}"
+    );
+}
+
+// ── PR #17 R5: the DWIM derivation must not depend on argv order ───────
+//
+// F5: `git checkout <assigned> --track` created and landed on a
+// basename-derived branch while the fence passed, because the derivation ran
+// only when a positional arrived — and `--track` came later, so the already
+// stored token was never re-derived. git's DWIM is order-independent:
+//
+//   git checkout --track agent/live     → Switched to a new branch 'live'
+//   git checkout agent/live --track     → Switched to a new branch 'live'
+//
+// Both orderings must produce the same derived name.
+#[test]
+fn dwim_is_order_independent_f5_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    // Trigger BEFORE the positional (R3 order).
+    for lead in [["--track"], ["-t"], ["--no-track"]] {
+        let mut argv: Vec<&str> = vec!["checkout", lead[0], "agent/live"];
+        argv[0] = "checkout";
+        let expected = Some(CheckoutTarget::Branch("live".into()));
+        assert_eq!(
+            resolve_checkout_target_branch(&s(&argv)),
+            expected,
+            "trigger-first `{}` must derive `live`",
+            argv.join(" ")
+        );
+    }
+    // Trigger AFTER the positional (F5) — same result, both subcommands.
+    for args in [
+        vec!["checkout", "agent/live", "--track"],
+        vec!["checkout", "agent/live", "-t"],
+        vec!["checkout", "agent/live", "--no-track"],
+        vec!["checkout", "-q", "agent/live", "--track"],
+        vec!["switch", "agent/live", "--track"],
+        vec!["switch", "agent/live", "-t"],
+        vec!["switch", "agent/live", "--no-track"],
+    ] {
+        assert_eq!(
+            resolve_checkout_target_branch(&s(&args)),
+            Some(CheckoutTarget::Branch("live".into())),
+            "trigger-last `{}` must derive the SAME `live` as trigger-first",
+            args.join(" ")
+        );
+    }
+}
+
+// The fence consequence: every F5 shape must DENY, not PASS.
+#[test]
+fn dwim_reverse_ordering_fenced_f5_17() {
+    for (sub, args) in [
+        ("checkout", vec!["checkout", "agent/live", "--track"]),
+        ("checkout", vec!["checkout", "agent/live", "-t"]),
+        ("checkout", vec!["checkout", "agent/live", "--no-track"]),
+        ("checkout", vec!["checkout", "-q", "agent/live", "--track"]),
+        ("switch", vec!["switch", "agent/live", "--track"]),
+        ("switch", vec!["switch", "agent/live", "-t"]),
+        ("switch", vec!["switch", "agent/live", "--no-track"]),
+    ] {
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let binding = bound_binding("agent/live", "/tmp/.worktrees/dev");
+        let action = classify(sub, &argv, &binding, false, false, false);
+        match action {
+            Action::Deny(reason) => assert!(
+                reason.contains("cross-branch"),
+                "`{}` DWIMs onto `live` and must be fenced: {reason}",
+                args.join(" ")
+            ),
+            other => panic!(
+                "`{}` MUST deny (git lands on `live`), got {other:?}",
+                args.join(" ")
+            ),
+        }
+    }
+}
+
+// Structural, not incidental: the derivation runs once, after the scan, so
+// moving the trigger anywhere in the argv cannot change the result. This
+// pins that property across positions the review rounds did not enumerate.
+#[test]
+fn dwim_trigger_position_cannot_change_result_f5_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    let expected = Some(CheckoutTarget::Branch("live".into()));
+    for args in [
+        vec!["checkout", "--track", "agent/live"],
+        vec!["checkout", "agent/live", "--track"],
+        vec!["checkout", "-q", "--track", "agent/live"],
+        vec!["checkout", "--track", "-q", "agent/live"],
+        vec!["checkout", "-q", "agent/live", "--track"],
+        vec!["checkout", "--force", "agent/live", "--track"],
+        vec!["switch", "--track", "agent/live"],
+        vec!["switch", "agent/live", "--track"],
+        vec!["switch", "--no-track", "agent/live"],
+        vec!["switch", "agent/live", "--no-track"],
+        // after `switch`'s transparent `--`
+        vec!["switch", "agent/live", "--", "--track"],
+        vec!["switch", "--", "agent/live", "--track"],
+    ] {
+        assert_eq!(
+            resolve_checkout_target_branch(&s(&args)),
+            expected,
+            "trigger position in `{}` must not change the derived name",
+            args.join(" ")
+        );
+    }
+}
+
+// Control: WITHOUT a trigger, order is irrelevant and the positional IS the
+// branch — so the same-branch case still passes. Passes on both the pre-R5
+// and post-R5 resolver.
+#[test]
+fn no_trigger_position_is_irrelevant_f5_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "agent/live", "-q"])),
+        Some(CheckoutTarget::Branch("agent/live".into()))
+    );
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "-q", "agent/live"])),
+        Some(CheckoutTarget::Branch("agent/live".into()))
+    );
+    let binding = bound_binding("agent/live", "/tmp/.worktrees/dev");
+    let action = classify(
+        "checkout",
+        &["checkout".into(), "agent/live".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    assert!(
+        matches!(action, Action::ChdirPass(_)),
+        "same-branch checkout must still pass, got {action:?}"
+    );
+}
+
+#[test]
+fn target_branch_resolution_skips_options_and_their_values_12() {
+    // Unit-level pin on the parser itself, independent of classify's
+    // fence: each case is (argv tail, expected target).
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+
+    // Options are skipped; the following positional is the target.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "-q", "abc123"])),
+        Some(CheckoutTarget::Branch("abc123".into()))
+    );
+    // `-q` takes no value, so with nothing positional after it the invocation
+    // names no target and stays on the bound branch.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "-q"])),
+        Some(CheckoutTarget::Stay)
+    );
+    // `--detach` / `-d` classify as a detach, not a branch named `--detach`.
+    // The commit-ish after the flag is carried for the deny message, not
+    // compared against the assigned branch.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "--detach", "abc"])),
+        Some(CheckoutTarget::Detach(Some("abc".into())))
+    );
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "-d"])),
+        Some(CheckoutTarget::Detach(None))
+    );
+    // `-c <name>` / `-C <name>` / `--orphan <name>` consume their value as the
+    // branch that would be created and landed on.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "-b", "new"])),
+        Some(CheckoutTarget::Branch("new".into()))
+    );
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "--orphan", "orph"])),
+        Some(CheckoutTarget::Branch("orph".into()))
+    );
+    // Bundled `-qd`: `d` is a DETACH flag here, not an attached branch name.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "-qd"])),
+        Some(CheckoutTarget::Detach(None))
+    );
+    // Bundled `-qb name`: `b` takes a value.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "-qb", "new"])),
+        Some(CheckoutTarget::Branch("new".into()))
+    );
+    // No subcommand at all — nothing to judge.
+    assert_eq!(resolve_checkout_target_branch(&s(&[])), None);
+    // Only options, none of which leave the branch.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "-q", "--progress"])),
+        Some(CheckoutTarget::Stay)
+    );
+}
+
+#[test]
+fn gh_post_merge_exemption_survives_flag_prefix_12() {
+    // The Track-D exemption must keep working through a noise flag:
+    // `gh` post-merge cleanup with `-q` must still be SilentExempt, not deny.
+    // Without this the #12 fix would regress the Track D path.
+    let binding = bound_binding("sprint57-track-k", "/tmp/.worktrees/dev");
+    let action = classify(
+        "checkout",
+        &["checkout".into(), "-q".into(), "main".into()],
+        &binding,
+        true, // parent_is_gh
+        false,
+        false,
+    );
+    assert!(
+        matches!(action, Action::SilentExempt { .. }),
+        "gh post-merge `checkout -q main` must stay exempt, got {action:?}"
+    );
+}
+
+#[test]
+
 fn gh_invocation_detection_robust_against_simulated_external_invocation() {
     // The detection helper must reject `gh`-lookalike basenames
     // that aren't the canonical CLI binary. This pins the
