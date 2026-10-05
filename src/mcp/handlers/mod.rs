@@ -335,3 +335,11 @@ mod review_repro_mcp_ci_worktree;
 #[cfg(test)]
 #[path = "dispatch_hook/review_repro_mcp_dispatch_comms.rs"]
 mod review_repro_mcp_dispatch_hook;
+
+// #15: the typed receipt's active-assignment subject guard names the diverging
+// column, so a head advance and a review-class divergence (opposite correct
+// next steps) reach the caller distinguishable. Sibling file per the
+// p0b_tests / instance_964_tests precedent.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod review_repro_issue15_subject_mismatch;
