@@ -1028,6 +1028,13 @@ const CHECKOUT_DWIM_TRIGGER_OPTS: &[&str] = &["track", "no-track"];
 /// Derive the branch name git actually lands on when `--track`/`-t`/
 /// `--no-track` is combined with the positional `spec`.
 ///
+/// This models the DWIM **path** — how the branch name is derived from argv —
+/// not the DWIM **outcome**. For inputs such as a hex string that is not a
+/// 40-hex object name, or a full `refs/...` spelling, it may derive a name
+/// where git in fact creates no branch at all. Every such divergence
+/// currently collapses to a deny (fail-closed); there is no under-deny. A
+/// future caller must not read its `Some(_)` as "git will create this branch".
+///
 /// Measured against git 2.50.1 (Apple Git-155), one fresh repo per case:
 ///
 ///   - a 40-hex SHA does NOT DWIM — git reports
@@ -1109,10 +1116,30 @@ pub(crate) fn resolve_checkout_target_branch(args: &[String]) -> Option<Checkout
     // (non-existent) operand. Presence only — the derived name is filled in
     // when the positional arrives (PR #17 R3).
     let mut dwim_trigger = false;
+    // PR #17 R4: `--` is NOT the same terminator for both subcommands.
+    //
+    //   git checkout -- <path>   → pathspec restore (does NOT switch branch)
+    //   git switch   -- <name>   → a BRANCH SWITCH
+    //
+    // Measured with git 2.50.1 (Apple Git-155):
+    //   git switch -- team/feature            → Switched to branch 'team/feature'
+    //   git switch --track -- team/feature    → Switched to a new branch 'feature'
+    //   git checkout -- f.txt                 → (restore; HEAD unchanged)
+    //
+    // Treating both alike let `switch` escape the fence, because the scan
+    // ended before any positional was seen and the resolver returned `Stay`.
+    let is_switch = args.first().is_some_and(|s| s == "switch");
 
     while let Some(tok) = rest.next() {
         if tok == "--" {
-            // Everything after is a pathspec, never a target.
+            // `checkout` treats everything after `--` as pathspec and never
+            // switches branch — stop scanning (this is what protects the
+            // `checkout <tree-ish> -- <pathspec>` recovery path). `switch`
+            // instead treats the first post-`--` token as the branch, so it
+            // keeps scanning (PR #17 R4).
+            if is_switch {
+                continue;
+            }
             break;
         }
         if !tok.starts_with('-') || tok == "-" {
