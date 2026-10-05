@@ -130,8 +130,7 @@ fn typed_review_params(assignment_id: uuid::Uuid) -> Value {
 /// `handle_report_result` is the production path a reviewer's verdict takes
 /// (`request_kind: "report"` → `send`'s report arm).
 fn report_via_real_entry(home: &Path, assignment_id: uuid::Uuid) -> Value {
-    let sender =
-        crate::identity::Sender::new("typed-reviewer").expect("reviewer identity");
+    let sender = crate::identity::Sender::new("typed-reviewer").expect("reviewer identity");
     crate::mcp::handlers::comms::handle_report_result(
         home,
         &typed_review_params(assignment_id),
