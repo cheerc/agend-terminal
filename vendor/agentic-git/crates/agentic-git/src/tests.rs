@@ -1602,6 +1602,71 @@ fn switch_double_dash_assigned_still_allowed_f1_17() {
     );
 }
 
+// The full `switch --` rule, not just reviewer1's three variants.
+//
+// `git switch` has NO pathspec-restore form: after `--` the first token is
+// always the branch start, never a path. Measured with git 2.50.1
+// (Apple Git-155), a fresh repo per case, with `f.txt` tracked and branches
+// `team/feature` / `other` present, HEAD on `live`:
+//
+//   git switch -- f.txt                 → fatal: invalid reference: f.txt
+//   git switch -- nosuchbranch          → fatal: invalid reference: nosuchbranch
+//   git switch -- other                 → Switched to branch 'other'
+//   git switch -- team/feature          → Switched to branch 'team/feature'
+//   git switch --detach -- other        → HEAD is now at ... two   (detached)
+//   git switch --detach -- team/feature → HEAD is now at ...       (detached)
+//   git switch -c newbr -- other        → Switched to a new branch 'newbr'
+//   git switch --track -- f.txt         → fatal: missing branch name; try -c
+//
+// So the rule is: `--` is transparent for `switch`; an explicit `--detach`
+// or `-c` still wins over whatever follows. This is why the resolver keeps
+// scanning for `switch` instead of terminating on `--`.
+#[test]
+fn switch_double_dash_full_rule_f1_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    // An existing branch after `--` is the target.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["switch", "--", "other"])),
+        Some(CheckoutTarget::Branch("other".into()))
+    );
+    // DWIM trigger before `--` still derives from the post-`--` token.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["switch", "--track", "--", "f.txt"])),
+        Some(CheckoutTarget::Branch("f.txt".into())),
+        "a 40-hex-style name is not derived here; `f.txt` is a plain basename"
+    );
+    // `--detach` wins over the post-`--` token — git detaches.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["switch", "--detach", "--", "team/feature"])),
+        Some(CheckoutTarget::Detach(Some("team/feature".into())))
+    );
+    // `-c` wins too: git creates and lands on `newbr`.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["switch", "-c", "newbr", "--", "other"])),
+        Some(CheckoutTarget::Branch("newbr".into()))
+    );
+}
+
+// A real file after `switch --` is NOT a restore — git rejects it outright.
+// The fence must still not treat it as a same-branch pass-through of a
+// checkout; denying is the safe direction and matches "switch never restores".
+#[test]
+fn switch_double_dash_file_is_not_a_restore_f1_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    let binding = bound_binding("live", "/tmp/.worktrees/dev");
+    // `--track -- f.txt`: git errors (missing branch name), but the derived
+    // name is `f.txt` ≠ assigned, so the fence denies. Fail-closed.
+    let argv: Vec<String> = ["switch", "--track", "--", "f.txt"]
+        .iter()
+        .map(|x| x.to_string())
+        .collect();
+    let action = classify("switch", &argv, &binding, false, false, false);
+    assert!(
+        matches!(action, Action::Deny(_)),
+        "`switch --track -- f.txt` must not pass as a no-op, got {action:?}"
+    );
+}
+
 #[test]
 fn target_branch_resolution_skips_options_and_their_values_12() {
     // Unit-level pin on the parser itself, independent of classify's
