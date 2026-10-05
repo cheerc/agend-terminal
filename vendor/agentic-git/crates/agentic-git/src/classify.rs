@@ -696,6 +696,11 @@ pub(crate) fn classify(
             // leave `target_branch` empty, which the is_empty() guard below
             // used to treat as "no target". Detach is now handled explicitly;
             // only a genuinely malformed invocation stays permissive.
+            // PR #17 review (dual REJECTED) finding C: this exemption used to
+            // be checked target-blind, so a bare TRAILING `--` satisfied it
+            // and the resolver's detach deny was never reached. Real git:
+            // `git checkout --detach HEAD --` DOES detach, so the trailing
+            // `--` must not neutralise the detach.
             let is_pathspec_restore =
                 args.first().is_some_and(|s| s == "checkout") && args.iter().any(|a| a == "--");
             // Check for cross-branch attempt.
@@ -712,7 +717,11 @@ pub(crate) fn classify(
                     Some(CheckoutTarget::Detach(_)) => true,
                     Some(CheckoutTarget::Stay) | None => false,
                 };
-                if !is_pathspec_restore && leaves_branch {
+                // A detach is NOT a pathspec restore, so it never qualifies
+                // for the exemption (PR #17 finding C).
+                let restore_exempt =
+                    is_pathspec_restore && !matches!(target, Some(CheckoutTarget::Detach(_)));
+                if !restore_exempt && leaves_branch {
                     // Sprint 57 Wave 2 Track D: gh post-merge cleanup exemption.
                     if is_gh_post_merge_cleanup_checkout(target_branch, parent_is_gh) {
                         return Action::SilentExempt {
@@ -1005,32 +1014,45 @@ pub(crate) enum CheckoutTarget {
 
 /// Long options whose value names the BRANCH this invocation lands on.
 /// Names are matched WITHOUT the leading `--` (the parser strips it).
-const CHECKOUT_BRANCH_VALUE_OPTS: &[&str] = &["branch", "orphan"];
-/// Long options whose value is a PATHSPEC / SOURCE ref, never a branch to
-/// land on. `track` names the upstream to track (the branch itself stays a
-/// positional); `pathspec-from-file` names a file.
-const CHECKOUT_PATHSPEC_VALUE_OPTS: &[&str] = &["pathspec-from-file", "track"];
+const CHECKOUT_BRANCH_VALUE_OPTS: &[&str] = &["branch", "orphan", "track"];
+/// Long options whose value is a PATHSPEC list, never a branch to land on.
+/// `pathspec-from-file` names a file. (`track` was here in the first #12
+/// revision and was wrong — see `resolve_checkout_target_branch`.)
+const CHECKOUT_PATHSPEC_VALUE_OPTS: &[&str] = &["pathspec-from-file"];
 
-/// Resolve what a `checkout`/`switch` argv does to the current branch, by
-/// walking the option tokens instead of trusting `args[1]`.
+/// Resolve what a `checkout`/`switch` argv does to the current branch.
 ///
-/// Option handling mirrors what real git does (verified against the git
-/// binary, not guessed):
+/// Scans the WHOLE argv before deciding (it does not stop at the first
+/// positional — an early revision did, which under-denied
+/// `checkout <assigned> --detach`; see the doc note below). Returns:
+///
+///   * `Branch(name)` — lands on a named branch (existing or newly created)
+///   * `Detach(at)`   — leaves the bound branch for a detached HEAD
+///   * `Stay`         — names no target; only non-moving options
+///
+/// Option handling mirrors what real git does. Every rule below was checked
+/// against the git binary (2.50.1, Apple Git-155), not assumed:
+///
 ///   - a value-taking option CONSUMES the next token, so `switch -c <new>`
-///     yields `<new>` — the branch it creates and lands on — rather than
-///     stopping at nothing;
-///   - `--detach`/`-d` is a Detach, not a branch literally named `--detach`;
-///   - short flags BUNDLE, so `-qd` is detach (the `d` is a flag) while
-///     `-catt` creates a branch named `att` (verified: git switch -catt
-///     really does create `att`);
+///     yields `<new>` — the branch it creates and lands on;
+///   - `--detach`/`-d` is a Detach, not a branch named `--detach`. It is
+///     honoured wherever it appears, INCLUDING AFTER a positional:
+///     `git checkout <branch> --detach` really does detach;
+///   - short flags BUNDLE: `git switch -qd` detaches (the `d` is a flag)
+///     while `git switch -catt` creates a branch named `att`;
+///   - `--track <ref>` / `-t <ref>` DWIM: git creates a local branch from
+///     the ref's short name AND switches to it, so the ref IS the target.
+///     The `--track=<v>` attached form is NOT a branch — modern git rejects
+///     it outright (`option '--track' expects "direct" or "inherit"`), so
+///     its value is skipped like any other option operand;
 ///   - `--branch=<n>` / `-c<n>` carry an attached value; a bare `-` is git's
 ///     "previous branch" shorthand and is a real target;
 ///   - a bare `--` terminates options; everything after it is a pathspec.
 ///
 /// Fail-closed on unknown options: an unrecognised flag is treated as
 /// value-less, so a following positional is still read as the target. That
-/// over-denies a same-branch checkout rather than under-denying a switch,
-/// and the deny message already steers that case to `git restore`.
+/// over-denies a same-branch checkout rather than under-denying a switch, and
+/// the deny message steers that case to `git restore`.
 pub(crate) fn resolve_checkout_target_branch(args: &[String]) -> Option<CheckoutTarget> {
     if args.len() < 2 {
         // No subcommand token, or nothing after it — nothing to judge.
@@ -1038,7 +1060,11 @@ pub(crate) fn resolve_checkout_target_branch(args: &[String]) -> Option<Checkout
     }
     // args[0] is the subcommand itself; classification is over the tail.
     let mut rest = args.iter().skip(1);
+    // Outcome accumulators, resolved after the full scan.
     let mut detached = false;
+    let mut detach_at: Option<String> = None;
+    let mut named_branch: Option<String> = None;
+    let mut first_positional: Option<String> = None;
 
     while let Some(tok) = rest.next() {
         if tok == "--" {
@@ -1046,14 +1072,20 @@ pub(crate) fn resolve_checkout_target_branch(args: &[String]) -> Option<Checkout
             break;
         }
         if !tok.starts_with('-') || tok == "-" {
-            // A positional after a detach flag is the commit-ish to detach
-            // AT, not a branch to land on — so it must not be compared
-            // against the assigned branch name.
+            // A positional following a detach flag is the commit-ish to
+            // detach AT, not a branch to land on.
             if detached {
-                return Some(CheckoutTarget::Detach(Some(tok.clone())));
+                detach_at.get_or_insert_with(|| tok.clone());
+                continue;
             }
-            // First positional wins; a later one is a pathspec, not a target.
-            return Some(CheckoutTarget::Branch(tok.clone()));
+            if first_positional.is_none() {
+                first_positional = Some(tok.clone());
+            } else {
+                // Two positionals: the second is a pathspec, so the first is
+                // the only target. Nothing further can change the outcome.
+                break;
+            }
+            continue;
         }
 
         if let Some(long) = tok.strip_prefix("--") {
@@ -1067,11 +1099,16 @@ pub(crate) fn resolve_checkout_target_branch(args: &[String]) -> Option<Checkout
                 // invocation lands on (`--branch <n>` / `--branch=<n>`).
                 name if CHECKOUT_BRANCH_VALUE_OPTS.contains(&name) => {
                     if let Some(v) = attached {
-                        return Some(CheckoutTarget::Branch(v));
+                        // `--track=<v>` lands here: modern git REJECTS that
+                        // form (`--track` expects "direct"/"inherit"), so its
+                        // value is an operand, not a branch. Skip it.
+                        if name == "track" {
+                            continue;
+                        }
+                        named_branch.get_or_insert(v);
+                    } else if let Some(v) = rest.next() {
+                        named_branch.get_or_insert_with(|| v.clone());
                     }
-                    return rest
-                        .next()
-                        .map(|v| CheckoutTarget::Branch(v.clone()));
                 }
                 // An option whose value is a PATHSPEC list, never a branch.
                 // `--pathspec-from-file=<f>` names a file, and returning it
@@ -1079,22 +1116,20 @@ pub(crate) fn resolve_checkout_target_branch(args: &[String]) -> Option<Checkout
                 // snapshots.rs `checkout_pathspec_from_file_is_recoverable_
                 // review2` guards (impl-review round 2, fugu) — the op must
                 // reach the snapshotting layer, not read as a branch switch.
-                name if CHECKOUT_PATHSPEC_VALUE_OPTS.contains(&name) => {
-                    if attached.is_none() {
-                        // Bare form consumes the following token.
-                        rest.next();
-                    }
+                // The bare form consumes the following token; the attached
+                // `--opt=value` form already carries it.
+                name if attached.is_none() && CHECKOUT_PATHSPEC_VALUE_OPTS.contains(&name) => {
+                    rest.next();
                 }
-                // Any other option carrying `=value`: the value is this
-                // option's operand, not a branch.
-                _ => {
-                    let _ = attached;
-                }
+                name if CHECKOUT_PATHSPEC_VALUE_OPTS.contains(&name) => {}
+                // Any other option: its `=value` is this option's operand,
+                // never a branch.
+                _ => {}
             }
             continue;
         }
 
-        // Short cluster: `-qd`, `-catt`, `-b`, `-`.
+        // Short cluster: `-qd`, `-catt`, `-b`, `-t`, `-`.
         let flags: Vec<char> = tok.chars().skip(1).collect();
         for (i, flag) in flags.iter().enumerate() {
             match flag {
@@ -1104,23 +1139,32 @@ pub(crate) fn resolve_checkout_target_branch(args: &[String]) -> Option<Checkout
                     if attached.is_empty() {
                         // Value is the next token; `-c` with nothing after is
                         // malformed and names no target.
-                        return rest
-                            .next()
-                            .map(|v| CheckoutTarget::Branch(v.clone()));
+                        if let Some(v) = rest.next() {
+                            named_branch.get_or_insert_with(|| v.clone());
+                        }
+                    } else {
+                        // `-catt` — an attached value, not another flag cluster.
+                        named_branch.get_or_insert(attached);
                     }
-                    // `-catt` — an attached value, not another flag cluster.
-                    return Some(CheckoutTarget::Branch(attached));
+                    break;
                 }
                 _ => {}
             }
         }
     }
 
+    // Precedence: a detach always leaves the bound branch, even when a
+    // positional named the assigned branch (`checkout <assigned> --detach`).
     if detached {
-        Some(CheckoutTarget::Detach(None))
-    } else {
-        Some(CheckoutTarget::Stay)
+        return Some(CheckoutTarget::Detach(detach_at));
     }
+    // An explicit branch-naming option outranks a bare positional: for
+    // `--track <ref>` DWIM the ref IS what git lands on.
+    let branch = named_branch.or(first_positional);
+    Some(match branch {
+        Some(b) => CheckoutTarget::Branch(b),
+        None => CheckoutTarget::Stay,
+    })
 }
 
 /// #852: agent callers must NOT use the #778 Option-3 leniency below. The

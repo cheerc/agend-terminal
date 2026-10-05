@@ -683,7 +683,6 @@ fn cross_branch_to_non_protected_target_never_exempted() {
     }
 }
 
-#[test]
 // ── #12: the cross-branch fence must survive flag-prefixed checkout/switch ──
 //
 // Pre-#12 the fence read `args.get(1)` verbatim, so ANY option token in the
@@ -979,6 +978,207 @@ fn pathspec_from_file_option_is_not_a_branch_12() {
     assert!(
         matches!(action, Action::ChdirPass(_)),
         "`checkout --pathspec-from-file=<f>` must pass through to the snapshot layer, got {action:?}"
+    );
+}
+
+// ── PR #17 rework: three under-deny shapes the dual review found ───────
+//
+// The first #12 revision closed the four reported bypasses but a dual review
+// (real-git-verified) found three more, all reachable with one extra token.
+// Each test below names the finding and cites the observed git behaviour.
+
+// Finding A — the resolver used to return at the FIRST positional, so a
+// trailing detach flag was never parsed. Real git (2.50.1):
+// `git checkout assigned --detach` → HEAD detached.
+#[test]
+fn trailing_detach_after_assigned_branch_is_fenced_a17() {
+    for args in [
+        vec!["checkout", "assigned-br", "--detach"],
+        vec!["checkout", "assigned-br", "-d"],
+        vec!["checkout", "assigned-br", "-qd"],
+        vec!["checkout", "-q", "assigned-br", "--detach"],
+        vec!["switch", "assigned-br", "-d"],
+        vec!["switch", "-q", "assigned-br", "--detach"],
+    ] {
+        let sub = args[0];
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let binding = bound_binding("assigned-br", "/tmp/.worktrees/dev");
+        let action = classify(sub, &argv, &binding, false, false, false);
+        match action {
+            Action::Deny(reason) => assert!(
+                reason.contains("detach HEAD"),
+                "`{}` leaves the bound branch and must be fenced as a detach: {reason}",
+                args.join(" ")
+            ),
+            other => panic!(
+                "`{}` MUST deny (git detaches here), got {other:?}",
+                args.join(" ")
+            ),
+        }
+    }
+}
+
+// The resolver half of finding A, pinned directly.
+#[test]
+fn resolver_reads_trailing_detach_after_positional_a17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "br", "--detach"])),
+        Some(CheckoutTarget::Detach(None))
+    );
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "br", "-d"])),
+        Some(CheckoutTarget::Detach(None))
+    );
+    // A commit-ish after the trailing flag is recorded as the detach point.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "br", "-d", "abc"])),
+        Some(CheckoutTarget::Detach(Some("abc".into())))
+    );
+    // Detach still wins even when a branch-naming option came first.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "-b", "new", "--detach"])),
+        Some(CheckoutTarget::Detach(None))
+    );
+}
+
+// Control: with NO trailing detach, `checkout <assigned>` is still a
+// same-branch no-op and must keep passing.
+#[test]
+fn plain_assigned_branch_checkout_still_allowed_a17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "assigned-br"])),
+        Some(CheckoutTarget::Branch("assigned-br".into()))
+    );
+    let binding = bound_binding("assigned-br", "/tmp/.worktrees/dev");
+    let action = classify(
+        "checkout",
+        &["checkout".into(), "assigned-br".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    assert!(
+        matches!(action, Action::ChdirPass(_)),
+        "same-branch checkout must still pass, got {action:?}"
+    );
+}
+
+// Finding B — `--track <ref>` DWIMs: git creates a local branch from the
+// ref's short name AND switches to it. The first revision classified `--track`
+// as a pathspec-valued option and returned `Stay`, under-denying the switch.
+// Real git (2.50.1): `git checkout --track origin/other` → "Switched to a new
+// branch 'other'".
+#[test]
+fn track_dwim_is_fenced_b17() {
+    // Long form (was `Stay` → pass) and short form must agree.
+    for (sub, args) in [
+        ("checkout", vec!["checkout", "--track", "origin/other"]),
+        ("switch", vec!["switch", "--track", "origin/topic"]),
+        ("switch", vec!["switch", "-t", "origin/topic"]),
+        ("checkout", vec!["checkout", "-t", "origin/other"]),
+    ] {
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let binding = bound_binding("agent/live", "/tmp/.worktrees/dev");
+        let action = classify(sub, &argv, &binding, false, false, false);
+        match action {
+            Action::Deny(reason) => assert!(
+                reason.contains("cross-branch"),
+                "`{}` DWIMs onto a new branch and must be fenced: {reason}",
+                args.join(" ")
+            ),
+            other => panic!(
+                "`{}` MUST deny (git switches branch here), got {other:?}",
+                args.join(" ")
+            ),
+        }
+    }
+}
+
+// The resolver half of finding B.
+#[test]
+fn resolver_reads_track_value_as_the_branch_b17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "--track", "origin/other"])),
+        Some(CheckoutTarget::Branch("origin/other".into()))
+    );
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["switch", "-t", "origin/topic"])),
+        Some(CheckoutTarget::Branch("origin/topic".into()))
+    );
+    // `--track=<v>` attached: modern git REJECTS this form
+    // (`option '--track' expects "direct" or "inherit"`), so the value is an
+    // operand, not a branch, and nothing lands off-branch.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["switch", "--track=direct"])),
+        Some(CheckoutTarget::Stay)
+    );
+}
+
+// Finding C — the pathspec-restore exemption was target-blind, so a bare
+// TRAILING `--` satisfied it and the new detach deny was unreachable.
+// Real git (2.50.1): `git checkout --detach HEAD --` → HEAD detached.
+#[test]
+fn trailing_double_dash_does_not_exempt_a_detach_c17() {
+    for args in [
+        vec!["checkout", "--detach", "HEAD", "--"],
+        vec!["checkout", "-q", "--detach", "HEAD", "--"],
+    ] {
+        let sub = args[0];
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let binding = bound_binding("assigned-br", "/tmp/.worktrees/dev");
+        let action = classify(sub, &argv, &binding, false, false, false);
+        match action {
+            Action::Deny(reason) => assert!(
+                reason.contains("detach HEAD"),
+                "`{}` detaches in real git; the trailing `--` must not exempt it: {reason}",
+                args.join(" ")
+            ),
+            other => panic!(
+                "`{}` MUST deny (git detaches here), got {other:?}",
+                args.join(" ")
+            ),
+        }
+    }
+}
+
+// Control for finding C: a genuine restore with a trailing `--` must STILL be
+// exempt. This is the recovery layer's documented snapshot restore
+// (`git checkout <snapshot-ref> -- .`) and the
+// snapshots.rs `checkout_pathspec_from_file_is_recoverable_review2` guard
+// depends on ops reaching the snapshotting layer.
+#[test]
+fn genuine_pathspec_restore_stays_exempt_c17() {
+    let binding = bound_binding("assigned-br", "/tmp/.worktrees/dev");
+    for args in [
+        vec!["checkout", "snapshot-ref", "--", "."],
+        vec!["checkout", "-q", "snapshot-ref", "--", "."],
+        vec!["checkout", "assigned-br", "--", "f.txt"],
+    ] {
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let action = classify("checkout", &argv, &binding, false, false, false);
+        assert!(
+            matches!(action, Action::ChdirPass(_)),
+            "`{}` is a restore and must stay exempt, got {action:?}",
+            args.join(" ")
+        );
+    }
+    // And `--pathspec-from-file` keeps its snapshot-layer reachability
+    // (snapshots.rs:973 guard).
+    let action = classify(
+        "checkout",
+        &["checkout".into(), "--pathspec-from-file=ps.txt".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    assert!(
+        matches!(action, Action::ChdirPass(_)),
+        "`checkout --pathspec-from-file=<f>` must reach the snapshot layer, got {action:?}"
     );
 }
 
