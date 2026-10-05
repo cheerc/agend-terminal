@@ -1098,16 +1098,21 @@ fn track_dwim_is_fenced_b17() {
 }
 
 // The resolver half of finding B.
+//
+// PR #17 R3 superseded the round-1 expectation: `--track`/`-t` are VALUELESS
+// DWIM triggers, so the landed branch is derived from the positional, not
+// passed through. `origin/other` DWIMs to `other` (measured: real git
+// `git switch --track origin/topic` → `Switched to a new branch 'topic'`).
 #[test]
 fn resolver_reads_track_value_as_the_branch_b17() {
     let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
     assert_eq!(
         resolve_checkout_target_branch(&s(&["checkout", "--track", "origin/other"])),
-        Some(CheckoutTarget::Branch("origin/other".into()))
+        Some(CheckoutTarget::Branch("other".into()))
     );
     assert_eq!(
         resolve_checkout_target_branch(&s(&["switch", "-t", "origin/topic"])),
-        Some(CheckoutTarget::Branch("origin/topic".into()))
+        Some(CheckoutTarget::Branch("topic".into()))
     );
     // `--track=<v>` attached: modern git REJECTS this form
     // (`option '--track' expects "direct" or "inherit"`), so the value is an
@@ -1271,6 +1276,201 @@ fn plain_positional_without_no_track_still_compares_f4_17() {
     assert!(
         matches!(action, Action::ChdirPass(_)),
         "plain same-branch checkout must still pass, got {action:?}"
+    );
+}
+
+// ── PR #17 R3: basename-DWIM across all six trigger shapes ─────────────
+//
+// Round 1's F4 fix modelled `--no-track` only. `--track` / `-t` are the SAME
+// DWIM path and were still passing: the resolver read the positional as the
+// target, compared `agent/live` against assigned `agent/live`, found them
+// equal, and passed — while git had moved HEAD to `live`.
+//
+// Note the test values use the daemon's real binding shape `<agent>/<slug>`:
+// a synthetic single-token branch would make the wrong comparison produce the
+// right answer by accident, which is exactly how this slipped through.
+
+// All six trigger shapes must DENY when the DWIM'd name differs from assigned.
+#[test]
+fn basename_dwim_all_six_shapes_fenced_r3_17() {
+    // assigned = `agent/live`; real git lands on `live` for every one of these.
+    for args in [
+        vec!["checkout", "--track", "agent/live"],
+        vec!["switch", "--track", "agent/live"],
+        vec!["checkout", "-t", "agent/live"],
+        vec!["switch", "-t", "agent/live"],
+        vec!["checkout", "--no-track", "agent/live"],
+        vec!["switch", "--no-track", "agent/live"],
+        // bundled short form
+        vec!["checkout", "-qt", "agent/live"],
+    ] {
+        let sub = args[0];
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let binding = bound_binding("agent/live", "/tmp/.worktrees/dev");
+        let action = classify(sub, &argv, &binding, false, false, false);
+        match action {
+            Action::Deny(reason) => assert!(
+                reason.contains("cross-branch"),
+                "`{}` DWIMs onto `live` and must be fenced: {reason}",
+                args.join(" ")
+            ),
+            other => panic!(
+                "`{}` MUST deny (git lands on `live`), got {other:?}",
+                args.join(" ")
+            ),
+        }
+    }
+}
+
+// The resolver half: every trigger shape must produce the DWIM'd name.
+#[test]
+fn resolver_derives_dwim_name_for_all_triggers_r3_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    for args in [
+        vec!["checkout", "--track", "agent/live"],
+        vec!["checkout", "-t", "agent/live"],
+        vec!["checkout", "--no-track", "agent/live"],
+    ] {
+        assert_eq!(
+            resolve_checkout_target_branch(&s(&args)),
+            Some(CheckoutTarget::Branch("live".into())),
+            "`{}` must derive the DWIM basename, not pass the positional through",
+            args.join(" ")
+        );
+    }
+}
+
+// The derivation rules themselves, each pinned against measured git 2.50.1
+// behaviour (see `derive_dwim_branch_name`'s doc).
+#[test]
+fn dwim_derivation_rules_r3_17() {
+    // `<remote>/X` strips only the remote segment, keeping the rest.
+    assert_eq!(
+        derive_dwim_branch_name("origin/team/feature"),
+        Some("team/feature".into())
+    );
+    assert_eq!(
+        derive_dwim_branch_name("origin/topic"),
+        Some("topic".into())
+    );
+    // Anything else with slashes falls back to the basename.
+    assert_eq!(derive_dwim_branch_name("agent/live"), Some("live".into()));
+    // A 40-hex commit-ish does NOT DWIM — git errors, so nothing is named.
+    assert_eq!(
+        derive_dwim_branch_name("0a1b2c3d4e5f60718293a4b5c6d7e8f901234567"),
+        None
+    );
+    assert_eq!(derive_dwim_branch_name("deadbeef"), None);
+    // A bare name has nothing to strip.
+    assert_eq!(derive_dwim_branch_name("live"), Some("live".into()));
+}
+
+// Rule 4 — a 40-hex positional after `--track` names nothing (git errors),
+// so it must NOT become a spurious deny.
+#[test]
+fn track_with_sha_names_nothing_r3_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&[
+            "checkout",
+            "--track",
+            "0a1b2c3d4e5f60718293a4b5c6d7e8f901234567"
+        ])),
+        Some(CheckoutTarget::Stay)
+    );
+}
+
+// Rule 5 — an explicit `-b`/`-c` wins over the DWIM, verbatim.
+#[test]
+fn explicit_branch_option_beats_dwim_r3_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&[
+            "checkout",
+            "--track",
+            "-b",
+            "my/custom",
+            "agent/live"
+        ])),
+        Some(CheckoutTarget::Branch("my/custom".into()))
+    );
+}
+
+// Rule 6 — `--track` with no positional names nothing (git: `--track needs a
+// branch name`), so `Stay`, not a deny.
+#[test]
+fn track_without_positional_names_nothing_r3_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "--track"])),
+        Some(CheckoutTarget::Stay)
+    );
+}
+
+// `--track=<v>` stays skipped — modern git rejects the attached form.
+#[test]
+fn track_attached_form_still_skipped_r3_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["switch", "--track=direct"])),
+        Some(CheckoutTarget::Stay)
+    );
+}
+
+// R3 acceptance criterion 2 — the three recovery paths must stay usable.
+#[test]
+fn recovery_paths_still_usable_r3_17() {
+    let binding = bound_binding("agent/live", "/tmp/.worktrees/dev");
+    // (a) `checkout <tree-ish> -- <pathspec>` restore
+    for args in [
+        vec!["checkout", "snapshot-ref", "--", "."],
+        vec!["checkout", "-q", "snapshot-ref", "--", "."],
+    ] {
+        let argv: Vec<String> = args.iter().map(|x| x.to_string()).collect();
+        let action = classify("checkout", &argv, &binding, false, false, false);
+        assert!(
+            matches!(action, Action::ChdirPass(_)),
+            "`{}` is a restore and must pass, got {action:?}",
+            args.join(" ")
+        );
+    }
+    // (b) `--pathspec-from-file` snapshot-layer reachability (snapshots.rs:973)
+    let action = classify(
+        "checkout",
+        &["checkout".into(), "--pathspec-from-file=ps.txt".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    assert!(
+        matches!(action, Action::ChdirPass(_)),
+        "`--pathspec-from-file` must reach the snapshot layer, got {action:?}"
+    );
+    // (c) plain same-branch checkout — the trigger refactor must not disturb it
+    let action = classify(
+        "checkout",
+        &["checkout".into(), "agent/live".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    assert!(
+        matches!(action, Action::ChdirPass(_)),
+        "same-branch checkout must pass, got {action:?}"
+    );
+}
+
+// Control: WITHOUT any trigger option the positional IS the branch, so the
+// same-branch case must still pass. Passes on both the pre-R3 and post-R3
+// resolver.
+#[test]
+fn plain_positional_without_trigger_still_compares_r3_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "agent/live"])),
+        Some(CheckoutTarget::Branch("agent/live".into()))
     );
 }
 

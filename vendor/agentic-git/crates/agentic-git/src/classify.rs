@@ -1014,11 +1014,47 @@ pub(crate) enum CheckoutTarget {
 
 /// Long options whose value names the BRANCH this invocation lands on.
 /// Names are matched WITHOUT the leading `--` (the parser strips it).
-const CHECKOUT_BRANCH_VALUE_OPTS: &[&str] = &["branch", "orphan", "track"];
+/// `track` is deliberately NOT here: it is valueless (see
+/// `CHECKOUT_DWIM_TRIGGER_OPTS`).
+const CHECKOUT_BRANCH_VALUE_OPTS: &[&str] = &["branch", "orphan"];
 /// Long options whose value is a PATHSPEC list, never a branch to land on.
 /// `pathspec-from-file` names a file. (`track` was here in the first #12
 /// revision and was wrong — see `resolve_checkout_target_branch`.)
 const CHECKOUT_PATHSPEC_VALUE_OPTS: &[&str] = &["pathspec-from-file"];
+
+/// Long options that trigger git's DWIM path WITHOUT consuming a value.
+const CHECKOUT_DWIM_TRIGGER_OPTS: &[&str] = &["track", "no-track"];
+
+/// Derive the branch name git actually lands on when `--track`/`-t`/
+/// `--no-track` is combined with the positional `spec`.
+///
+/// Measured against git 2.50.1 (Apple Git-155), one fresh repo per case:
+///
+///   - a 40-hex SHA does NOT DWIM — git reports
+///     `fatal: missing branch name; try -b` and moves nothing, so this
+///     derivation yields `None` ("names no branch");
+///   - `<remote>/<rest>` keeps `<rest>` — `origin/team/feature` DWIMs to
+///     `team/feature`, so only the remote SEGMENT is stripped, not every
+///     leading component;
+///   - anything else with slashes falls back to the basename —
+///     `agent/live` DWIMs to `live`.
+///
+/// The basename case is the one that matters for AgEnD: binding branches are
+/// `<agent>/<task-slug>`, so the DWIM'd name almost always differs from the
+/// assigned one — which is exactly what must trip the fence.
+pub(crate) fn derive_dwim_branch_name(spec: &str) -> Option<String> {
+    // A full/abbreviated 40-hex object name is a commit-ish, not a branch.
+    let is_hex =
+        !spec.is_empty() && spec.len() <= 40 && spec.chars().all(|c| c.is_ascii_hexdigit());
+    if is_hex {
+        return None;
+    }
+    match spec.split_once('/') {
+        // Strip exactly one segment (the remote name), keep the rest.
+        Some((_remote, rest)) if !rest.is_empty() => Some(rest.to_string()),
+        _ => Some(spec.rsplit('/').next().unwrap_or(spec).to_string()),
+    }
+}
 
 /// Resolve what a `checkout`/`switch` argv does to the current branch.
 ///
@@ -1040,15 +1076,14 @@ const CHECKOUT_PATHSPEC_VALUE_OPTS: &[&str] = &["pathspec-from-file"];
 ///     `git checkout <branch> --detach` really does detach;
 ///   - short flags BUNDLE: `git switch -qd` detaches (the `d` is a flag)
 ///     while `git switch -catt` creates a branch named `att`;
-///   - `--track <ref>` / `-t <ref>` DWIM: git creates a local branch from
-///     the ref's short name AND switches to it, so the ref IS the target.
-///     The `--track=<v>` attached form is NOT a branch — modern git rejects
-///     it outright (`option '--track' expects "direct" or "inherit"`), so
-///     its value is skipped like any other option operand;
-///   - `--no-track` is VALUELESS but shares that same DWIM path: git lands
-///     on a branch derived from the following positional's BASENAME, not on
-///     the positional itself. Reading the positional as the target compares
-///     the wrong name and under-denies (PR #17 F4);
+///   - `--track` / `-t` / `--no-track` are VALUELESS and share git's DWIM
+///     path: git creates a local branch from a LATER positional and switches
+///     to it, so the positional itself is never the branch git lands on.
+///     Reading it as the target compares the wrong name and under-denies —
+///     which matters here because AgEnD binding branches are
+///     `<agent>/<task-slug>` and the DWIM'd basename almost always differs
+///     (PR #17 F4 / R3). See `derive_dwim_branch_name` for the exact rules;
+///     `--track=<v>` is skipped because modern git rejects that form;
 ///   - `--branch=<n>` / `-c<n>` carry an attached value; a bare `-` is git's
 ///     "previous branch" shorthand and is a real target;
 ///   - a bare `--` terminates options; everything after it is a pathspec.
@@ -1069,10 +1104,11 @@ pub(crate) fn resolve_checkout_target_branch(args: &[String]) -> Option<Checkout
     let mut detach_at: Option<String> = None;
     let mut named_branch: Option<String> = None;
     let mut first_positional: Option<String> = None;
-    // `--no-track` is valueless but still triggers git's DWIM path: the branch
-    // git lands on is derived from the following positional's BASENAME, not
-    // from the positional itself. Modeled as its own outcome (PR #17 F4).
-    let mut dwim_bare: Option<String> = None;
+    // `--track` / `-t` / `--no-track` are valueless DWIM triggers: the branch
+    // git lands on is derived from a LATER positional, not from this option's
+    // (non-existent) operand. Presence only — the derived name is filled in
+    // when the positional arrives (PR #17 R3).
+    let mut dwim_trigger = false;
 
     while let Some(tok) = rest.next() {
         if tok == "--" {
@@ -1086,11 +1122,11 @@ pub(crate) fn resolve_checkout_target_branch(args: &[String]) -> Option<Checkout
                 detach_at.get_or_insert_with(|| tok.clone());
                 continue;
             }
-            // Under `--no-track` git DWIMs a NEW branch from this
-            // positional's basename — the landed branch is NOT this
-            // positional, so comparing them would under-deny (PR #17 F4).
-            if dwim_bare.is_some() {
-                dwim_bare = Some(tok.rsplit('/').next().unwrap_or(tok.as_str()).to_string());
+            // Under `--track`/`-t`/`--no-track` git DWIMs a NEW branch from
+            // this positional — the landed branch is NOT this positional, so
+            // comparing them would under-deny (PR #17 F4 / R3).
+            if dwim_trigger && named_branch.is_none() {
+                first_positional = derive_dwim_branch_name(tok);
                 continue;
             }
             if first_positional.is_none() {
@@ -1110,22 +1146,19 @@ pub(crate) fn resolve_checkout_target_branch(args: &[String]) -> Option<Checkout
             };
             match name {
                 "detach" => detached = true,
-                // PR #17 F4: `--no-track` is the valueless negation of
-                // `--track`, and git routes it through the SAME DWIM path —
-                // it creates a local branch from the following positional's
-                // basename and switches there. The positional is NOT the
-                // branch git lands on, so it must not be compared as one.
-                "no-track" => dwim_bare = Some(String::new()),
+                // `--track` / `--no-track` are VALUELESS DWIM triggers: they
+                // consume no operand, and the branch git lands on is derived
+                // from a later positional (PR #17 R3). `--track=<v>` is the
+                // one exception — modern git rejects that attached form
+                // outright (`option '--track' expects "direct" or "inherit"`),
+                // so its value is an operand, never a branch.
+                name if CHECKOUT_DWIM_TRIGGER_OPTS.contains(&name) && attached.is_none() => {
+                    dwim_trigger = true;
+                }
                 // A branch-NAMING option: its value is the branch this
                 // invocation lands on (`--branch <n>` / `--branch=<n>`).
                 name if CHECKOUT_BRANCH_VALUE_OPTS.contains(&name) => {
                     if let Some(v) = attached {
-                        // `--track=<v>` lands here: modern git REJECTS that
-                        // form (`--track` expects "direct"/"inherit"), so its
-                        // value is an operand, not a branch. Skip it.
-                        if name == "track" {
-                            continue;
-                        }
                         named_branch.get_or_insert(v);
                     } else if let Some(v) = rest.next() {
                         named_branch.get_or_insert_with(|| v.clone());
@@ -1155,7 +1188,11 @@ pub(crate) fn resolve_checkout_target_branch(args: &[String]) -> Option<Checkout
         for (i, flag) in flags.iter().enumerate() {
             match flag {
                 'd' => detached = true,
-                'b' | 'B' | 'c' | 'C' | 't' => {
+                // `-t` is the SHORT form of `--track`: valueless, and it triggers the same
+                // DWIM derivation (PR #17 R3). Its remaining cluster chars, if
+                // any, belong to later flags, so keep scanning.
+                't' => dwim_trigger = true,
+                'b' | 'B' | 'c' | 'C' => {
                     let attached: String = flags[i + 1..].iter().collect();
                     if attached.is_empty() {
                         // Value is the next token; `-c` with nothing after is
@@ -1179,15 +1216,11 @@ pub(crate) fn resolve_checkout_target_branch(args: &[String]) -> Option<Checkout
     if detached {
         return Some(CheckoutTarget::Detach(detach_at));
     }
-    // An explicit branch-naming option outranks a bare positional: for
-    // `--track <ref>` DWIM the ref IS what git lands on.
-    // `--no-track` also outranks the positional, but with the DWIM'd
-    // basename — the branch git actually lands on. A `--no-track` with NO
-    // following positional names nothing (git: `--track needs a branch
-    // name`), so the empty sentinel falls through rather than yielding an
-    // empty branch name.
-    let dwim = dwim_bare.filter(|b| !b.is_empty());
-    let branch = named_branch.or(dwim).or(first_positional);
+    // An explicit branch-naming option outranks a bare positional — that is
+    // the DWIM'd branch (already stored in `first_positional` by
+    // `derive_dwim_branch_name`), or an explicit `-b`/`-c` name, which wins
+    // verbatim over the DWIM in real git too.
+    let branch = named_branch.or(first_positional);
     Some(match branch {
         Some(b) => CheckoutTarget::Branch(b),
         None => CheckoutTarget::Stay,
