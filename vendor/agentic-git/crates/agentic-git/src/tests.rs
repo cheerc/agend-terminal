@@ -684,6 +684,383 @@ fn cross_branch_to_non_protected_target_never_exempted() {
 }
 
 #[test]
+// ── #12: the cross-branch fence must survive flag-prefixed checkout/switch ──
+//
+// Pre-#12 the fence read `args.get(1)` verbatim, so ANY option token in the
+// first position made it bail out (`!target_branch.starts_with('-')`) and the
+// branch switch sailed through. Every case below is a real bypass shape: the
+// fence must DENY, naming the real target.
+
+#[test]
+fn checkout_quiet_sha_is_fenced_12() {
+    // `git checkout -q <sha>` — the #12 canonical shape. Pre-#12 args[1] was
+    // `-q`, so the `starts_with('-')` bail-out fired and the detached-HEAD
+    // switch was allowed.
+    let binding = bound_binding("sprint57-track-a", "/tmp/.worktrees/dev");
+    let action = classify(
+        "checkout",
+        &["checkout".into(), "-q".into(), "0a1b2c3".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    match action {
+        Action::Deny(reason) => {
+            assert!(
+                reason.contains("cross-branch"),
+                "`checkout -q <sha>` must trip the cross-branch fence: {reason}"
+            );
+            assert!(
+                reason.contains("0a1b2c3"),
+                "deny must name the real target, not the `-q` option: {reason}"
+            );
+        }
+        other => panic!("`checkout -q <sha>` must deny, got {other:?}"),
+    }
+}
+
+#[test]
+fn checkout_force_branch_is_fenced_12() {
+    // `git checkout -f <branch>` — discards local changes AND switches
+    // branch; pre-#12 the `-f` first position disabled the fence.
+    let binding = bound_binding("sprint57-track-b", "/tmp/.worktrees/dev");
+    let action = classify(
+        "checkout",
+        &["checkout".into(), "-f".into(), "main".into()],
+        &binding,
+        false, // parent_is_gh — interactive, so the Track-D exemption
+        // must not apply even though the target is protected.
+        false,
+        false,
+    );
+    match action {
+        Action::Deny(reason) => assert!(
+            reason.contains("cross-branch"),
+            "`checkout -f <branch>` must trip the cross-branch fence: {reason}"
+        ),
+        other => panic!("`checkout -f <branch>` must deny, got {other:?}"),
+    }
+}
+
+#[test]
+fn switch_detach_sha_is_fenced_12() {
+    // `git switch --detach <sha>` — leaves the bound branch for a detached
+    // HEAD; pre-#12 args[1] was `--detach` and the fence bailed.
+    let binding = bound_binding("sprint57-track-c", "/tmp/.worktrees/dev");
+    let action = classify(
+        "switch",
+        &["switch".into(), "--detach".into(), "0a1b2c3".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    match action {
+        Action::Deny(reason) => {
+            assert!(
+                reason.contains("cross-branch"),
+                "`switch --detach <sha>` must trip the cross-branch fence: {reason}"
+            );
+            assert!(
+                reason.contains("0a1b2c3"),
+                "deny must name the detached commit: {reason}"
+            );
+        }
+        other => panic!("`switch --detach <sha>` must deny, got {other:?}"),
+    }
+}
+
+#[test]
+fn switch_create_branch_is_fenced_12() {
+    // `git switch -c <new>` creates AND lands on a new branch. The name is
+    // consumed as the option's value, so a naive "first non-flag token"
+    // parser would see nothing and let it through.
+    let binding = bound_binding("sprint57-track-d", "/tmp/.worktrees/dev");
+    let action = classify(
+        "switch",
+        &["switch".into(), "-c".into(), "tmp-scratch".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    match action {
+        Action::Deny(reason) => {
+            assert!(
+                reason.contains("cross-branch"),
+                "`switch -c <new>` must trip the cross-branch fence: {reason}"
+            );
+            assert!(
+                reason.contains("tmp-scratch"),
+                "deny must name the branch being created: {reason}"
+            );
+        }
+        other => panic!("`switch -c <new>` must deny, got {other:?}"),
+    }
+}
+
+#[test]
+fn flag_prefixed_same_branch_checkout_still_allowed_12() {
+    // Over-guard check: `-q` is noise, so `checkout -q <assigned>` stays on
+    // the bound branch and must still PASS. Without this the #12 fix would
+    // just deny every flag-prefixed checkout and break normal use.
+    let binding = bound_binding("sprint57-track-e", "/tmp/.worktrees/dev");
+    let action = classify(
+        "checkout",
+        &["checkout".into(), "-q".into(), "sprint57-track-e".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    assert!(
+        matches!(action, Action::ChdirPass(_)),
+        "same-branch `checkout -q <assigned>` must still pass, got {action:?}"
+    );
+}
+
+#[test]
+fn bundled_option_does_not_hide_attached_branch_name_12() {
+    // `switch -qd` is a bundleable short: `d` is a DETACH flag here, not an
+    // attached branch name (proved against real git — `git switch -qd` detaches
+    // instead of creating a branch named `d`). It must therefore deny as a
+    // detach, NOT be read as a branch switch to a branch named `d`.
+    let binding = bound_binding("sprint57-track-f", "/tmp/.worktrees/dev");
+    let action = classify(
+        "switch",
+        &["switch".into(), "-qd".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    match action {
+        Action::Deny(reason) => {
+            assert!(
+                reason.contains("cross-branch"),
+                "`switch -qd` leaves the bound branch and must be fenced: {reason}"
+            );
+            assert!(
+                !reason.contains("switch to 'd'"),
+                "`-qd` must not be parsed as a branch named `d`: {reason}"
+            );
+        }
+        other => panic!("`switch -qd` must deny, got {other:?}"),
+    }
+}
+
+#[test]
+fn attached_option_branch_name_is_fenced_12() {
+    // `git switch -catt` really does create a branch named `att` (verified
+    // against real git), so the attached form must be parsed the same way as
+    // the separated one — otherwise `-c<name>` stays a bypass.
+    let binding = bound_binding("sprint57-track-g", "/tmp/.worktrees/dev");
+    let action = classify(
+        "switch",
+        &["switch".into(), "-catt".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    match action {
+        Action::Deny(reason) => {
+            assert!(
+                reason.contains("cross-branch"),
+                "`switch -catt` (attached -c value) must be fenced: {reason}"
+            );
+            assert!(
+                reason.contains("att"),
+                "deny must name the attached branch value `att`: {reason}"
+            );
+        }
+        other => panic!("`switch -catt` must deny, got {other:?}"),
+    }
+}
+
+#[test]
+fn bare_detach_options_still_fenced_12() {
+    // `checkout -d` / `switch -d` detach with no argument at all. There is no
+    // target token to name, but leaving the bound branch is still a
+    // cross-branch move, so the fence must fire.
+    for (subcmd, args) in [
+        ("checkout", vec!["checkout".to_string(), "-d".to_string()]),
+        ("switch", vec!["switch".to_string(), "-d".to_string()]),
+    ] {
+        let binding = bound_binding("sprint57-track-h", "/tmp/.worktrees/dev");
+        let action = classify(subcmd, &args, &binding, false, false, false);
+        match action {
+            Action::Deny(reason) => assert!(
+                reason.contains("cross-branch"),
+                "bare `{subcmd} -d` leaves the bound branch and must be fenced: {reason}"
+            ),
+            other => panic!("bare `{subcmd} -d` must deny, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn pathspec_restore_exemption_survives_leading_flag_12() {
+    // The `checkout <tree-ish> -- <pathspec>` restore exemption must keep
+    // working when a noise flag leads: `checkout -q <snapshot> -- .` restores
+    // working-tree files without switching branches. Denying this would
+    // re-break the recovery layer's own documented restore.
+    let binding = bound_binding("sprint57-track-i", "/tmp/.worktrees/dev");
+    let action = classify(
+        "checkout",
+        &[
+            "checkout".into(),
+            "-q".into(),
+            "snapshot-ref".into(),
+            "--".into(),
+            ".".into(),
+        ],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    assert!(
+        matches!(action, Action::ChdirPass(_)),
+        "`checkout -q <ref> -- .` is a restore, must still pass, got {action:?}"
+    );
+}
+
+#[test]
+fn double_dash_terminator_stops_option_parsing_12() {
+    // After a bare `--` every token is a pathspec, never an option. `--`
+    // itself must not be mistaken for a detach-shaped option.
+    let binding = bound_binding("sprint57-track-j", "/tmp/.worktrees/dev");
+    let action = classify(
+        "checkout",
+        &["checkout".into(), "--".into(), "src".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    assert!(
+        matches!(action, Action::ChdirPass(_)),
+        "`checkout -- <path>` is a restore shape, must pass, got {action:?}"
+    );
+}
+
+#[test]
+fn pathspec_from_file_option_is_not_a_branch_12() {
+    // Regression guard for the impl-review round-2 (fugu) reachability case
+    // snapshots.rs `checkout_pathspec_from_file_is_recoverable_review2`
+    // pins: `checkout --pathspec-from-file=ps.txt` is a worktree-discard op
+    // that must REACH the snapshotting layer. An early #12 draft read the
+    // `=`-attached value as a branch name and re-denied it, breaking that
+    // documented recovery path. The value is an operand, not a target.
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "--pathspec-from-file=ps.txt"])),
+        Some(CheckoutTarget::Stay)
+    );
+    // Bare form consumes the following token rather than reading it as one.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "--pathspec-from-file", "ps.txt"])),
+        Some(CheckoutTarget::Stay)
+    );
+
+    // And the real shim path still lets the op through.
+    let binding = bound_binding("sprint57-track-l", "/tmp/.worktrees/dev");
+    let action = classify(
+        "checkout",
+        &["checkout".into(), "--pathspec-from-file=ps.txt".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    assert!(
+        matches!(action, Action::ChdirPass(_)),
+        "`checkout --pathspec-from-file=<f>` must pass through to the snapshot layer, got {action:?}"
+    );
+}
+
+#[test]
+fn target_branch_resolution_skips_options_and_their_values_12() {
+    // Unit-level pin on the parser itself, independent of classify's
+    // fence: each case is (argv tail, expected target).
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+
+    // Options are skipped; the following positional is the target.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "-q", "abc123"])),
+        Some(CheckoutTarget::Branch("abc123".into()))
+    );
+    // `-q` takes no value, so with nothing positional after it the invocation
+    // names no target and stays on the bound branch.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "-q"])),
+        Some(CheckoutTarget::Stay)
+    );
+    // `--detach` / `-d` classify as a detach, not a branch named `--detach`.
+    // The commit-ish after the flag is carried for the deny message, not
+    // compared against the assigned branch.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "--detach", "abc"])),
+        Some(CheckoutTarget::Detach(Some("abc".into())))
+    );
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "-d"])),
+        Some(CheckoutTarget::Detach(None))
+    );
+    // `-c <name>` / `-C <name>` / `--orphan <name>` consume their value as the
+    // branch that would be created and landed on.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "-b", "new"])),
+        Some(CheckoutTarget::Branch("new".into()))
+    );
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "--orphan", "orph"])),
+        Some(CheckoutTarget::Branch("orph".into()))
+    );
+    // Bundled `-qd`: `d` is a DETACH flag here, not an attached branch name.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "-qd"])),
+        Some(CheckoutTarget::Detach(None))
+    );
+    // Bundled `-qb name`: `b` takes a value.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "-qb", "new"])),
+        Some(CheckoutTarget::Branch("new".into()))
+    );
+    // No subcommand at all — nothing to judge.
+    assert_eq!(resolve_checkout_target_branch(&s(&[])), None);
+    // Only options, none of which leave the branch.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "-q", "--progress"])),
+        Some(CheckoutTarget::Stay)
+    );
+}
+
+#[test]
+fn gh_post_merge_exemption_survives_flag_prefix_12() {
+    // The Track-D exemption must keep working through a noise flag:
+    // `gh` post-merge cleanup with `-q` must still be SilentExempt, not deny.
+    // Without this the #12 fix would regress the Track D path.
+    let binding = bound_binding("sprint57-track-k", "/tmp/.worktrees/dev");
+    let action = classify(
+        "checkout",
+        &["checkout".into(), "-q".into(), "main".into()],
+        &binding,
+        true, // parent_is_gh
+        false,
+        false,
+    );
+    assert!(
+        matches!(action, Action::SilentExempt { .. }),
+        "gh post-merge `checkout -q main` must stay exempt, got {action:?}"
+    );
+}
+
+#[test]
+
 fn gh_invocation_detection_robust_against_simulated_external_invocation() {
     // The detection helper must reject `gh`-lookalike basenames
     // that aren't the canonical CLI binary. This pins the
