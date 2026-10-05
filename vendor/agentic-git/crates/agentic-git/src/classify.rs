@@ -1069,10 +1069,9 @@ pub(crate) fn resolve_checkout_target_branch(args: &[String]) -> Option<Checkout
                     if let Some(v) = attached {
                         return Some(CheckoutTarget::Branch(v));
                     }
-                    return match rest.next() {
-                        Some(v) => Some(CheckoutTarget::Branch(v.clone())),
-                        None => None,
-                    };
+                    return rest
+                        .next()
+                        .map(|v| CheckoutTarget::Branch(v.clone()));
                 }
                 // An option whose value is a PATHSPEC list, never a branch.
                 // `--pathspec-from-file=<f>` names a file, and returning it
@@ -1105,10 +1104,9 @@ pub(crate) fn resolve_checkout_target_branch(args: &[String]) -> Option<Checkout
                     if attached.is_empty() {
                         // Value is the next token; `-c` with nothing after is
                         // malformed and names no target.
-                        return match rest.next() {
-                            Some(v) => Some(CheckoutTarget::Branch(v.clone())),
-                            None => None,
-                        };
+                        return rest
+                            .next()
+                            .map(|v| CheckoutTarget::Branch(v.clone()));
                     }
                     // `-catt` — an attached value, not another flag cluster.
                     return Some(CheckoutTarget::Branch(attached));
