@@ -90,6 +90,122 @@ if [[ -z "${AGENTIC_GIT_HOME:-}" && -n "${AGEND_HOME:-}" ]]; then
     export AGENTIC_GIT_HOME="$AGEND_HOME"
 fi
 
+# ── #2: real-git starting line ────────────────────────────────────────────
+# The pin above is only HALF the starting line. It makes the shim's
+# self-exclusion work, but it does not give the shim a real git to exec. When
+# BOTH of the shim's resolution defences are unavailable — Priority 1
+# (AGENTIC_GIT_REAL_GIT / legacy AGEND_REAL_GIT unset) and Priority 2
+# (self-exclusion misses because a test scoped AGEND_HOME to a temp dir) — the
+# shim resolves `git` to ITSELF and trips its recursion guard (#1504), turning
+# ~40 deterministic tests into false reds that mask real failures.
+#
+# So pin the other half too: derive the real git and hand it to the shim.
+# Whether that is NEEDED is decided by what `git` actually RESOLVES TO on PATH,
+# not by whether some env var happens to be set — that keeps the boundary
+# derivable from the program alone:
+#
+#   * first `git` on PATH is the agentic-git/agend-git shim → managed agent
+#     shell → the shim is live and NEEDS a real git to hand off to. (Detecting
+#     the shim, not "is AGEND_HOME set", also covers a shell where the shim is
+#     on PATH but AGEND_HOME was never exported — the pin above cannot fire
+#     there, which is exactly the shape the recursion guard then bites on.)
+#   * first `git` on PATH is a real git → plain shell → do NOTHING. No export,
+#     no PATH rewrite, no policy change; behaviour is byte-identical to a run
+#     without this block.
+#
+# Env-only by construction: we export a variable, never rewrite PATH and never
+# touch AGENTIC_GIT_HOME's meaning, so the shim keeps enforcing the same policy
+# for the same agent identity. (Do NOT "fix" this by sourcing
+# scripts/lib/real-git.sh — that helper PREPENDS the real git's directory onto
+# PATH, which would change path resolution outside a managed shell and is
+# fixture-only by contract, see tests/fixture_real_git_provenance.rs.)
+
+# Physical path of an existing file/dir, following symlinks (bash 3.2 has no
+# `readlink -f`; realpath(1) exists on macOS 13+ and on CI's linux runners).
+pf_canon() {
+    if [ -e "$1" ]; then
+        realpath "$1" 2>/dev/null && return 0
+    fi
+    local d b
+    d="$(cd "$(dirname "$1")" 2>/dev/null && pwd -P)" || return 1
+    b="$(basename "$1")"
+    printf '%s\n' "$d/$b"
+}
+
+# True when $1 (a file) sits in a known shim install dir ($AGEND_HOME/bin).
+pf_in_shim_dir() {
+    local fd h sd
+    fd="$(cd "$(dirname "$1")" 2>/dev/null && pwd -P)" || return 1
+    for h in "${AGENTIC_GIT_HOME:-}" "${AGEND_HOME:-}"; do
+        [ -n "$h" ] || continue
+        sd="$(cd "$h/bin" 2>/dev/null && pwd -P)" || continue
+        [ "$fd" = "$sd" ] && return 0
+    done
+    return 1
+}
+
+# True when the first `git` on PATH is the agentic-git / agend-git shim.
+pf_first_git_is_shim() {
+    local g canon base
+    g="$(command -v git 2>/dev/null)" || return 1
+    [ -n "$g" ] || return 1
+    canon="$(pf_canon "$g")" || return 1
+    base="${canon##*/}"
+    case "$base" in
+        agentic-git | agentic-git.exe | agend-git | agend-git.exe) return 0 ;;
+    esac
+    pf_in_shim_dir "$canon"
+}
+
+# First PATH git that is neither the shim nor in a shim dir, proven to answer
+# `git version`.
+pf_derive_real_git() {
+    local first first_canon entry cand cc oldifs
+    first="$(command -v git 2>/dev/null)" || return 1
+    first_canon="$(pf_canon "$first")" || return 1
+    oldifs="$IFS"
+    IFS=:
+    for entry in $PATH; do
+        IFS="$oldifs"
+        if [ -n "$entry" ]; then
+            cand="$entry/git"
+            if [ -x "$cand" ]; then
+                if cc="$(pf_canon "$cand")" && [ "$cc" != "$first_canon" ] &&
+                    ! pf_in_shim_dir "$cc" &&
+                    "$cc" version 2>/dev/null | grep -q '^git version'; then
+                    IFS="$oldifs"
+                    printf '%s\n' "$cc"
+                    return 0
+                fi
+            fi
+        fi
+        IFS=:
+    done
+    IFS="$oldifs"
+    return 1
+}
+
+if [[ -z "${AGENTIC_GIT_REAL_GIT:-}" && -z "${AGEND_REAL_GIT:-}" ]]; then
+    if pf_first_git_is_shim; then
+        if pf_real="$(pf_derive_real_git)"; then
+            export AGENTIC_GIT_REAL_GIT="$pf_real"
+            echo "[$SCRIPT_NAME] agent shell: pinned AGENTIC_GIT_REAL_GIT=$pf_real (shim at $(command -v git)) — #1504" >&2
+        else
+            # Acceptance: an unresolvable real git must be NAMED, not turned
+            # into a second wave of false reds. Say what broke, how to confirm
+            # it, and how to fix it, then keep going — the tests themselves
+            # still decide the verdict.
+            echo "[$SCRIPT_NAME] WARNING: the agentic-git shim is first on PATH but no real git could be resolved." >&2
+            echo "  Symptom: if the test phase reports 'FATAL recursion guard tripped (AGENTIC_GIT_SHIM_DEPTH=3)' (#1504)," >&2
+            echo "           those reds are shim self-resolution, NOT your change." >&2
+            echo "  Fix:     export AGENTIC_GIT_REAL_GIT=\"\$(git --version >/dev/null 2>&1 && command -v git)\"" >&2
+            echo "           — i.e. point it at a real git that is NOT the shim, e.g. /usr/bin/git." >&2
+            echo "           A shell without a real git on PATH at all cannot run this suite." >&2
+        fi
+    fi
+    unset pf_real
+fi
+
 passed=()
 failed=()
 skipped=()
