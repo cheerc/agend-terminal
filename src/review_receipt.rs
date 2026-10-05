@@ -167,6 +167,135 @@ pub(crate) fn has_flat_review_smuggling_fields(params: &Value) -> bool {
         .any(|k| params.get(*k).is_some_and(|v| !v.is_null()))
 }
 
+/// #15: WHICH column of the exact-subject comparison failed. The five columns
+/// used to share one `&'static str`, so a reviewer could not tell a PR HEAD
+/// advance (wait for a re-dispatch) from a review-class divergence (check task
+/// authority) — opposite dispositions behind identical text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubjectMismatch {
+    Repo,
+    Branch,
+    PrNumber,
+    HeadSha,
+    ReviewClass,
+}
+
+/// The exact-subject comparison, unchanged from the pre-#15 `if a || b || c ||
+/// d || e` — every operand, every type, and the left-to-right evaluation order
+/// are byte-equivalent; only the *reporting* of a true result moved into
+/// [`SubjectMismatch`]. Nothing here is relaxed, removed, reordered in effect,
+/// or gated differently: `None` still means "all five columns agree", and each
+/// `Some` variant maps to exactly one of the five former `||` operands.
+///
+/// Columns 1 and 2 are near-tautological in the normal path — the pr-state file
+/// path is derived from `assignment.repo`/`assignment.branch` through
+/// `pr_state_filename` (a `/`→`_` round-trip), so `state.repo`/`state.branch`
+/// can only diverge from the assignment if the file was hand-edited or written
+/// by a different producer. They are KEPT (not removed) so the diagnostic stays
+/// correct for that case; removing them is a separate decision (#15 Related).
+fn subject_mismatch(
+    assignment: &crate::daemon::assignment_authority::ActiveAssignment,
+    state: &PrState,
+    reviewed_head: &str,
+) -> Option<SubjectMismatch> {
+    if state.repo != assignment.repo {
+        Some(SubjectMismatch::Repo)
+    } else if state.branch != assignment.branch {
+        Some(SubjectMismatch::Branch)
+    } else if state.pr_number != assignment.pr_number {
+        Some(SubjectMismatch::PrNumber)
+    } else if state.head_sha != reviewed_head {
+        Some(SubjectMismatch::HeadSha)
+    } else if state.review_class != assignment.review_class {
+        Some(SubjectMismatch::ReviewClass)
+    } else {
+        None
+    }
+}
+
+impl SubjectMismatch {
+    /// Stable machine-readable column id. The transport
+    /// (`messaging::SendOutcome::Error`) carries a single free-text `error`, so
+    /// this token is what a caller keys on inside that text; promoting it to a
+    /// first-class MCP `code` field needs the upstream response-struct change
+    /// reported in #15, not a silent parallel error type here.
+    fn code(self) -> &'static str {
+        match self {
+            Self::Repo => "subject_mismatch_repo",
+            Self::Branch => "subject_mismatch_branch",
+            Self::PrNumber => "subject_mismatch_pr_number",
+            Self::HeadSha => "subject_mismatch_head_sha",
+            Self::ReviewClass => "subject_mismatch_review_class",
+        }
+    }
+
+    /// The column name, as the guard's operand names it.
+    fn column(self) -> &'static str {
+        match self {
+            Self::Repo => "repo",
+            Self::Branch => "branch",
+            Self::PrNumber => "pr_number",
+            Self::HeadSha => "head_sha",
+            Self::ReviewClass => "review_class",
+        }
+    }
+
+    /// Caller-facing diagnostic. Each variant names the diverging column, both
+    /// observed values, and the NEXT STEP for that column — the steps are
+    /// deliberately different, which is the whole point of #15.
+    fn diagnostic(
+        self,
+        assignment: &crate::daemon::assignment_authority::ActiveAssignment,
+        state: &PrState,
+        reviewed_head: &str,
+    ) -> String {
+        let head = format!(
+            "active assignment subject no longer exactly matches PR state \
+             (mismatched column: {}) [{}]",
+            self.column(),
+            self.code(),
+        );
+        match self {
+            Self::HeadSha => format!(
+                "{head} — assignment reviewed_head {reviewed_head}, PR state head_sha {}. \
+                 The PR HEAD advanced after this assignment was dispatched, so this \
+                 assignment's generation is stale: do NOT re-send the verdict against it. \
+                 Wait for the dispatching lead to re-dispatch a fresh assignment for the \
+                 new HEAD, then review that generation.",
+                state.head_sha,
+            ),
+            Self::ReviewClass => format!(
+                "{head} — assignment review_class {}, PR state review_class {}. \
+                 The review threshold itself diverged, so the HEAD may be unchanged: \
+                 do NOT wait for a re-dispatch. Check the task's review_class authority \
+                 (the task board / governing decision) against the PR's review_class and \
+                 reconcile them before re-reviewing.",
+                assignment.review_class.as_token(),
+                state.review_class.as_token(),
+            ),
+            Self::PrNumber => format!(
+                "{head} — assignment pr_number {}, PR state pr_number {}. \
+                 The tracked PR number is not the one this assignment was bound to \
+                 (PR re-created, or pr-state not yet refreshed); re-check the PR state \
+                 for this branch before re-reviewing.",
+                assignment.pr_number, state.pr_number,
+            ),
+            Self::Repo => format!(
+                "{head} — assignment repo {}, PR state repo {}. The pr-state file under \
+                 this branch's key was written for a different repository; the assignment \
+                 is not bound to this PR.",
+                assignment.repo, state.repo,
+            ),
+            Self::Branch => format!(
+                "{head} — assignment branch {}, PR state branch {}. The pr-state file under \
+                 this branch's key records a different branch; the assignment is not bound \
+                 to this PR.",
+                assignment.branch, state.branch,
+            ),
+        }
+    }
+}
+
 /// Authoritative API-sink validation. Must run before delivery.
 pub(crate) fn authorize_report(
     home: &Path,
@@ -284,13 +413,8 @@ pub(crate) fn authorize_report(
     }
 
     let state = load_pr_state_strict(home, &assignment.repo, &assignment.branch)?;
-    if state.repo != assignment.repo
-        || state.branch != assignment.branch
-        || state.pr_number != assignment.pr_number
-        || state.head_sha != reviewed_head
-        || state.review_class != assignment.review_class
-    {
-        return Err("active assignment subject no longer exactly matches PR state".into());
+    if let Some(mismatch) = subject_mismatch(&assignment, &state, &reviewed_head) {
+        return Err(mismatch.diagnostic(&assignment, &state, &reviewed_head));
     }
 
     Ok(ReportAuthorization {
