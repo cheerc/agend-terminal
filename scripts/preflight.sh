@@ -92,17 +92,20 @@ fi
 
 # ── #2: real-git starting line ────────────────────────────────────────────
 # The pin above is only HALF the starting line. It makes the shim's
-# self-exclusion work, but it does not give the shim a real git to exec. When
-# BOTH of the shim's resolution defences are unavailable — Priority 1
-# (AGENTIC_GIT_REAL_GIT / legacy AGEND_REAL_GIT unset) and Priority 2
-# (self-exclusion misses because a test scoped AGEND_HOME to a temp dir) — the
+# self-exclusion work, but it does not guarantee the shim has a real git to
+# exec in the environment the tests build. When BOTH of the shim's resolution
+# defences are down — Priority 1 unusable (the daemon's spawn-time
+# AGEND_REAL_GIT was computed from a different PATH, or the canonical
+# AGENTIC_GIT_REAL_GIT is absent / stale / points at the shim) and Priority 2
+# missed (self-exclusion reads AGENTIC_GIT_HOME, so a test that scopes
+# AGEND_HOME to a temp dir moves the exclusion off the shim's real dir) — the
 # shim resolves `git` to ITSELF and trips its recursion guard (#1504), turning
-# ~40 deterministic tests into false reds that mask real failures.
+# deterministic tests into false reds that mask real failures.
 #
-# So pin the other half too: derive the real git and hand it to the shim.
-# Whether that is NEEDED is decided by what `git` actually RESOLVES TO on PATH,
-# not by whether some env var happens to be set — that keeps the boundary
-# derivable from the program alone:
+# So make sure the shim has one: derive it, or promote a still-good injected
+# value, and hand it over. Whether that is NEEDED is decided by what `git`
+# actually RESOLVES TO on PATH, not by whether some env var happens to be set —
+# that keeps the boundary derivable from the program alone:
 #
 #   * first `git` on PATH is the agentic-git/agend-git shim → managed agent
 #     shell → the shim is live and NEEDS a real git to hand off to. (Detecting
@@ -112,6 +115,13 @@ fi
 #   * first `git` on PATH is a real git → plain shell → do NOTHING. No export,
 #     no PATH rewrite, no policy change; behaviour is byte-identical to a run
 #     without this block.
+#
+# Gate on the CANONICAL AGENTIC_GIT_REAL_GIT, not on the legacy AGEND_REAL_GIT:
+# the shim reads the canonical name first and only falls back to the legacy one
+# inside `env_compat` (vendor/.../src/lib.rs), so a guard that treats a set
+# AGEND_REAL_GIT as "already handled" would skip this block in exactly the
+# standard daemon-managed shell it exists to serve — where the daemon always
+# injects that legacy name at spawn.
 #
 # Env-only by construction: we export a variable, never rewrite PATH and never
 # touch AGENTIC_GIT_HOME's meaning, so the shim keeps enforcing the same policy
@@ -185,22 +195,55 @@ pf_derive_real_git() {
     return 1
 }
 
-if [[ -z "${AGENTIC_GIT_REAL_GIT:-}" && -z "${AGEND_REAL_GIT:-}" ]]; then
+# True when $1 is usable AS the shim's real git right now: an absolute path to
+# an existing file that is not the shim itself. The shim applies the same test
+# at exec.rs:86-90 (`exists` + `points_at_self`) — being no looser than the
+# consumer is the floor.
+#
+# The daemon injects AGEND_REAL_GIT at SPAWN time from the PATH of that moment;
+# the shim reaches it only through the legacy fallback inside `env_compat`. So
+# its mere presence does not mean it still fits the environment the tests build
+# — hence judge the VALUE, not the variable's existence.
+pf_real_git_usable() {
+    local v="$1" canon shim_canon
+    [ -n "$v" ] || return 1
+    case "$v" in
+        /* | [A-Za-z]:[\\/]*) ;; # absolute (POSIX, or a Windows drive path)
+        *) return 1 ;;
+    esac
+    [ -f "$v" ] || return 1
+    canon="$(pf_canon "$v")" || return 1
+    [ -f "$canon" ] || return 1
+    # Never treat the shim as its own real git — that is the loop #1504 contains.
+    if shim_canon="$(pf_canon "$(command -v git 2>/dev/null)" 2>/dev/null)"; then
+        [ "$canon" != "$shim_canon" ] || return 1
+    fi
+    pf_in_shim_dir "$canon" && return 1
+    return 0
+}
+
+# Re-pin whenever the CANONICAL variable is absent or no longer usable.
+if ! pf_real_git_usable "${AGENTIC_GIT_REAL_GIT:-}"; then
     if pf_first_git_is_shim; then
         if pf_real="$(pf_derive_real_git)"; then
             export AGENTIC_GIT_REAL_GIT="$pf_real"
             echo "[$SCRIPT_NAME] agent shell: pinned AGENTIC_GIT_REAL_GIT=$pf_real (shim at $(command -v git)) — #1504" >&2
+        elif pf_real_git_usable "${AGEND_REAL_GIT:-}"; then
+            # The daemon-injected legacy value is still good here; promoting it to
+            # the canonical name is what the shim reads first.
+            export AGENTIC_GIT_REAL_GIT="$AGEND_REAL_GIT"
+            echo "[$SCRIPT_NAME] agent shell: promoted AGEND_REAL_GIT=$AGEND_REAL_GIT to AGENTIC_GIT_REAL_GIT (shim at $(command -v git)) — #1504" >&2
         else
             # Acceptance: an unresolvable real git must be NAMED, not turned
             # into a second wave of false reds. Say what broke, how to confirm
             # it, and how to fix it, then keep going — the tests themselves
             # still decide the verdict.
-            echo "[$SCRIPT_NAME] WARNING: the agentic-git shim is first on PATH but no real git could be resolved." >&2
+            echo "[$SCRIPT_NAME] WARNING: the agentic-git shim is first on PATH but no usable real git could be resolved." >&2
             echo "  Symptom: if the test phase reports 'FATAL recursion guard tripped (AGENTIC_GIT_SHIM_DEPTH=3)' (#1504)," >&2
             echo "           those reds are shim self-resolution, NOT your change." >&2
-            echo "  Fix:     export AGENTIC_GIT_REAL_GIT=\"\$(git --version >/dev/null 2>&1 && command -v git)\"" >&2
-            echo "           — i.e. point it at a real git that is NOT the shim, e.g. /usr/bin/git." >&2
-            echo "           A shell without a real git on PATH at all cannot run this suite." >&2
+            echo "  Fix:     export AGENTIC_GIT_REAL_GIT=\"\$(command -v git)\" — any real git that is NOT the shim," >&2
+            echo "           e.g. /usr/bin/git. A stale, relative, or shim-pointing value is ignored here" >&2
+            echo "           for the same reason the shim ignores it." >&2
         fi
     fi
     unset pf_real
