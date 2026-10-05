@@ -1667,6 +1667,140 @@ fn switch_double_dash_file_is_not_a_restore_f1_17() {
     );
 }
 
+// ── PR #17 R5: the DWIM derivation must not depend on argv order ───────
+//
+// F5: `git checkout <assigned> --track` created and landed on a
+// basename-derived branch while the fence passed, because the derivation ran
+// only when a positional arrived — and `--track` came later, so the already
+// stored token was never re-derived. git's DWIM is order-independent:
+//
+//   git checkout --track agent/live     → Switched to a new branch 'live'
+//   git checkout agent/live --track     → Switched to a new branch 'live'
+//
+// Both orderings must produce the same derived name.
+#[test]
+fn dwim_is_order_independent_f5_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    // Trigger BEFORE the positional (R3 order).
+    for lead in [["--track"], ["-t"], ["--no-track"]] {
+        let mut argv: Vec<&str> = vec!["checkout", lead[0], "agent/live"];
+        argv[0] = "checkout";
+        let expected = Some(CheckoutTarget::Branch("live".into()));
+        assert_eq!(
+            resolve_checkout_target_branch(&s(&argv)),
+            expected,
+            "trigger-first `{}` must derive `live`",
+            argv.join(" ")
+        );
+    }
+    // Trigger AFTER the positional (F5) — same result, both subcommands.
+    for args in [
+        vec!["checkout", "agent/live", "--track"],
+        vec!["checkout", "agent/live", "-t"],
+        vec!["checkout", "agent/live", "--no-track"],
+        vec!["checkout", "-q", "agent/live", "--track"],
+        vec!["switch", "agent/live", "--track"],
+        vec!["switch", "agent/live", "-t"],
+        vec!["switch", "agent/live", "--no-track"],
+    ] {
+        assert_eq!(
+            resolve_checkout_target_branch(&s(&args)),
+            Some(CheckoutTarget::Branch("live".into())),
+            "trigger-last `{}` must derive the SAME `live` as trigger-first",
+            args.join(" ")
+        );
+    }
+}
+
+// The fence consequence: every F5 shape must DENY, not PASS.
+#[test]
+fn dwim_reverse_ordering_fenced_f5_17() {
+    for (sub, args) in [
+        ("checkout", vec!["checkout", "agent/live", "--track"]),
+        ("checkout", vec!["checkout", "agent/live", "-t"]),
+        ("checkout", vec!["checkout", "agent/live", "--no-track"]),
+        ("checkout", vec!["checkout", "-q", "agent/live", "--track"]),
+        ("switch", vec!["switch", "agent/live", "--track"]),
+        ("switch", vec!["switch", "agent/live", "-t"]),
+        ("switch", vec!["switch", "agent/live", "--no-track"]),
+    ] {
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let binding = bound_binding("agent/live", "/tmp/.worktrees/dev");
+        let action = classify(sub, &argv, &binding, false, false, false);
+        match action {
+            Action::Deny(reason) => assert!(
+                reason.contains("cross-branch"),
+                "`{}` DWIMs onto `live` and must be fenced: {reason}",
+                args.join(" ")
+            ),
+            other => panic!(
+                "`{}` MUST deny (git lands on `live`), got {other:?}",
+                args.join(" ")
+            ),
+        }
+    }
+}
+
+// Structural, not incidental: the derivation runs once, after the scan, so
+// moving the trigger anywhere in the argv cannot change the result. This
+// pins that property across positions the review rounds did not enumerate.
+#[test]
+fn dwim_trigger_position_cannot_change_result_f5_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    let expected = Some(CheckoutTarget::Branch("live".into()));
+    for args in [
+        vec!["checkout", "--track", "agent/live"],
+        vec!["checkout", "agent/live", "--track"],
+        vec!["checkout", "-q", "--track", "agent/live"],
+        vec!["checkout", "--track", "-q", "agent/live"],
+        vec!["checkout", "-q", "agent/live", "--track"],
+        vec!["checkout", "--force", "agent/live", "--track"],
+        vec!["switch", "--track", "agent/live"],
+        vec!["switch", "agent/live", "--track"],
+        vec!["switch", "--no-track", "agent/live"],
+        vec!["switch", "agent/live", "--no-track"],
+        // after `switch`'s transparent `--`
+        vec!["switch", "agent/live", "--", "--track"],
+        vec!["switch", "--", "agent/live", "--track"],
+    ] {
+        assert_eq!(
+            resolve_checkout_target_branch(&s(&args)),
+            expected,
+            "trigger position in `{}` must not change the derived name",
+            args.join(" ")
+        );
+    }
+}
+
+// Control: WITHOUT a trigger, order is irrelevant and the positional IS the
+// branch — so the same-branch case still passes. Passes on both the pre-R5
+// and post-R5 resolver.
+#[test]
+fn no_trigger_position_is_irrelevant_f5_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "agent/live", "-q"])),
+        Some(CheckoutTarget::Branch("agent/live".into()))
+    );
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "-q", "agent/live"])),
+        Some(CheckoutTarget::Branch("agent/live".into()))
+    );
+    let binding = bound_binding("agent/live", "/tmp/.worktrees/dev");
+    let action = classify(
+        "checkout",
+        &["checkout".into(), "agent/live".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    assert!(
+        matches!(action, Action::ChdirPass(_)),
+        "same-branch checkout must still pass, got {action:?}"
+    );
+}
+
 #[test]
 fn target_branch_resolution_skips_options_and_their_values_12() {
     // Unit-level pin on the parser itself, independent of classify's

@@ -1084,16 +1084,25 @@ pub(crate) fn derive_dwim_branch_name(spec: &str) -> Option<String> {
 ///   - short flags BUNDLE: `git switch -qd` detaches (the `d` is a flag)
 ///     while `git switch -catt` creates a branch named `att`;
 ///   - `--track` / `-t` / `--no-track` are VALUELESS and share git's DWIM
-///     path: git creates a local branch from a LATER positional and switches
-///     to it, so the positional itself is never the branch git lands on.
+///     path: git creates a local branch from a positional and switches to
+///     it, so the positional itself is never the branch git lands on.
 ///     Reading it as the target compares the wrong name and under-denies —
 ///     which matters here because AgEnD binding branches are
 ///     `<agent>/<task-slug>` and the DWIM'd basename almost always differs
-///     (PR #17 F4 / R3). See `derive_dwim_branch_name` for the exact rules;
-///     `--track=<v>` is skipped because modern git rejects that form;
+///     (PR #17 F4 / R3). The derivation is applied AFTER the whole scan
+///     (PR #17 R5), so it does not matter whether the trigger precedes or
+///     follows the positional. See `derive_dwim_branch_name`; `--track=<v>`
+///     is skipped because modern git rejects that form;
 ///   - `--branch=<n>` / `-c<n>` carry an attached value; a bare `-` is git's
 ///     "previous branch" shorthand and is a real target;
-///   - a bare `--` terminates options; everything after it is a pathspec.
+///   - a bare `--` terminates options for `checkout`; for `switch` it is
+///     transparent (see `is_switch` below).
+///
+/// On `switch`'s post-`--` handling: git's real rule is that every token
+/// after `--` is re-read as a plain reference, whereas this resolver keeps
+/// parsing it with the same option grammar. These are different models that
+/// agree on every shape probed so far; the divergence, where found, has been
+/// fail-closed. Treat it as an approximation, not an equivalence.
 ///
 /// Fail-closed on unknown options: an unrecognised flag is treated as
 /// value-less, so a following positional is still read as the target. That
@@ -1149,13 +1158,13 @@ pub(crate) fn resolve_checkout_target_branch(args: &[String]) -> Option<Checkout
                 detach_at.get_or_insert_with(|| tok.clone());
                 continue;
             }
-            // Under `--track`/`-t`/`--no-track` git DWIMs a NEW branch from
-            // this positional — the landed branch is NOT this positional, so
-            // comparing them would under-deny (PR #17 F4 / R3).
-            if dwim_trigger && named_branch.is_none() {
-                first_positional = derive_dwim_branch_name(tok);
-                continue;
-            }
+            // PR #17 R5: store the token VERBATIM. Whether it is the branch
+            // or a DWIM source depends on `dwim_trigger`, which may only be
+            // set by an option that appears LATER in the argv. Deriving here
+            // made the result order-dependent and under-denied the reverse
+            // ordering (`git checkout <assigned> --track`), where git creates
+            // and lands on a basename-derived branch. The derivation is done
+            // once, after the scan, so ordering cannot affect the outcome.
             if first_positional.is_none() {
                 first_positional = Some(tok.clone());
             } else {
@@ -1242,6 +1251,16 @@ pub(crate) fn resolve_checkout_target_branch(args: &[String]) -> Option<Checkout
     // positional named the assigned branch (`checkout <assigned> --detach`).
     if detached {
         return Some(CheckoutTarget::Detach(detach_at));
+    }
+    // PR #17 R5: the DWIM derivation happens HERE, after the whole scan, so
+    // it cannot depend on where the trigger appeared relative to the
+    // positional. `git checkout agent/live --track` and
+    // `git checkout --track agent/live` both DWIM to `live` in real git; the
+    // previous in-loop derivation only handled the second.
+    if dwim_trigger && named_branch.is_none() {
+        first_positional = first_positional
+            .as_deref()
+            .and_then(derive_dwim_branch_name);
     }
     // An explicit branch-naming option outranks a bare positional — that is
     // the DWIM'd branch (already stored in `first_positional` by
