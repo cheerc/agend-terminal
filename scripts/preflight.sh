@@ -115,10 +115,10 @@ fi
 #
 # Env-only by construction: we export a variable, never rewrite PATH and never
 # touch AGENTIC_GIT_HOME's meaning, so the shim keeps enforcing the same policy
-# for the same agent identity. (Do NOT "fix" this by sourcing
-# scripts/lib/real-git.sh — that helper PREPENDS the real git's directory onto
-# PATH, which would change path resolution outside a managed shell and is
-# fixture-only by contract, see tests/fixture_real_git_provenance.rs.)
+# for the same agent identity. (Do NOT "fix" this by sourcing the fixture-only
+# shell seam under scripts/lib/ — that helper PREPENDS the real git's directory
+# onto PATH, which would change path resolution outside a managed shell, and it
+# is fixture-only by contract; see tests/fixture_real_git_provenance.rs.)
 
 # Physical path of an existing file/dir, following symlinks (bash 3.2 has no
 # `readlink -f`; realpath(1) exists on macOS 13+ and on CI's linux runners).
