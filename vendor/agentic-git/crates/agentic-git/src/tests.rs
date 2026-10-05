@@ -1182,6 +1182,98 @@ fn genuine_pathspec_restore_stays_exempt_c17() {
     );
 }
 
+// ── PR #17 rework round 2: F4, a valueless DWIM option ────────────────
+//
+// `--no-track` carries no operand, so the resolver treated it as an unknown
+// valueless flag and read the FOLLOWING POSITIONAL as the target. But git
+// routes `--no-track` through the same DWIM path as `--track`: it creates a
+// local branch from the positional's BASENAME and switches there. So the
+// branch git lands on is `live`, not the `agent/live` that was compared —
+// and since they compared EQUAL, the fence passed.
+
+// F4 — the fence must see the DWIM'd basename, not the raw positional.
+#[test]
+fn no_track_dwim_is_fenced_f4_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+
+    // assigned = `agent/live`; git lands on `live`, so this must NOT read as
+    // a same-branch no-op.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "--no-track", "agent/live"])),
+        Some(CheckoutTarget::Branch("live".into())),
+        "--no-track must DWIM to the basename, not pass the positional through"
+    );
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["switch", "--no-track", "agent/live"])),
+        Some(CheckoutTarget::Branch("live".into()))
+    );
+    // A noise flag in front must not change that.
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "-q", "--no-track", "agent/live"])),
+        Some(CheckoutTarget::Branch("live".into()))
+    );
+
+    // End to end through classify(): assigned `agent/live`, so the DWIM'd
+    // `live` differs and the fence must fire.
+    let binding = bound_binding("agent/live", "/tmp/.worktrees/dev");
+    for args in [
+        vec!["checkout", "--no-track", "agent/live"],
+        vec!["switch", "--no-track", "agent/live"],
+        vec!["checkout", "-q", "--no-track", "agent/live"],
+    ] {
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let action = classify("checkout", &argv, &binding, false, false, false);
+        match action {
+            Action::Deny(reason) => assert!(
+                reason.contains("cross-branch"),
+                "`{}` DWIMs onto `live` and must be fenced: {reason}",
+                args.join(" ")
+            ),
+            other => panic!(
+                "`{}` MUST deny (git lands on `live`), got {other:?}",
+                args.join(" ")
+            ),
+        }
+    }
+}
+
+// F4 boundary: `--no-track` with NO positional names nothing — real git
+// errors (`fatal: --track needs a branch name`), so `Stay` is correct and
+// must not become a spurious deny.
+#[test]
+fn no_track_without_positional_stays_f4_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "--no-track"])),
+        Some(CheckoutTarget::Stay)
+    );
+}
+
+// F4 control: WITHOUT `--no-track`, the positional IS the branch, so the
+// same-branch case must still pass. This pins that the DWIM rewrite did not
+// break the ordinary path.
+#[test]
+fn plain_positional_without_no_track_still_compares_f4_17() {
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    assert_eq!(
+        resolve_checkout_target_branch(&s(&["checkout", "agent/live"])),
+        Some(CheckoutTarget::Branch("agent/live".into()))
+    );
+    let binding = bound_binding("agent/live", "/tmp/.worktrees/dev");
+    let action = classify(
+        "checkout",
+        &["checkout".into(), "agent/live".into()],
+        &binding,
+        false,
+        false,
+        false,
+    );
+    assert!(
+        matches!(action, Action::ChdirPass(_)),
+        "plain same-branch checkout must still pass, got {action:?}"
+    );
+}
+
 #[test]
 fn target_branch_resolution_skips_options_and_their_values_12() {
     // Unit-level pin on the parser itself, independent of classify's

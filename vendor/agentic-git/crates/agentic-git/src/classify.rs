@@ -1045,6 +1045,10 @@ const CHECKOUT_PATHSPEC_VALUE_OPTS: &[&str] = &["pathspec-from-file"];
 ///     The `--track=<v>` attached form is NOT a branch — modern git rejects
 ///     it outright (`option '--track' expects "direct" or "inherit"`), so
 ///     its value is skipped like any other option operand;
+///   - `--no-track` is VALUELESS but shares that same DWIM path: git lands
+///     on a branch derived from the following positional's BASENAME, not on
+///     the positional itself. Reading the positional as the target compares
+///     the wrong name and under-denies (PR #17 F4);
 ///   - `--branch=<n>` / `-c<n>` carry an attached value; a bare `-` is git's
 ///     "previous branch" shorthand and is a real target;
 ///   - a bare `--` terminates options; everything after it is a pathspec.
@@ -1065,6 +1069,10 @@ pub(crate) fn resolve_checkout_target_branch(args: &[String]) -> Option<Checkout
     let mut detach_at: Option<String> = None;
     let mut named_branch: Option<String> = None;
     let mut first_positional: Option<String> = None;
+    // `--no-track` is valueless but still triggers git's DWIM path: the branch
+    // git lands on is derived from the following positional's BASENAME, not
+    // from the positional itself. Modeled as its own outcome (PR #17 F4).
+    let mut dwim_bare: Option<String> = None;
 
     while let Some(tok) = rest.next() {
         if tok == "--" {
@@ -1076,6 +1084,13 @@ pub(crate) fn resolve_checkout_target_branch(args: &[String]) -> Option<Checkout
             // detach AT, not a branch to land on.
             if detached {
                 detach_at.get_or_insert_with(|| tok.clone());
+                continue;
+            }
+            // Under `--no-track` git DWIMs a NEW branch from this
+            // positional's basename — the landed branch is NOT this
+            // positional, so comparing them would under-deny (PR #17 F4).
+            if dwim_bare.is_some() {
+                dwim_bare = Some(tok.rsplit('/').next().unwrap_or(tok.as_str()).to_string());
                 continue;
             }
             if first_positional.is_none() {
@@ -1095,6 +1110,12 @@ pub(crate) fn resolve_checkout_target_branch(args: &[String]) -> Option<Checkout
             };
             match name {
                 "detach" => detached = true,
+                // PR #17 F4: `--no-track` is the valueless negation of
+                // `--track`, and git routes it through the SAME DWIM path —
+                // it creates a local branch from the following positional's
+                // basename and switches there. The positional is NOT the
+                // branch git lands on, so it must not be compared as one.
+                "no-track" => dwim_bare = Some(String::new()),
                 // A branch-NAMING option: its value is the branch this
                 // invocation lands on (`--branch <n>` / `--branch=<n>`).
                 name if CHECKOUT_BRANCH_VALUE_OPTS.contains(&name) => {
@@ -1160,7 +1181,13 @@ pub(crate) fn resolve_checkout_target_branch(args: &[String]) -> Option<Checkout
     }
     // An explicit branch-naming option outranks a bare positional: for
     // `--track <ref>` DWIM the ref IS what git lands on.
-    let branch = named_branch.or(first_positional);
+    // `--no-track` also outranks the positional, but with the DWIM'd
+    // basename — the branch git actually lands on. A `--no-track` with NO
+    // following positional names nothing (git: `--track needs a branch
+    // name`), so the empty sentinel falls through rather than yielding an
+    // empty branch name.
+    let dwim = dwim_bare.filter(|b| !b.is_empty());
+    let branch = named_branch.or(dwim).or(first_positional);
     Some(match branch {
         Some(b) => CheckoutTarget::Branch(b),
         None => CheckoutTarget::Stay,
