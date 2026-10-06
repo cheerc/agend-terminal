@@ -411,9 +411,9 @@ fn deliver_delegate(ctx: &DeliveryCtx<'_>, runtime: Option<&RuntimeContext>) -> 
             crate::agent_ops::messaging::SendOutcome::Success { .. } => {
                 json!({"target": ctx.target})
             }
-            crate::agent_ops::messaging::SendOutcome::Error { error, .. } => {
-                json!({"error": error})
-            }
+            crate::agent_ops::messaging::SendOutcome::Error {
+                error, code, hint, ..
+            } => super::send_error_response(error, code, hint),
         }
     } else {
         crate::agent_ops::send_via_api_bridge(ctx.home, &req)

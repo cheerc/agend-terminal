@@ -343,3 +343,10 @@ mod review_repro_mcp_dispatch_hook;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod review_repro_issue15_subject_mismatch;
+
+// #33 (S2): the #15 subject-column token must SURVIVE the MCP error projection
+// — every adapter used to drop `SendOutcome`'s `code` with `..`. Sibling file
+// per the p0b_tests / instance_964_tests precedent.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod review_repro_issue33_error_projection;

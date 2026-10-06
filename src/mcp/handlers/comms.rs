@@ -83,6 +83,40 @@ pub(super) fn handle_unified_send(
     }
 }
 
+/// Project the neutral service's [`SendOutcome::Error`] into an MCP response
+/// Value.
+///
+/// #33 (S1): the `code` and `hint` discriminators existed on
+/// `SendOutcome::Error` all along but every MCP adapter dropped them with
+/// `..`, leaving every rejection as an undifferentiated `{"error": …}`. This
+/// forwards both, in the SAME shape the API adapter already emits
+/// (`src/api/handlers/messaging.rs`) — `code`/`hint` appear only when present,
+/// so a `None` leaves the response byte-identical to the previous projection.
+///
+/// SCOPE: additive field forwarding only. The `code` VALUES are untouched —
+/// `report_authority_rejected` still spans "no assignment", "assignment
+/// mismatch", and "assignment no longer valid", and narrowing it is a separate
+/// decision (#33) this deliberately does not pre-empt. Forwarding the
+/// coarse code is still strictly more information than dropping it.
+///
+/// Why the projection lives here rather than in `agent_ops::messaging`: that
+/// module sits below both adapter families and must stay free of raw-`Value`
+/// entry points (pinned by `send_typed_shared_service_boundary_guard_2454`).
+pub(super) fn send_error_response(
+    error: String,
+    code: Option<String>,
+    hint: Option<String>,
+) -> Value {
+    let mut resp = json!({"error": error});
+    if let Some(c) = code {
+        resp["code"] = json!(c);
+    }
+    if let Some(h) = hint {
+        resp["hint"] = json!(h);
+    }
+    resp
+}
+
 pub(super) fn handle_send_to_instance(
     home: &Path,
     args: &Value,
@@ -120,9 +154,9 @@ pub(super) fn handle_send_to_instance(
                 settlement,
                 ..
             } => send_success_response(target, &delivery_mode, settlement.as_deref()),
-            crate::agent_ops::messaging::SendOutcome::Error { error, .. } => {
-                json!({"error": error})
-            }
+            crate::agent_ops::messaging::SendOutcome::Error {
+                error, code, hint, ..
+            } => send_error_response(error, code, hint),
         }
     } else {
         crate::agent_ops::send_via_api_bridge(home, &req)
@@ -275,9 +309,9 @@ pub(super) fn handle_report_result(
                     settlement,
                     ..
                 } => send_success_response(target, &delivery_mode, settlement.as_deref()),
-                crate::agent_ops::messaging::SendOutcome::Error { error, .. } => {
-                    json!({"error": error})
-                }
+                crate::agent_ops::messaging::SendOutcome::Error {
+                    error, code, hint, ..
+                } => send_error_response(error, code, hint),
             }
         } else {
             crate::agent_ops::send_via_api_bridge(home, &req)
@@ -346,9 +380,9 @@ pub(super) fn handle_request_information(
                 settlement,
                 ..
             } => send_success_response(target, &delivery_mode, settlement.as_deref()),
-            crate::agent_ops::messaging::SendOutcome::Error { error, .. } => {
-                json!({"error": error})
-            }
+            crate::agent_ops::messaging::SendOutcome::Error {
+                error, code, hint, ..
+            } => send_error_response(error, code, hint),
         }
     } else {
         crate::agent_ops::send_via_api_bridge(home, &req)
@@ -406,9 +440,9 @@ pub(super) fn handle_broadcast(
                     settlement,
                     ..
                 } => send_success_response(target, &delivery_mode, settlement.as_deref()),
-                crate::agent_ops::messaging::SendOutcome::Error { error, .. } => {
-                    json!({"error": error})
-                }
+                crate::agent_ops::messaging::SendOutcome::Error {
+                    error, code, hint, ..
+                } => send_error_response(error, code, hint),
             }
         } else {
             crate::agent_ops::send_via_api_bridge(home, &req)
