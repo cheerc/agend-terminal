@@ -47,14 +47,20 @@ CI's `windows-latest` runner stays the backstop. The preflight is intentionally
 own `#[cfg(test)]` modules and skips every `tests/*.rs` invariant (temp-fixture
 prefix isolation, env-mutation serialisation, spawn rationale, file-size
 ceilings, docs bilingual), so a green `--bin` run is not evidence for CI. Say
-"tests green" only after that gate (or `scripts/preflight.sh --quick`). In a
-daemon-managed agent shell `export AGENTIC_GIT_HOME="$AGEND_HOME"` first
-(preflight does it itself): tests that scope `AGEND_HOME` and spawn `git`
-otherwise trip the agentic-git shim's recursion guard (#1504) — about 40
-deterministic failures CI never sees, because CI has no shim on PATH. Which
-of the remaining results you may trust from an agent shell, and which need a
-solo re-run first, is defined in CONTRIBUTING.md under "Which local results
-an agent worktree can trust".
+"tests green" only after that gate (or `scripts/preflight.sh --quick`). From
+`scripts/preflight.sh` alone you need no manual export: it pins both halves of
+the shim's starting line — `AGENTIC_GIT_HOME` (so the shim can exclude its own
+directory when a test scopes `AGEND_HOME` to a temp dir) and `AGENTIC_GIT_REAL_GIT`
+(so the shim has a real git to exec). It decides whether that second pin applies
+by what `git` actually resolves to on PATH, not by whether some env var is set,
+so a plain non-agent shell is untouched. Without both, tests that scope
+`AGEND_HOME` and spawn `git` trip the agentic-git shim's recursion guard (#1504)
+— about 40 deterministic failures CI never sees, because CI has no shim on
+PATH. If preflight cannot resolve a real git it says so and names the symptom
+(`FATAL recursion guard tripped (AGENTIC_GIT_SHIM_DEPTH=3)`); that reds are
+shim self-resolution, not your change. Which of the remaining results you may
+trust from an agent shell, and which need a solo re-run first, is defined in
+CONTRIBUTING.md under "Which local results an agent worktree can trust".
 
 **Which hooks actually fire depends on `core.hooksPath`, and there are two
 regimes.** In a daemon-managed worktree — and in any clone whose
