@@ -7766,7 +7766,7 @@ fn timed_out_partial_remove_marks_binding_unusable_and_does_not_snapshot_remnant
     assert_eq!(outcome.code, Some("release_incomplete"), "{outcome:?}");
     assert_eq!(outcome.stage, Some("worktree_remove"), "{outcome:?}");
     assert!(
-        outcome.worktree_removed == false,
+        !outcome.worktree_removed,
         "directory still exists: {outcome:?}"
     );
     assert!(

@@ -219,7 +219,9 @@ fn git_and_managed_marker_are_never_swept_40() {
     seed_dir_with_files(&wt.join("target"), 2);
     std::fs::write(wt.join(crate::worktree_pool::MANAGED_MARKER), "agent=x\n")
         .expect("seed marker");
-    let git_dir_before = std::fs::read_dir(wt.join(".git")).unwrap().count();
+    let git_dir_before = std::fs::read_dir(wt.join(".git"))
+        .expect("read .git")
+        .count();
 
     let out = clean_ignored_build_cache_with_budget(&wt, Duration::from_secs(30));
     assert!(out.is_ok(), "sweep must succeed: {out:?}");
@@ -229,7 +231,10 @@ fn git_and_managed_marker_are_never_swept_40() {
         "#40: the daemon marker must never be swept — it is the release authority"
     );
     assert!(
-        std::fs::read_dir(wt.join(".git")).unwrap().count() == git_dir_before,
+        std::fs::read_dir(wt.join(".git"))
+            .expect("re-read .git")
+            .count()
+            == git_dir_before,
         "#40: .git must never be swept even if a .gitignore matched it"
     );
     std::fs::remove_dir_all(&wt).ok();

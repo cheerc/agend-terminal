@@ -69,7 +69,7 @@ pub(crate) mod release_test_seam {
         // Fault-inject the git removal syscall, not the postcondition, so a
         // test can leave a genuine partial on-disk worktree and exercise the
         // actual release response/tombstone path without waiting 60s.
-        static REMOVE_ERROR: RefCell<Option<io::ErrorKind>> = RefCell::new(None);
+        static REMOVE_ERROR: RefCell<Option<io::ErrorKind>> = const { RefCell::new(None) };
     }
 
     pub(crate) struct Guard;
