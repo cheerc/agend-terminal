@@ -24,8 +24,10 @@ This is the one-shot mirror of CI's `check` job and the best way to avoid a
 local-green → CI-red round trip. It runs `cargo fmt --check`,
 `cargo clippy --all-targets --features tray -- -D warnings`,
 `cargo nextest run --features tray` (unit + integration + invariants — CI's
-runner; `cargo test --tests --features tray` only when cargo-nextest is
-missing), and a
+runner). If cargo-nextest is missing, preflight marks the test step FAILED with
+an install hint (`cargo install cargo-nextest --locked`); it does not run
+`cargo test --tests`, whose bulk result cannot distinguish flaky reds from real
+regressions. It also runs a
 **Windows cross-check** (`x86_64-pc-windows-msvc`) — the keystone, since
 Windows-only code (`libc::getppid`, `/bin/sh` spawns, `UnixStream`) compiles
 fine on a unix dev box but breaks CI's `windows-latest` runner.

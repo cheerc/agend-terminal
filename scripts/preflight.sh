@@ -13,11 +13,11 @@
 #   2. cargo clippy <owned targets + agentic-git wrapper> --features tray -- -D warnings  (CI's exact targets)
 #   3. cargo nextest run --features tray   (unit + integration + invariants)
 #      This is CI's runner AND selection (unit tests + every tests/*.rs target).
-#      Without cargo-nextest it falls back to `cargo test --tests --features tray`
-#      — same selection, but a binary's tests then share one process, so tests
-#      that touch process-global state can race (CI never runs that form). A
-#      floating stable toolchain is not byte-exact over time either. "Green here"
-#      is a strong pre-check, not a byte-exact guarantee of CI.
+#      If cargo-nextest is missing, the test step FAILS with an install hint;
+#      preflight does NOT substitute `cargo test --tests` because its bulk verdict
+#      is flaky and indistinguishable from a real regression. A floating stable
+#      toolchain is not byte-exact over time either. "Green here" is a strong
+#      pre-check, not a byte-exact guarantee of CI.
 #   4. Windows cross-check (x86_64-pc-windows-msvc)   <- the keystone
 #
 # Step 4 catches the class that hurts most: Windows-only code
@@ -391,11 +391,13 @@ if cargo nextest --version >/dev/null 2>&1; then
     step "test (nextest --features tray: unit + integration + invariants — CI's runner)" \
         cargo nextest run --features tray
 else
-    echo "[$SCRIPT_NAME] cargo-nextest not installed — falling back to 'cargo test --tests'" >&2
-    echo "  (same selection; a binary's tests share one process, so parallel tests may race)" >&2
-    echo "  install CI's runner: cargo install cargo-nextest --locked" >&2
-    step "test (--tests --features tray: unit + integration + invariants — cargo-nextest fallback)" \
-        cargo test --tests --features tray
+    cargo_nextest_missing() {
+        echo "[$SCRIPT_NAME] ERROR: required test runner cargo-nextest is not installed; the test suite was NOT run." >&2
+        echo "  install: cargo install cargo-nextest --locked" >&2
+        return 1
+    }
+    step "test (FAIL: runner missing — cargo-nextest required)" \
+        cargo_nextest_missing
 fi
 
 # ── Step 4: Windows cross-check ──────────────────────────────────────────
