@@ -362,12 +362,24 @@ fi
 # origin — none of which make local checks validate a state CI will disagree
 # with.
 #
-# Placement: this runs FIRST among the checks, before any cargo work, because the
-# later steps all read the worktree. When it trips, everything after it is
-# validating content that is not what will be pushed, and burning a full
-# clippy+nextest cycle on it is exactly the waste #13 is about. It is also the
-# first thing `scripts/hooks/pre-push` gets for free, since that hook delegates
-# to `scripts/preflight.sh --quick` rather than re-listing the parity commands.
+# Placement: this runs FIRST among the checks, so a tracked-file divergence is
+# reported before the cargo steps rather than buried among them. Note that it
+# does NOT short-circuit the run: `step()` is run-all by design (so one pass
+# shows every problem), so the clippy and nextest steps still execute after this
+# one fails. Reporting the divergence early is the point; skipping the expensive
+# steps on it would need an abort-on-failure path that deliberately departs from
+# that run-all contract.
+#
+# Coverage is "when the agent RUNS preflight", not "automatically on push". In a
+# daemon-managed worktree `core.hooksPath` points at `$AGEND_HOME/hooks`, where
+# the active hooks are the daemon's own (CLAUDE.md, "Which hooks actually fire"),
+# so `scripts/hooks/pre-push` is not the active hook there and this gate is not
+# reached on push. Even in the `scripts/hooks` regime that hook only runs its
+# CI-parity block when the push touches `src/ tests/ Cargo.toml Cargo.lock
+# build.rs`, so a scripts-only change like this one would not trigger it either.
+# That is consistent with preflight being a manual gate by design — CLAUDE.md
+# says so explicitly — and an agent iterating on a worktree does run it, which
+# is the case #13 is about.
 step "worktree matches HEAD (tracked files)" \
     pf_check_worktree_matches_head
 
