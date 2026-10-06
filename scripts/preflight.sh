@@ -260,6 +260,56 @@ banner() {
     echo "──────────────────────────────────────────────────────────────"
 }
 
+# #13 — tracked worktree content must match what HEAD records, so the local
+# checks cannot pass on content CI will not receive. See the call site for the
+# full rationale and the exact shapes covered.
+pf_check_worktree_matches_head() {
+    # Read-only; needs no cargo, and the shim passes `diff`/`diff-index` through.
+    local staged unstaged
+    staged="$(git diff --cached --name-only --no-renames 2>/dev/null)"
+    unstaged="$(git diff --name-only --no-renames 2>/dev/null)"
+
+    if [[ -z "$staged" && -z "$unstaged" ]]; then
+        return 0
+    fi
+
+    if [[ -n "$unstaged" ]]; then
+        echo
+        echo "[$SCRIPT_NAME] These TRACKED files differ from the index (edited but not staged):"
+        while IFS= read -r f; do
+            [[ -n "$f" ]] && echo "    $f"
+        done <<<"$unstaged"
+    fi
+    if [[ -n "$staged" ]]; then
+        echo
+        echo "[$SCRIPT_NAME] These files are staged but NOT committed (index is ahead of HEAD):"
+        while IFS= read -r f; do
+            [[ -n "$f" ]] && echo "    $f"
+        done <<<"$staged"
+    fi
+    if [[ -n "$unstaged" && -n "$staged" ]]; then
+        cat >&2 <<EOF
+
+  A file can appear in both lists when it was staged and then edited again —
+  that is the #13 accident shape: the COMMIT holds the staged version while the
+  worktree holds the newer one, so local checks (which read the worktree) pass
+  while CI (which reads the commit) fails.
+EOF
+    fi
+
+    cat >&2 <<EOF
+
+  Every later step in this run reads the WORKTREE, so a pass below is a pass on
+  content that is not what will be pushed. Untracked files are deliberately NOT
+  reported here — they are a legitimate part of iterating in this repo.
+
+  Fix: commit the current content (git add <files> && git commit), or restore the
+  files you did not mean to change (git restore <files>) before re-running.
+  Stashing (git stash push) also clears the staged/unstaged state.
+EOF
+    return 1
+}
+
 # step "<label>" cmd args...   — runs cmd, records pass/fail, never aborts the
 # script (run-all so the dev sees every problem in one pass, not one at a time).
 step() {
@@ -281,6 +331,45 @@ done < <(git ls-files -z --others --exclude-standard -- '*.rs' ':!:vendor/**')
 if [[ "$untracked_rs_found" == "true" ]]; then
     echo "[$SCRIPT_NAME] note: untracked, non-ignored *.rs files are included in the fmt check" >&2
 fi
+
+# ── #13: tracked files must match HEAD ─────────────────────────────────────
+# The #13 accident: an agent edits the worktree, runs `git add`, edits the SAME
+# file AGAIN, and only then commits. The commit carries the intermediate
+# version; the worktree holds the final one. Every local check below reads the
+# WORKTREE and passes, while CI reads the COMMIT and fails — and neither
+# `fmt --check` (the file need not be owned Rust) nor `git diff-tree` (the
+# committed content is byte-identical to the pre-edit stage) can see it.
+#
+# Scope is deliberately TRACKED files only. `git status --porcelain
+# --untracked-files=normal` would also flag every untracked scratch file an agent
+# creates while iterating — but untracked files are legitimate here by the repo's
+# own convention: `scripts/fmt-owned.sh` defines its owned surface as "tracked
+# PLUS untracked/non-ignored *.rs", and the untracked-*.rs note above prints
+# rather than blocks. Requiring a fully clean worktree would contradict that, so
+# this gate uses `git diff` (worktree vs INDEX) plus `git diff --cached` (index vs
+# HEAD) and ignores untracked paths entirely.
+#
+# Those two together cover every shape where what a later step reads differs from
+# what HEAD records:
+#   * `MM` (staged AND further edited) — the #13 accident itself; the unstaged
+#     half is what the commit silently dropped.
+#   * ` M` (tracked edit, never staged) — the commit does not contain the edit at
+#     all, and local checks are validating something CI will never see.
+#   * `M ` / `A ` (staged, not committed) — the index is ahead of HEAD, so this
+#     run is validating an uncommitted state.
+# It does NOT cover untracked files (above), deletions the agent intends to
+# commit later, or a worktree that is clean here but whose HEAD differs from
+# origin — none of which make local checks validate a state CI will disagree
+# with.
+#
+# Placement: this runs FIRST among the checks, before any cargo work, because the
+# later steps all read the worktree. When it trips, everything after it is
+# validating content that is not what will be pushed, and burning a full
+# clippy+nextest cycle on it is exactly the waste #13 is about. It is also the
+# first thing `scripts/hooks/pre-push` gets for free, since that hook delegates
+# to `scripts/preflight.sh --quick` rather than re-listing the parity commands.
+step "worktree matches HEAD (tracked files)" \
+    pf_check_worktree_matches_head
 
 step "fmt --check (owned surface)" \
     scripts/fmt-owned.sh --check
