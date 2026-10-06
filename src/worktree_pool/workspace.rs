@@ -539,7 +539,7 @@ pub(crate) fn release_one_stale_holder_with_permit(
             )
         })?;
     }
-    match remove_worktree(agent, holder, source_repo) {
+    match remove_worktree(agent, holder, source_repo, None) {
         WorktreeRemoval::Removed | WorktreeRemoval::AlreadyAbsent => Ok(()),
         WorktreeRemoval::Unmanaged(m) => Err(m),
         // #40: folded into `Failed` deliberately. This is the stale-holder
@@ -548,7 +548,7 @@ pub(crate) fn release_one_stale_holder_with_permit(
         // state for the caller to surface. Both outcomes mean the same thing
         // here: the directory could not be removed. The remnant-specific
         // handling lives in the three release call sites in `worktree_pool.rs`.
-        WorktreeRemoval::Failed(e) | WorktreeRemoval::PartiallyRemoved { cause: e } => Err(e),
+        WorktreeRemoval::Failed(e) | WorktreeRemoval::PartiallyRemoved { cause: e, .. } => Err(e),
     }
 }
 
@@ -673,7 +673,7 @@ pub fn reverse_reconcile(home: &Path, agent: &str) -> Result<(), String> {
     } else {
         // No live binding means there is no release transition to serialize; keep
         // the legacy remove-only path for already-unbound converted workspaces.
-        match remove_worktree(agent, &ws, &source_repo) {
+        match remove_worktree(agent, &ws, &source_repo, None) {
             WorktreeRemoval::Removed | WorktreeRemoval::AlreadyAbsent => {}
             WorktreeRemoval::Unmanaged(m) => {
                 return Err(format!("reverse_reconcile: {m}"));
@@ -686,7 +686,7 @@ pub fn reverse_reconcile(home: &Path, agent: &str) -> Result<(), String> {
             // already-unbound converted workspace (no live binding to flag),
             // so there is no binding left to mark unusable; a removal that did
             // not complete is simply a failed remove from here.
-            WorktreeRemoval::PartiallyRemoved { cause } => {
+            WorktreeRemoval::PartiallyRemoved { cause, .. } => {
                 return Err(format!(
                     "reverse_reconcile: worktree remove did not complete: {cause}"
                 ));

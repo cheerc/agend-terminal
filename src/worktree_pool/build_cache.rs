@@ -59,15 +59,79 @@ fn after_dir(_path: &Path) {}
 /// budget. Normal caches are deleted far inside this window.
 pub(crate) const BUILD_CACHE_CLEANUP_BUDGET: Duration = Duration::from_secs(10);
 
-/// Remove an ignored `target/` cache before worktree removal, bounded by
+/// Outcome of the pre-removal ignored-cache sweep.
+///
+/// #40: the sweep's product is a git-ignored build cache, never tracked work.
+/// That is what makes a *skip* safe and a *fatal* unnecessary for the "could
+/// not delete" cases — but "could not tell what is disposable" is a different
+/// failure and must stay fatal, so the two are deliberately distinct variants
+/// rather than one skip bucket.
+#[derive(Debug)]
+pub(crate) enum CacheCleanup {
+    /// Every git-ignored cache was removed.
+    Complete,
+    /// Some caches survived (unreadable directory, or the budget elapsed).
+    /// Non-fatal: the release continues and the bounded
+    /// `git worktree remove --force` that follows still deletes the whole
+    /// worktree directory. The reason is recorded on the release outcome so a
+    /// surviving cache is visible instead of silently reported as clean.
+    Skipped(String),
+    /// Git could not classify what is disposable. Continuing would mean acting
+    /// on a directory of unknown provenance, so the caller fails the release
+    /// rather than guessing.
+    Fatal { path: PathBuf, reason: String },
+}
+
+/// Fold a sweep result into a release outcome.
+///
+/// A skip is recorded and the release continues: the leftover is a git-ignored
+/// build cache and the bounded worktree removal still deletes it. A fatal is
+/// written onto the outcome — the caller decides whether to return it or carry
+/// on, and both sites share this so the two never drift apart.
+///
+/// Split out of `worktree_pool.rs` for two reasons: the file sits at 2467 of a
+/// hard 2500-line ratchet (see `tests/src_file_size_invariant.rs`), and the
+/// three release routes were about to hold three hand-copied versions of this
+/// decision. The skip-vs-fatal split is the load-bearing part — do not collapse
+/// it back into one bucket, and do not inline it.
+pub(crate) fn apply_cache_cleanup(
+    out: &mut super::ReleaseOutcome,
+    result: CacheCleanup,
+) -> Result<(), (PathBuf, String)> {
+    match result {
+        CacheCleanup::Complete => Ok(()),
+        CacheCleanup::Skipped(reason) => {
+            out.build_cache_cleanup_skipped = Some(reason);
+            Ok(())
+        }
+        CacheCleanup::Fatal { path, reason } => {
+            mark_cache_cleanup_fatal(out, &path, &reason);
+            Err((path, reason))
+        }
+    }
+}
+
+/// Write the caller-visible failure for a cache the sweep could not classify.
+pub(crate) fn mark_cache_cleanup_fatal(out: &mut super::ReleaseOutcome, path: &Path, reason: &str) {
+    super::mark_release_incomplete(
+        out,
+        "build_cache_cleanup",
+        path,
+        format!(
+            "release incomplete: could not classify ignored build cache at {}: {reason}",
+            path.display()
+        ),
+    );
+}
+
+/// Remove an ignored build cache before worktree removal, bounded by
 /// [`BUILD_CACHE_CLEANUP_BUDGET`].
 ///
-/// Returns `Err((path, reason))` only for an opaque precondition failure — an
-/// unreadable `target/` metadata or a directory that cannot be enumerated at
-/// all (matching the old unbounded `remove_dir_all` contract). Budget
-/// exhaustion is a **non-fatal skip**: the leftover is deleted by the worktree
-/// removal that follows.
-pub(crate) fn clean_ignored_build_cache(worktree: &Path) -> Result<(), (PathBuf, String)> {
+/// #40: returning `Skipped` means the release still succeeds with a recorded
+/// reason; `Fatal` means the caller must fail the release. An unreadable
+/// `target/` metadata, or a directory that cannot be enumerated at all, is
+/// `Fatal` only when it defeats classification — see [`CacheCleanup`].
+pub(crate) fn clean_ignored_build_cache(worktree: &Path) -> CacheCleanup {
     clean_ignored_build_cache_with_budget(worktree, BUILD_CACHE_CLEANUP_BUDGET)
 }
 
@@ -76,7 +140,7 @@ pub(crate) fn clean_ignored_build_cache(worktree: &Path) -> Result<(), (PathBuf,
 pub(crate) fn clean_ignored_build_cache_with_budget(
     worktree: &Path,
     budget: Duration,
-) -> Result<(), (PathBuf, String)> {
+) -> CacheCleanup {
     // ONE deadline starts before enumeration/classification and is shared by
     // all `check-ignore` calls plus every directory deletion. This is the
     // property most easily broken by a later change: do NOT recompute a
@@ -94,16 +158,36 @@ pub(crate) fn clean_ignored_build_cache_with_budget(
                 "release: ignored build-cache discovery exceeded its budget — leaving caches \
                  for worktree removal"
             );
-            return Ok(());
+            return CacheCleanup::Skipped(format!(
+                "discovery exceeded its {}s budget at {}",
+                budget.as_secs(),
+                worktree.display()
+            ));
         }
-        Err(error) => return Err(error),
+        Err((path, reason)) => return CacheCleanup::Fatal { path, reason },
     };
 
     for dir in dirs {
         let metadata = match std::fs::symlink_metadata(&dir) {
             Ok(metadata) => metadata,
+            // Vanished between enumeration and deletion: someone else already
+            // reclaimed it, which is the outcome the sweep wanted anyway.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err((dir, error.to_string())),
+            // #40: the entry is already known to be git-ignored, so an
+            // unreadable stat says only that this sweep cannot delete it. That
+            // is not a reason to abort a release the bounded worktree removal
+            // would otherwise complete, so it is recorded and skipped.
+            Err(error) => {
+                tracing::warn!(
+                    path = %dir.display(),
+                    "release: ignored build cache is unreadable — leaving it for the bounded \
+                     worktree removal"
+                );
+                return CacheCleanup::Skipped(format!(
+                    "unreadable ignored cache at {}: {error}",
+                    dir.display()
+                ));
+            }
         };
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             // Preserve the old `target` behaviour for a symlink/file while
@@ -122,12 +206,27 @@ pub(crate) fn clean_ignored_build_cache_with_budget(
                 );
                 // Every remaining directory would only burn the same exhausted
                 // deadline; stop here so the release keeps its single budget.
-                return Ok(());
+                return CacheCleanup::Skipped(format!(
+                    "cleanup exceeded its {}s budget at {}",
+                    budget.as_secs(),
+                    dir.display()
+                ));
             }
-            Err(BoundedRemoval::Io(error)) => return Err((dir, error)),
+            Err(BoundedRemoval::Io(error)) => {
+                tracing::warn!(
+                    path = %dir.display(),
+                    error = %error,
+                    "release: ignored build cache could not be enumerated — leaving it for the \
+                     bounded worktree removal"
+                );
+                return CacheCleanup::Skipped(format!(
+                    "could not enumerate ignored cache at {}: {error}",
+                    dir.display()
+                ));
+            }
         }
     }
-    Ok(())
+    CacheCleanup::Complete
 }
 
 #[derive(Debug)]
@@ -174,9 +273,9 @@ fn remove_dir_all_bounded(dir: &Path, deadline: Instant) -> Result<(), BoundedRe
 /// the number of directories.
 ///
 /// Returns `Ok(None)` if the single shared budget is exhausted while enumerating
-/// or classifying; that is a non-fatal skip, matching the original
-/// `target/`-only budget contract. Returns `Err` only for an opaque root or
-/// git-classification failure, which the caller surfaces rather than guessing.
+/// or classifying; the caller records that as a skip. A `git check-ignore`
+/// failure is `Fatal`: git is the authority on "disposable", so an unknown
+/// verdict must fail the release rather than guess.
 fn ignored_cache_dirs(
     worktree: &Path,
     deadline: Instant,

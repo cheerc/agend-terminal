@@ -7795,6 +7795,96 @@ fn timed_out_partial_remove_marks_binding_unusable_and_does_not_snapshot_remnant
     std::fs::remove_dir_all(&repo).ok();
 }
 
+/// #40 companion to the test above: the OTHER side of the same decision.
+///
+/// A removal can also fail with every tracked file still present — a
+/// permission-blocked directory, a held handle. The directory survives, so the
+/// earlier "did the directory survive?" heuristic called that
+/// `PartiallyRemoved` and told the agent AND `binding_state` that tracked
+/// files may already be deleted, for a worktree that was completely intact.
+///
+/// This pins the correction: intact tracked set ⇒ `Failed` and NO
+/// `WorktreeUnusable` tombstone, so nothing falsely reports a damaged tree.
+/// Together with the test above (one tracked file genuinely removed ⇒
+/// `PartiallyRemoved` + tombstone) the pair covers both branches of the
+/// classification.
+#[cfg(unix)]
+#[test]
+fn intact_worktree_that_cannot_be_removed_is_failed_not_partially_removed_40() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tmp_home("40-intact-refused");
+    let repo = tmp_repo("40-intact-refused-repo");
+    let lease = lease_bound(&home, &repo, "agent-40i", "feat/intact-refused");
+
+    let tracked = lease.path.join("tracked-survives.txt");
+    std::fs::write(&tracked, b"committed file\n").expect("seed tracked file");
+    git_in(&lease.path, &["add", "tracked-survives.txt"]);
+    git_in(
+        &lease.path,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "seed tracked file",
+        ],
+    );
+
+    // An unreadable directory inside the worktree makes removal fail while
+    // leaving every tracked file exactly where it was. Self-validating: as root
+    // the premise cannot be produced and silently passing would be vacuous.
+    let locked = lease.path.join("locked-subdir");
+    std::fs::create_dir_all(&locked).expect("mkdir locked");
+    std::fs::write(locked.join("held.txt"), b"held\n").expect("seed held");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+    let premise_holds = std::fs::read_dir(&locked).is_err();
+    if premise_holds {
+        let _hook = release_test_seam::install(|_phase| {
+            release_test_seam::fail_next_remove(std::io::ErrorKind::TimedOut);
+        });
+
+        let outcome = release_full(&home, "agent-40i", false);
+
+        assert!(!outcome.released, "must never report success: {outcome:?}");
+        assert_eq!(outcome.code, Some("release_incomplete"), "{outcome:?}");
+        assert!(
+            !outcome.worktree_removed,
+            "directory still exists: {outcome:?}"
+        );
+        assert!(
+            tracked.exists(),
+            "#40: the premise of this test is that every tracked file survives"
+        );
+
+        // The decisive assertion: an intact worktree must NOT be published as
+        // damaged. Before the fix this tombstone was written and both the agent
+        // and `binding_state` were told tracked files may be gone.
+        let tombstone =
+            crate::agent::deletion_recovery::read(&home, "agent-40i").expect("tombstone readable");
+        assert!(
+            !matches!(
+                tombstone.as_ref().map(|t| &t.state),
+                Some(crate::agent::deletion_recovery::State::WorktreeUnusable { .. })
+            ),
+            "#40: an intact worktree that merely could not be deleted must not be \
+             flagged unusable — that misreports damage that does not exist: {tombstone:?}"
+        );
+    }
+
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+    assert!(
+        premise_holds,
+        "setup could not produce an unreadable directory (root? permissive fs?) — \
+         this machine cannot exercise the guard"
+    );
+}
+
 /// Fleet Protocol §3.15 stress: the #40 marker update and `binding_state`'s
 /// tombstone read must remain atomic while a release transaction publishes the
 /// unusable state. There is no new lock acquisition in the release path (it

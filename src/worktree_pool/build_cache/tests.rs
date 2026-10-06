@@ -76,7 +76,10 @@ fn clean_ignored_cache_budget_exhaustion_is_non_fatal() {
     let target = wt.join("target");
     // Zero budget forces the skip path: the sweep must NOT fail the release.
     let out = clean_ignored_build_cache_with_budget(&wt, Duration::ZERO);
-    assert!(out.is_ok(), "budget exhaustion is non-fatal: {out:?}");
+    assert!(
+        matches!(out, CacheCleanup::Skipped(_)),
+        "budget exhaustion is non-fatal: {out:?}"
+    );
     assert!(
         target.exists(),
         "a skipped sweep leaves the cache for the bounded git removal"
@@ -91,7 +94,10 @@ fn clean_ignored_cache_removes_a_small_cache_within_budget() {
     seed_target_cache(&wt);
     let target = wt.join("target");
     let out = clean_ignored_build_cache_with_budget(&wt, Duration::from_secs(30));
-    assert!(out.is_ok(), "ample budget must succeed: {out:?}");
+    assert!(
+        matches!(out, CacheCleanup::Complete),
+        "ample budget must succeed: {out:?}"
+    );
     assert!(!target.exists(), "ample budget must remove the cache");
     std::fs::remove_dir_all(&wt).ok();
 }
@@ -137,7 +143,10 @@ fn clean_sweeps_every_ignored_top_level_directory_40() {
     seed_dir_with_files(&wt.join("dist"), 4);
 
     let out = clean_ignored_build_cache_with_budget(&wt, Duration::from_secs(30));
-    assert!(out.is_ok(), "sweep must succeed: {out:?}");
+    assert!(
+        matches!(out, CacheCleanup::Complete),
+        "sweep must succeed: {out:?}"
+    );
 
     for dir in ["target", "node_modules", ".venv", "dist"] {
         assert!(
@@ -158,7 +167,10 @@ fn unignored_directory_survives_the_sweep_40() {
     seed_dir_with_files(&wt.join("src-data"), 4);
 
     let out = clean_ignored_build_cache_with_budget(&wt, Duration::from_secs(30));
-    assert!(out.is_ok(), "sweep must succeed: {out:?}");
+    assert!(
+        matches!(out, CacheCleanup::Complete),
+        "sweep must succeed: {out:?}"
+    );
     assert!(
         wt.join("src-data").exists(),
         "#40: an unignored directory holds real work and must never be swept"
@@ -186,7 +198,10 @@ fn one_budget_covers_the_whole_sweep_not_one_per_directory_40() {
         }
     });
     let out = clean_ignored_build_cache_with_budget(&wt, Duration::from_secs(1));
-    assert!(out.is_ok(), "budget exhaustion stays non-fatal: {out:?}");
+    assert!(
+        matches!(out, CacheCleanup::Skipped(_)),
+        "budget exhaustion stays non-fatal: {out:?}"
+    );
 
     let remaining = ["target", "node_modules", ".venv"]
         .into_iter()
@@ -224,7 +239,10 @@ fn git_and_managed_marker_are_never_swept_40() {
         .count();
 
     let out = clean_ignored_build_cache_with_budget(&wt, Duration::from_secs(30));
-    assert!(out.is_ok(), "sweep must succeed: {out:?}");
+    assert!(
+        matches!(out, CacheCleanup::Complete),
+        "sweep must succeed: {out:?}"
+    );
     assert!(!wt.join("target").exists(), "target/ is still swept");
     assert!(
         wt.join(crate::worktree_pool::MANAGED_MARKER).exists(),
@@ -238,4 +256,55 @@ fn git_and_managed_marker_are_never_swept_40() {
         "#40: .git must never be swept even if a .gitignore matched it"
     );
     std::fs::remove_dir_all(&wt).ok();
+}
+
+/// #40 regression: an unreadable git-ignored cache directory must NOT fail the
+/// release. Before the fix this swept every git-ignored top-level directory but
+/// still treated an I/O error as fatal, so a single `0o000` directory aborted
+/// the release *before* `remove_worktree` — which is where the abort audit and
+/// the `release_failed` verdict live. The leftover is a disposable build cache
+/// and the bounded `git worktree remove --force` still deletes it.
+///
+/// Self-validating, following the established repo pattern: running as root (or
+/// on a filesystem that ignores mode bits) the premise cannot be produced, and
+/// silently passing would make this a vacuous test.
+#[cfg(unix)]
+#[test]
+fn unreadable_ignored_cache_is_skipped_not_fatal_40() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let wt = bc_fixture("40-unreadable");
+    git_repo_ignoring_many(&wt);
+    seed_dir_with_files(&wt.join("target"), 4);
+    seed_dir_with_files(&wt.join("node_modules"), 4);
+
+    let trapped = wt.join("node_modules/locked");
+    std::fs::create_dir_all(&trapped).expect("mkdir trapped");
+    std::fs::write(trapped.join("content.txt"), b"trapped\n").expect("seed trapped");
+    std::fs::set_permissions(&trapped, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+    let premise_holds = std::fs::read_dir(&trapped).is_err();
+    if premise_holds {
+        let out = clean_ignored_build_cache_with_budget(&wt, Duration::from_secs(30));
+        assert!(
+            matches!(out, CacheCleanup::Skipped(_)),
+            "#40: an undeletable git-ignored cache is disposable and the worktree removal \
+             that follows still deletes it — the sweep must skip, not abort the release: {out:?}"
+        );
+
+        // The readable cache before the trapped one is still removed, so the
+        // sweep is not merely bailing out at the first sign of trouble.
+        assert!(
+            !wt.join("target").exists(),
+            "#40: a skip must not abandon the caches that ARE deletable"
+        );
+    }
+
+    std::fs::set_permissions(&trapped, std::fs::Permissions::from_mode(0o755)).ok();
+    std::fs::remove_dir_all(&wt).ok();
+    assert!(
+        premise_holds,
+        "setup could not produce an unreadable directory (root? permissive fs?) — \
+         this machine cannot exercise the guard"
+    );
 }
