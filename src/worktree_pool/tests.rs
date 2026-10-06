@@ -7714,3 +7714,169 @@ fn merged_branch_retires_retention_obligation_despite_head_drift() {
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&repo).ok();
 }
+
+/// #40 判準 1 + 3: reproduce a killed mid-walk removal without a 60s wait or
+/// a multi-GB fixture. The seam deletes one tracked file (the exact
+/// `" D"` porcelain left by a partial `git worktree remove`) then injects the
+/// same `TimedOut` result the real 60s `LOCAL_GIT_TIMEOUT` returns.
+///
+/// The release must (a) refuse success, (b) retain the binding so the remnant
+/// stays attributable, (c) record the durable WorktreeUnusable state so the
+/// agent can see it in binding_state, and (d) NOT create a recovery ref whose
+/// only content is the deletion — the root cause of #40's misleading
+/// `5 files changed, 1478 deletions(-)` snapshot.
+#[test]
+fn timed_out_partial_remove_marks_binding_unusable_and_does_not_snapshot_remnant_40() {
+    let home = tmp_home("40-partial-remove");
+    let repo = tmp_repo("40-partial-remove-repo");
+    let lease = lease_bound(&home, &repo, "agent-40", "feat/partial-remove");
+
+    let tracked = lease.path.join("tracked-before-release.txt");
+    std::fs::write(&tracked, b"committed file\n").expect("seed tracked file");
+    git_in(&lease.path, &["add", "tracked-before-release.txt"]);
+    git_in(
+        &lease.path,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "seed tracked file",
+        ],
+    );
+
+    let partially_deleted = tracked.clone();
+    let _hook = release_test_seam::install(move |phase| {
+        if phase == ReleaseTestPhase::BeforeWorktreeRemove {
+            // Simulate the exact filesystem effect of git having started its
+            // post-order removal walk before its 60s process-tree kill.
+            std::fs::remove_file(&partially_deleted).expect("simulate partial git walk");
+            release_test_seam::fail_next_remove(std::io::ErrorKind::TimedOut);
+        }
+    });
+
+    let outcome = release_full(&home, "agent-40", false);
+
+    assert!(
+        !outcome.released,
+        "a partial remnant must never report success: {outcome:?}"
+    );
+    assert_eq!(outcome.code, Some("release_incomplete"), "{outcome:?}");
+    assert_eq!(outcome.stage, Some("worktree_remove"), "{outcome:?}");
+    assert!(
+        outcome.worktree_removed == false,
+        "directory still exists: {outcome:?}"
+    );
+    assert!(
+        crate::binding::read(&home, "agent-40").is_some(),
+        "retain binding authority"
+    );
+    assert!(lease.path.exists(), "remnant stays attributable on disk");
+
+    let tombstone = crate::agent::deletion_recovery::read(&home, "agent-40")
+        .expect("tombstone is readable")
+        .expect("signed binding entered deletion-recovery lane");
+    assert!(
+        matches!(
+            tombstone.state,
+            crate::agent::deletion_recovery::State::WorktreeUnusable { .. }
+        ),
+        "the unusable state must be durable and visible: {tombstone:?}"
+    );
+    assert!(
+        recovery_refs(&repo, "feat/partial-remove").is_empty(),
+        "#40: a pure-remnant deletion must not be saved as a WIP recovery ref"
+    );
+
+    drop(_hook);
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// Fleet Protocol §3.15 stress: the #40 marker update and `binding_state`'s
+/// tombstone read must remain atomic while a release transaction publishes the
+/// unusable state. There is no new lock acquisition in the release path (it
+/// holds the existing branch → agent-mutation → binding-file locks); readers
+/// are lock-free and must see either complete old/new JSON, never a truncated
+/// tombstone.
+#[test]
+fn unusable_tombstone_remains_atomic_under_concurrent_readers_40() {
+    let home = tmp_home("40-marker-stress");
+    let repo = tmp_repo("40-marker-stress-repo");
+    let lease = lease_bound(&home, &repo, "agent-40-stress", "feat/marker-stress");
+    let expected_worktree = lease.path.display().to_string();
+    prepare_release_journal(&home, "agent-40-stress").expect("durable release fence");
+
+    let readers = 6;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(readers + 1));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut threads = Vec::new();
+    for _ in 0..readers {
+        let home = home.clone();
+        let barrier = std::sync::Arc::clone(&barrier);
+        let stop = std::sync::Arc::clone(&stop);
+        let expected_worktree = expected_worktree.clone();
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            let mut reads = 0;
+            while !stop.load(std::sync::atomic::Ordering::Acquire) || reads < 200 {
+                let tombstone = crate::agent::deletion_recovery::read(&home, "agent-40-stress")
+                    .expect("atomic marker reads must never parse as partial JSON")
+                    .expect("release tombstone remains present");
+                assert_eq!(tombstone.instance, "agent-40-stress");
+                assert_eq!(tombstone.worktree, expected_worktree);
+                reads += 1;
+            }
+        }));
+    }
+
+    let writer_home = home.clone();
+    let writer_barrier = std::sync::Arc::clone(&barrier);
+    let writer_stop = std::sync::Arc::clone(&stop);
+    let writer = std::thread::spawn(move || {
+        writer_barrier.wait();
+        for i in 0..100 {
+            crate::agent::deletion_recovery::mark_worktree_unusable(
+                &writer_home,
+                "agent-40-stress",
+                &format!("partial removal attempt {i}"),
+            )
+            .expect("atomic unusable-state write");
+            // Model a retry transition that records ordinary recovery-required
+            // state before another removal attempt, exercising both variants.
+            crate::agent::deletion_recovery::mark_recovery_required(
+                &writer_home,
+                "agent-40-stress",
+                None,
+            )
+            .expect("atomic retry-state write");
+            std::thread::yield_now();
+        }
+        crate::agent::deletion_recovery::mark_worktree_unusable(
+            &writer_home,
+            "agent-40-stress",
+            "final timed-out removal",
+        )
+        .expect("final state write");
+        writer_stop.store(true, std::sync::atomic::Ordering::Release);
+    });
+
+    writer.join().expect("state writer");
+    for reader in threads {
+        reader.join().expect("concurrent state reader");
+    }
+    let final_state = crate::agent::deletion_recovery::read(&home, "agent-40-stress")
+        .expect("final tombstone readable")
+        .expect("final tombstone exists");
+    assert!(
+        matches!(
+            &final_state.state,
+            crate::agent::deletion_recovery::State::WorktreeUnusable { .. }
+        ),
+        "final state must remain explicitly unusable: {final_state:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}

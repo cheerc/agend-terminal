@@ -3671,3 +3671,148 @@ fn discard_seam_newline_path_no_mutation() {
         std::fs::remove_dir_all(root).ok();
     }
 }
+
+// ─── #40 ─────────────────────────────────────────────────────────────────────
+
+fn git40(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .env("AGEND_GIT_BYPASS", "1")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A repo with committed files, then the local copies deleted — the exact shape
+/// a killed `git worktree remove` leaves behind.
+fn remnant_repo_40(name: &str) -> PathBuf {
+    let repo = tmp_repo(name);
+    for file in ["alpha.txt", "beta.txt", "gamma.txt"] {
+        std::fs::write(repo.join(file), b"content\n").expect("seed");
+    }
+    git40(&repo, &["add", "-A"]);
+    git40(&repo, &["commit", "-m", "seed"]);
+    for file in ["alpha.txt", "beta.txt", "gamma.txt"] {
+        std::fs::remove_file(repo.join(file)).expect("delete");
+    }
+    repo
+}
+
+/// #40 判準 3: a worktree whose porcelain is 100% deletions is a REMNANT of a
+/// killed removal, not preservable WIP.
+///
+/// Pre-fix this returned `true`, so `preserve_dirty_worktree_collect` snapshotted
+/// the deletions into a recovery ref — producing #40's observed
+/// `5 files changed, 1478 deletions(-)`, a "saved WIP" ref whose entire content
+/// is the damage itself.
+#[test]
+fn pure_deletion_remnant_is_not_preservable_wip_40() {
+    let repo = remnant_repo_40("40-remnant");
+    let status = crate::git_helpers::git_cmd(
+        &repo,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "--ignore-submodules=none",
+        ],
+    )
+    .expect("status should be readable after simulated removal");
+    assert!(
+        !worktree_has_preservable_wip(&repo),
+        "#40: a worktree that is 100% deletions is a removal remnant, not WIP — \
+         snapshotting it produces a recovery ref containing only the damage; \
+         observed porcelain: {status:?}"
+    );
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// #40 判準 3 (conservative half): a deletion MIXED with a real edit or an
+/// untracked file is genuine work and must still be preserved. Misclassifying
+/// this as a remnant would destroy real work.
+#[test]
+fn deletion_mixed_with_an_edit_is_still_wip_40() {
+    let repo = remnant_repo_40("40-mixed");
+    // Re-add one deleted file with DIFFERENT content: now `M` + `D`.
+    std::fs::write(repo.join("alpha.txt"), b"edited\n").expect("edit");
+    assert!(
+        worktree_has_preservable_wip(&repo),
+        "#40: deletions mixed with a real edit are real WIP and must be preserved"
+    );
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn deletion_mixed_with_an_untracked_file_is_still_wip_40() {
+    let repo = remnant_repo_40("40-mixed-untracked");
+    std::fs::write(repo.join("brand-new.txt"), b"new\n").expect("untracked");
+    assert!(
+        worktree_has_preservable_wip(&repo),
+        "#40: deletions mixed with an untracked file are real WIP"
+    );
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// #40: the pre-existing clean/marker-only behaviour must be unchanged.
+#[test]
+fn clean_worktree_still_has_no_preservable_wip_40() {
+    let repo = tmp_repo("40-clean");
+    assert!(
+        !worktree_has_preservable_wip(&repo),
+        "#40: a clean worktree has no WIP — zero behaviour change"
+    );
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn pure_modification_is_still_wip_40() {
+    let repo = tmp_repo("40-mod");
+    std::fs::write(repo.join("only.txt"), b"x\n").expect("seed");
+    git40(&repo, &["add", "-A"]);
+    git40(&repo, &["commit", "-m", "seed"]);
+    std::fs::write(repo.join("only.txt"), b"changed\n").expect("edit");
+    assert!(
+        worktree_has_preservable_wip(&repo),
+        "#40: a pure modification is real WIP"
+    );
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// A staged pure deletion (`D `) also contains no content to preserve, so it is
+/// classified with other pure deletion remnants. A staged addition (`AD`) is
+/// tested separately below and remains WIP.
+#[test]
+fn pure_staged_deletion_is_not_preservable_wip_40() {
+    let repo = tmp_repo("40-staged-delete");
+    std::fs::write(repo.join("staged-delete.txt"), b"content\n").expect("seed");
+    git40(&repo, &["add", "-A"]);
+    git40(&repo, &["commit", "-m", "seed"]);
+    git40(&repo, &["rm", "staged-delete.txt"]);
+    assert!(
+        !worktree_has_preservable_wip(&repo),
+        "#40: a pure staged deletion contains no worktree content and should not \
+         create a deletion-only recovery ref"
+    );
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// A staged add whose worktree copy is missing has `AD` status and staged blob
+/// content. The status includes a deletion, but it is not a pure remnant and
+/// must remain preservable.
+#[test]
+fn staged_add_then_worktree_delete_is_still_wip_40() {
+    let repo = tmp_repo("40-staged-add-delete");
+    std::fs::write(repo.join("staged-add.txt"), b"staged content\n").expect("seed");
+    git40(&repo, &["add", "staged-add.txt"]);
+    std::fs::remove_file(repo.join("staged-add.txt")).expect("delete worktree copy");
+    assert!(
+        worktree_has_preservable_wip(&repo),
+        "#40: staged content in the index is WIP even when its worktree copy is absent"
+    );
+    std::fs::remove_dir_all(&repo).ok();
+}

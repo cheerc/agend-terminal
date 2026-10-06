@@ -542,7 +542,13 @@ pub(crate) fn release_one_stale_holder_with_permit(
     match remove_worktree(agent, holder, source_repo) {
         WorktreeRemoval::Removed | WorktreeRemoval::AlreadyAbsent => Ok(()),
         WorktreeRemoval::Unmanaged(m) => Err(m),
-        WorktreeRemoval::Failed(e) => Err(e),
+        // #40: folded into `Failed` deliberately. This is the stale-holder
+        // reclaim path, not a live agent release — nothing here was "cut in
+        // half by a timeout" in the #40 sense, so there is no damaged-remnant
+        // state for the caller to surface. Both outcomes mean the same thing
+        // here: the directory could not be removed. The remnant-specific
+        // handling lives in the three release call sites in `worktree_pool.rs`.
+        WorktreeRemoval::Failed(e) | WorktreeRemoval::PartiallyRemoved { cause: e } => Err(e),
     }
 }
 
@@ -674,6 +680,16 @@ pub fn reverse_reconcile(home: &Path, agent: &str) -> Result<(), String> {
             }
             WorktreeRemoval::Failed(e) => {
                 return Err(format!("reverse_reconcile: worktree remove failed: {e}"));
+            }
+            // #40: folded into the `Failed` arm deliberately — same reasoning
+            // as the stale-holder arm above. This path only runs for an
+            // already-unbound converted workspace (no live binding to flag),
+            // so there is no binding left to mark unusable; a removal that did
+            // not complete is simply a failed remove from here.
+            WorktreeRemoval::PartiallyRemoved { cause } => {
+                return Err(format!(
+                    "reverse_reconcile: worktree remove did not complete: {cause}"
+                ));
             }
         }
     }

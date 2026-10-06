@@ -31,12 +31,21 @@ pub(crate) fn force_clear_failure() -> ClearFailureGuard {
     ClearFailureGuard
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum State {
     Deleting,
     RecoveryRequired,
     Recovered,
+    /// #40: the worktree removal was KILLED part-way, so the directory
+    /// survives with some tracked files already deleted. The binding is
+    /// deliberately left in place (the remnant must stay attributable) but is
+    /// no longer usable, and this state is what makes that visible to the
+    /// agent and the orchestrator through `binding_state`.
+    WorktreeUnusable {
+        /// Why the removal stopped, for the operator.
+        cause: String,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -181,6 +190,29 @@ pub(crate) fn mark_recovery_required(
         .ok_or_else(|| "recovery_required: delete tombstone is missing".to_string())?;
     tombstone.state = State::RecoveryRequired;
     tombstone.archive = archive.map(|path| path.display().to_string());
+    write(home, &tombstone)
+}
+
+/// #40: record that a worktree removal was killed mid-walk and the directory
+/// survives in a damaged state. Idempotent — re-recording keeps the first
+/// cause, because the FIRST interruption is the one that explains the damage.
+pub(crate) fn mark_worktree_unusable(
+    home: &Path,
+    instance: &str,
+    cause: &str,
+) -> Result<(), String> {
+    let Some(mut tombstone) = read(home, instance)? else {
+        // A new release should have entered the signed recovery lane before
+        // it starts mutating the worktree. If that invariant is missing, do
+        // NOT silently pretend the unusable state was recorded.
+        return Err("worktree_unusable: deletion-recovery tombstone is missing".to_string());
+    };
+    if matches!(tombstone.state, State::WorktreeUnusable { .. }) {
+        return Ok(());
+    }
+    tombstone.state = State::WorktreeUnusable {
+        cause: cause.to_string(),
+    };
     write(home, &tombstone)
 }
 

@@ -837,12 +837,39 @@ pub(crate) fn worktree_has_preservable_wip(wt_path: &Path) -> bool {
             "--ignore-submodules=none",
         ],
     ) {
+        // #40: classify the dirt. A worktree whose porcelain is 100% UNSTAGED
+        // deletions (`" D"`) is not "dirty with work in it" — it is the
+        // REMNANT of a removal that was killed part-way (`git worktree remove`
+        // deletes entries one at a time, and LOCAL_GIT_TIMEOUT kills it mid-walk).
+        // Snapshotting that as "preserved WIP" produces a recovery ref whose whole
+        // content is deletions; because it is then the ONLY ref, it reads as
+        // though something was saved when nothing was. Observed in #40 as
+        // `5 files changed, 1478 deletions(-)`.
+        //
+        // Pure staged or unstaged deletions have no added/modified content to
+        // salvage and are both classified as remnants. A staged addition whose
+        // worktree copy is gone (`AD`), or any deletion mixed with another state,
+        // remains WIP because the index may contain real content.
         Ok(s) => s.lines().any(|line| {
             let path = line.get(3..).map(str::trim).unwrap_or("");
-            !path.is_empty() && path != crate::worktree_pool::MANAGED_MARKER
+            if path.is_empty() || path == crate::worktree_pool::MANAGED_MARKER {
+                return false;
+            }
+            // Porcelain v1 XY: pure deletions are exactly ` D` and `D `; `AD`,
+            // `MD`, and other mixed states carry additional content/status and
+            // must remain WIP. `??` is untracked and is always WIP.
+            !is_remnant_deletion_status(line)
         }),
         Err(_) => true,
     }
+}
+
+/// True when porcelain reports a pure tracked-file deletion (`" D"` or
+/// `"D "`) with NO add/modify/rename/copy state in the other column. A staged
+/// add whose worktree copy is missing (`AD`) and deletion mixed with any other
+/// state remain WIP; the index may contain real content.
+fn is_remnant_deletion_status(line: &str) -> bool {
+    matches!(line.as_bytes().get(..2), Some(b" D") | Some(b"D "))
 }
 
 /// Outcome of a pre-removal WIP-preservation attempt. `#[must_use]` so a release
