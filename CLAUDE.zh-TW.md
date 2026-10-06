@@ -19,7 +19,7 @@ CI 會在 `ci.yml` 的前兩個步驟執行這些命令。本機略過它們，�
 scripts/preflight.sh          # 完整 matrix；--quick 會略過 Windows 檢查
 ```
 
-這是 CI `check` job 的一次性鏡像，也是避免 local-green → CI-red 往返的最佳方法。它會執行 `cargo fmt --check`、`cargo clippy --all-targets --features tray -- -D warnings`、`cargo nextest run --features tray`（unit + integration + invariant——CI 用的 runner；只有沒安裝 cargo-nextest 時才用 `cargo test --tests --features tray`），以及關鍵的 **Windows cross-check**（`x86_64-pc-windows-msvc`）。Windows-only 程式碼（`libc::getppid`、`/bin/sh` spawn、`UnixStream`）在 Unix 開發機上可以順利編譯，卻會讓 CI 的 `windows-latest` runner 失敗。
+這是 CI `check` job 的一次性鏡像，也是避免 local-green → CI-red 往返的最佳方法。它會執行 `cargo fmt --check`、`cargo clippy --all-targets --features tray -- -D warnings`、`cargo nextest run --features tray`（unit + integration + invariant——CI 用的 runner）；若未安裝 cargo-nextest，preflight 會將 test step 明確標為 FAIL，附上安裝提示（`cargo install cargo-nextest --locked`），**不會**改跑 `cargo test --tests`，因為 bulk 結果無法區分 flaky 紅燈與真回歸。接著會執行關鍵的 **Windows cross-check**（`x86_64-pc-windows-msvc`）。Windows-only 程式碼（`libc::getppid`、`/bin/sh` spawn、`UnixStream`）在 Unix 開發機上可以順利編譯，卻會讓 CI 的 `windows-latest` runner 失敗。
 
 Windows 步驟需要 MSVC C toolchain，因為 transitive C dependency（`ring`）在 macOS/Linux 上缺少它就無法 cross-compile。只需安裝一次：
 
