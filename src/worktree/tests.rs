@@ -3475,11 +3475,89 @@ fn discard_seam_removal_failure_no_success_audit() {
         "removal failure must NOT emit success audit: {new_lines:?}"
     );
     assert!(
-        new_lines
+        !new_lines
             .iter()
-            .any(|l| l.contains("nested_dirt_discard_aborted") && l.contains("release_failed")),
-        "removal failure must emit aborted/release_failed audit: {new_lines:?}"
+            .any(|l| l.contains("nested_dirt_discard_release")),
+        "removal failure must NOT emit success audit: {new_lines:?}"
     );
+
+    // #40: a two-branch contract, each branch pinned harder than the single
+    // string the original assertion required.
+    //
+    // WHICH branch runs here is decided by the platform's `readdir` order, not
+    // by anything this test controls. Measured on this fixture: readdir yields
+    // `['.trap', '.gitmodules', '.gitignore', 'vendor']`, so on macOS the
+    // `remove_dir_all` fallback hits the `0o000` `.trap` directory FIRST and
+    // deletes nothing (→ `release_failed`), while on Linux the tracked entries
+    // are removed before `.trap` is reached and 3 tracked paths really are gone
+    // (→ `worktree_partially_removed`). Same code, different git (2.50.1 here vs
+    // 2.55.0 on CI) and different filesystem ordering.
+    //
+    // Do NOT "fix" this by re-running, adding a retry, or reordering the
+    // fixture: both outcomes are legitimate, and the point of the two branches
+    // is that the classification matches what was actually deleted.
+    //
+    // SCOPE: this test pins the AUDIT LAYER only. The durable-tombstone half of
+    // the contract lives in
+    // `timed_out_partial_remove_marks_binding_unusable_and_does_not_snapshot_remnant_40`,
+    // which runs the route that can actually produce a tombstone. It cannot be
+    // asserted here: this fixture unbinds before releasing (legacy flat,
+    // unregistered), so it takes `release_absent_target_impl`, which by existing
+    // design does not call `prepare_release_journal` and therefore cannot leave
+    // a durable tombstone for ANY removal outcome — a pre-existing gap, tracked
+    // separately. Asserting it here would be a permanently-red assertion, not a
+    // stronger contract. Both layers have coverage; neither is missing.
+    let aborted: Vec<&str> = new_lines
+        .iter()
+        .copied()
+        .filter(|l| l.contains("nested_dirt_discard_aborted"))
+        .collect();
+    assert_eq!(
+        aborted.len(),
+        1,
+        "#40: the removal failure must emit exactly one aborted audit: {new_lines:?}"
+    );
+    let detail = aborted[0];
+
+    if detail.contains("abort_reason=release_failed") {
+        // Nothing tracked was deleted, so the audit must not claim otherwise and
+        // must not carry a missing-file list.
+        assert!(
+            !detail.contains("missing_tracked="),
+            "#40: `release_failed` means no tracked path vanished — a missing-file \
+             count on that branch contradicts it: {detail}"
+        );
+    } else if detail.contains("abort_reason=worktree_partially_removed") {
+        // The stronger branch: it must name what went missing AND the binding
+        // must be flagged unusable, so neither agent nor orchestrator keeps
+        // treating the tree as healthy.
+        let count = detail
+            .split("missing_tracked=")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .and_then(|n| n.trim().parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                panic!(
+                    "#40: partial removal must report how many tracked paths are \
+                        missing: {detail}"
+                )
+            });
+        assert!(
+            count >= 1,
+            "#40: `worktree_partially_removed` with zero missing paths contradicts \
+             itself: {detail}"
+        );
+        // The durable-tombstone half of this contract is asserted in
+        // `timed_out_partial_remove_marks_binding_unusable_and_does_not_snapshot_remnant_40`
+        // (the route that can produce one) — see the SCOPE note above. Deliberately
+        // NOT skipped-with-an-`if` here: that would leave this route's partial
+        // branch with no assertion at all.
+    } else {
+        panic!(
+            "#40: unrecognised abort_reason — a new branch must add its own contract \
+             here rather than pass silently: {detail}"
+        );
+    }
 
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
     std::fs::remove_dir_all(&info.path).ok();
