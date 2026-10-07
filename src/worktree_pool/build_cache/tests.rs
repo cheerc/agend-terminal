@@ -258,74 +258,97 @@ fn git_and_managed_marker_are_never_swept_40() {
     std::fs::remove_dir_all(&wt).ok();
 }
 
-/// #40 regression: an unreadable git-ignored cache directory must NOT fail the
-/// release. Before the fix this swept every git-ignored top-level directory but
-/// still treated an I/O error as fatal, so a single `0o000` directory aborted
-/// the release *before* `remove_worktree` — which is where the abort audit and
-/// the `release_failed` verdict live. The leftover is a disposable build cache
-/// and the bounded `git worktree remove --force` still deletes it.
+/// #40 regression, upgraded to the #47 contract: an unreadable git-ignored
+/// cache directory must NOT fail the release, and must NOT abandon the caches
+/// that ARE deletable.
+///
+/// #45 left this as a degraded single-candidate test that only recorded current
+/// behaviour (see the SCOPE note it carried): `clean_ignored_build_cache`
+/// returned `Skipped` at the FIRST directory it could not enumerate
+/// (`build_cache.rs` `Err(BoundedRemoval::Io)` arm) and the candidate order came
+/// from an unsorted `read_dir`, so any assertion about what else got swept
+/// encoded a platform's directory order — green on macOS, red on Linux.
+///
+/// #47 fixes the production defect (record the skip and CONTINUE with the
+/// remaining candidates), so this test now pins the real contract with two
+/// trapped caches and one deletable cache: whatever order `read_dir` yields,
+/// the deletable cache is swept, both trapped caches survive for the bounded
+/// worktree removal, and the skip reason names every trapped path. No `sort`
+/// is involved — the contract holds for any enumeration order.
 ///
 /// Self-validating, following the established repo pattern: running as root (or
 /// on a filesystem that ignores mode bits) the premise cannot be produced, and
 /// silently passing would make this a vacuous test.
-///
-/// SCOPE — this pins only "an undeletable ignored cache does not abort the
-/// release". It deliberately says nothing about how much got swept, because
-/// `clean_ignored_build_cache` returns `Skipped` at the FIRST directory it
-/// cannot enumerate (`build_cache.rs:215-226`) and the candidate order comes
-/// from an unsorted `read_dir` (`build_cache.rs:284`). When the undeletable
-/// directory is enumerated first the sweep clears nothing; when it is last the
-/// sweep clears everything ahead of it. Any assertion about the count therefore
-/// encodes a platform's directory order. Two earlier versions did exactly that
-/// — one named `target`, the next asserted "at least one" — and passed on macOS
-/// while failing on ubuntu and Coverage. What "should still be swept" is the
-/// subject of #47.
 #[cfg(unix)]
 #[test]
 fn unreadable_ignored_cache_is_skipped_not_fatal_40() {
     use std::os::unix::fs::PermissionsExt;
 
-    const TRAPPED_CACHE: &str = "node_modules";
+    // Two trapped caches, one deletable cache. Whichever order the unsorted
+    // `read_dir` yields them in, the deletable one must still be swept.
+    const TRAPPED_A: &str = "node_modules";
+    const TRAPPED_B: &str = "dist";
+    const DELETABLE: &str = "target";
 
     let wt = bc_fixture("40-unreadable");
     git_repo_ignoring_many(&wt);
-    // Minimal scene: one undeletable cache, nothing else. Additional deletable
-    // caches are deliberately NOT seeded — with no assertion on what they add,
-    // seeding them would stage a state this test cannot check, i.e. hide the
-    // #47 defect inside the fixture instead of naming it in #47.
-    //
-    // `git_repo_ignoring_many` lists `.venv` in .gitignore but nothing seeds it,
-    // and `read_dir` only yields existing entries — so `.venv` is not a
-    // candidate here. A future edit that seeds it must not assume this test
-    // covers it.
-    seed_dir_with_files(&wt.join(TRAPPED_CACHE), 4);
-
-    let trapped = wt.join(TRAPPED_CACHE).join("locked");
-    std::fs::create_dir_all(&trapped).expect("mkdir trapped");
-    std::fs::write(trapped.join("content.txt"), b"trapped\n").expect("seed trapped");
-    std::fs::set_permissions(&trapped, std::fs::Permissions::from_mode(0o000)).expect("chmod");
-
-    let premise_holds = std::fs::read_dir(&trapped).is_err();
-    if premise_holds {
-        let out = clean_ignored_build_cache_with_budget(&wt, Duration::from_secs(30));
-        assert!(
-            matches!(out, CacheCleanup::Skipped(_)),
-            "#40: an undeletable git-ignored cache is disposable and the worktree removal \
-             that follows still deletes it — the sweep must skip, not abort the release: {out:?}"
-        );
-
-        // No count assertion: see the SCOPE note — the number swept depends on
-        // unsorted readdir order, so any specific expectation is a property of
-        // the running platform rather than of the code. #47 tracks what the
-        // sweep should actually clear.
-        assert!(
-            wt.join(TRAPPED_CACHE).exists(),
-            "#40: the undeletable cache must survive — the bounded worktree removal \
-             that follows is what deletes it, not this sweep: {out:?}"
-        );
+    // Deliberately seed nothing else: `git_repo_ignoring_many` lists `.venv`
+    // in .gitignore but nothing seeds it, and `read_dir` only yields existing
+    // entries — so `.venv` is not a candidate here. A future edit that seeds
+    // it must not assume this test covers it.
+    seed_dir_with_files(&wt.join(DELETABLE), 4);
+    for trapped_cache in [TRAPPED_A, TRAPPED_B] {
+        seed_dir_with_files(&wt.join(trapped_cache), 4);
+        let trapped = wt.join(trapped_cache).join("locked");
+        std::fs::create_dir_all(&trapped).expect("mkdir trapped");
+        std::fs::write(trapped.join("content.txt"), b"trapped\n").expect("seed trapped");
+        std::fs::set_permissions(&trapped, std::fs::Permissions::from_mode(0o000)).expect("chmod");
     }
 
-    std::fs::set_permissions(&trapped, std::fs::Permissions::from_mode(0o755)).ok();
+    let premise_holds = [TRAPPED_A, TRAPPED_B]
+        .iter()
+        .all(|cache| std::fs::read_dir(wt.join(cache).join("locked")).is_err());
+    if premise_holds {
+        let out = clean_ignored_build_cache_with_budget(&wt, Duration::from_secs(30));
+        match &out {
+            CacheCleanup::Skipped(reason) => {
+                // #47: the release outcome reflects per-candidate skips — every
+                // trapped path is named.
+                for trapped_cache in [TRAPPED_A, TRAPPED_B] {
+                    assert!(
+                        reason.contains(trapped_cache),
+                        "#47: the skip reason must name every trapped path, got: {reason}"
+                    );
+                }
+            }
+            other => panic!(
+                "#40: an undeletable git-ignored cache is disposable and the worktree removal \
+                 that follows still deletes it — the sweep must skip, not abort the release: {other:?}"
+            ),
+        }
+
+        // #47 order-independence: the trapped caches may come first, last, or
+        // around the deletable one — it is swept regardless.
+        assert!(
+            !wt.join(DELETABLE).exists(),
+            "#47: `{DELETABLE}` is deletable and must be swept even though other candidates were trapped"
+        );
+        for trapped_cache in [TRAPPED_A, TRAPPED_B] {
+            assert!(
+                wt.join(trapped_cache).exists(),
+                "#40: the undeletable cache must survive — the bounded worktree removal \
+                 that follows is what deletes it, not this sweep: {out:?}"
+            );
+        }
+    }
+
+    for trapped_cache in [TRAPPED_A, TRAPPED_B] {
+        std::fs::set_permissions(
+            wt.join(trapped_cache).join("locked"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .ok();
+    }
     std::fs::remove_dir_all(&wt).ok();
     assert!(
         premise_holds,

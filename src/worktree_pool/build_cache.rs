@@ -167,6 +167,14 @@ pub(crate) fn clean_ignored_build_cache_with_budget(
         Err((path, reason)) => return CacheCleanup::Fatal { path, reason },
     };
 
+    // #47: per-candidate skips are recorded and the sweep CONTINUES with the
+    // remaining candidates, so the outcome never depends on the unsorted
+    // `read_dir` order. A skip is one candidate the sweep could not delete;
+    // the deadline is different — the shared budget is exhausted, so every
+    // remaining candidate would burn the same dead budget and the loop still
+    // returns immediately (see the `Deadline` arm below).
+    let mut skips: Vec<String> = Vec::new();
+
     for dir in dirs {
         let metadata = match std::fs::symlink_metadata(&dir) {
             Ok(metadata) => metadata,
@@ -177,16 +185,19 @@ pub(crate) fn clean_ignored_build_cache_with_budget(
             // unreadable stat says only that this sweep cannot delete it. That
             // is not a reason to abort a release the bounded worktree removal
             // would otherwise complete, so it is recorded and skipped.
+            // #47: recorded — not returned — so the remaining candidates are
+            // still processed whatever order `read_dir` yielded them in.
             Err(error) => {
                 tracing::warn!(
                     path = %dir.display(),
                     "release: ignored build cache is unreadable — leaving it for the bounded \
                      worktree removal"
                 );
-                return CacheCleanup::Skipped(format!(
+                skips.push(format!(
                     "unreadable ignored cache at {}: {error}",
                     dir.display()
                 ));
+                continue;
             }
         };
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -219,14 +230,20 @@ pub(crate) fn clean_ignored_build_cache_with_budget(
                     "release: ignored build cache could not be enumerated — leaving it for the \
                      bounded worktree removal"
                 );
-                return CacheCleanup::Skipped(format!(
+                // #47: record the skip and continue with the remaining
+                // candidates instead of abandoning them.
+                skips.push(format!(
                     "could not enumerate ignored cache at {}: {error}",
                     dir.display()
                 ));
             }
         }
     }
-    CacheCleanup::Complete
+    if skips.is_empty() {
+        CacheCleanup::Complete
+    } else {
+        CacheCleanup::Skipped(skips.join("; "))
+    }
 }
 
 #[derive(Debug)]
