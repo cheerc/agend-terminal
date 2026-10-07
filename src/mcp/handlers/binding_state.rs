@@ -183,6 +183,28 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
 
         let target_identity = target_identity::probe_target_identity(wt_path, branch, wt_str);
 
+        // #40: a removal that was killed part-way leaves the directory present but
+        // with tracked files already gone. That is NOT "intact", and an agent
+        // reading only `worktree_exists_on_disk` would keep working in a tree
+        // that is silently losing files. `worktree_pool::remove_worktree`
+        // records the damage in the deletion-recovery tombstone; surface it.
+        // This is a read of what release already recorded — it is deliberately
+        // NOT a fresh integrity scan (that is #39's second facet, out of
+        // scope here).
+        let worktree_unusable = match crate::agent::deletion_recovery::read(home, agent) {
+            Ok(Some(tombstone)) => match tombstone.state {
+                crate::agent::deletion_recovery::State::WorktreeUnusable { cause } => {
+                    json!({"worktree": tombstone.worktree, "cause": cause})
+                }
+                _ => Value::Null,
+            },
+            Ok(None) => Value::Null,
+            // A corrupt/unreadable tombstone cannot certify that the worktree
+            // is usable. Surface the uncertainty rather than silently making
+            // the new field indistinguishable from a healthy binding.
+            Err(reason) => json!({"state": "unavailable", "reason": reason}),
+        };
+
         json!({
             "agent": agent,
             "bound": true,
@@ -195,6 +217,10 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
             "worktree_valid": worktree_valid,
             "worktree_resolves": worktree_resolves,
             "invalid_reason": invalid_reason,
+            // #40: non-null means the worktree is a removal REMNANT — tracked
+            // files were deleted before the removal was killed. Absent in every
+            // healthy case, so existing readers are unaffected.
+            "worktree_unusable": worktree_unusable,
             "marker_present": marker_present,
             "signature_valid": signature_valid,
             "ci_watches": ci_watches,

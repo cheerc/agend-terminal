@@ -7714,3 +7714,366 @@ fn merged_branch_retires_retention_obligation_despite_head_drift() {
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&repo).ok();
 }
+
+/// #40 判準 1 + 3: reproduce a killed mid-walk removal without a 60s wait or
+/// a multi-GB fixture. The seam deletes one tracked file (the exact
+/// `" D"` porcelain left by a partial `git worktree remove`) then injects the
+/// same `TimedOut` result the real 60s `LOCAL_GIT_TIMEOUT` returns.
+///
+/// The release must (a) refuse success, (b) retain the binding so the remnant
+/// stays attributable, (c) record the durable WorktreeUnusable state so the
+/// agent can see it in binding_state, and (d) NOT create a recovery ref whose
+/// only content is the deletion — the root cause of #40's misleading
+/// `5 files changed, 1478 deletions(-)` snapshot.
+#[test]
+fn timed_out_partial_remove_marks_binding_unusable_and_does_not_snapshot_remnant_40() {
+    let home = tmp_home("40-partial-remove");
+    let repo = tmp_repo("40-partial-remove-repo");
+    let lease = lease_bound(&home, &repo, "agent-40", "feat/partial-remove");
+
+    let tracked = lease.path.join("tracked-before-release.txt");
+    std::fs::write(&tracked, b"committed file\n").expect("seed tracked file");
+    git_in(&lease.path, &["add", "tracked-before-release.txt"]);
+    git_in(
+        &lease.path,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "seed tracked file",
+        ],
+    );
+
+    let partially_deleted = tracked.clone();
+    let _hook = release_test_seam::install(move |phase| {
+        if phase == ReleaseTestPhase::BeforeWorktreeRemove {
+            // Simulate the exact filesystem effect of git having started its
+            // post-order removal walk before its 60s process-tree kill.
+            std::fs::remove_file(&partially_deleted).expect("simulate partial git walk");
+            release_test_seam::fail_next_remove(std::io::ErrorKind::TimedOut);
+        }
+    });
+
+    let outcome = release_full(&home, "agent-40", false);
+
+    assert!(
+        !outcome.released,
+        "a partial remnant must never report success: {outcome:?}"
+    );
+    assert_eq!(outcome.code, Some("release_incomplete"), "{outcome:?}");
+    assert_eq!(outcome.stage, Some("worktree_remove"), "{outcome:?}");
+    assert!(
+        !outcome.worktree_removed,
+        "directory still exists: {outcome:?}"
+    );
+    assert!(
+        crate::binding::read(&home, "agent-40").is_some(),
+        "retain binding authority"
+    );
+    assert!(lease.path.exists(), "remnant stays attributable on disk");
+
+    let tombstone = crate::agent::deletion_recovery::read(&home, "agent-40")
+        .expect("tombstone is readable")
+        .expect("signed binding entered deletion-recovery lane");
+    assert!(
+        matches!(
+            tombstone.state,
+            crate::agent::deletion_recovery::State::WorktreeUnusable { .. }
+        ),
+        "the unusable state must be durable and visible: {tombstone:?}"
+    );
+    assert!(
+        recovery_refs(&repo, "feat/partial-remove").is_empty(),
+        "#40: a pure-remnant deletion must not be saved as a WIP recovery ref"
+    );
+
+    drop(_hook);
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// #40 companion to the test above: the OTHER side of the same decision.
+///
+/// A removal can also fail with every tracked file still present — a
+/// permission-blocked directory, a held handle. The directory survives, so the
+/// earlier "did the directory survive?" heuristic called that
+/// `PartiallyRemoved` and told the agent AND `binding_state` that tracked
+/// files may already be deleted, for a worktree that was completely intact.
+///
+/// This pins the correction: intact tracked set ⇒ `Failed` and NO
+/// `WorktreeUnusable` tombstone, so nothing falsely reports a damaged tree.
+/// Together with the test above (one tracked file genuinely removed ⇒
+/// `PartiallyRemoved` + tombstone) the pair covers both branches of the
+/// classification.
+#[cfg(unix)]
+#[test]
+fn intact_worktree_that_cannot_be_removed_is_failed_not_partially_removed_40() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tmp_home("40-intact-refused");
+    let repo = tmp_repo("40-intact-refused-repo");
+    let lease = lease_bound(&home, &repo, "agent-40i", "feat/intact-refused");
+
+    let tracked = lease.path.join("tracked-survives.txt");
+    std::fs::write(&tracked, b"committed file\n").expect("seed tracked file");
+    git_in(&lease.path, &["add", "tracked-survives.txt"]);
+    git_in(
+        &lease.path,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "seed tracked file",
+        ],
+    );
+
+    // An unreadable directory inside the worktree makes removal fail while
+    // leaving every tracked file exactly where it was. Self-validating: as root
+    // the premise cannot be produced and silently passing would be vacuous.
+    let locked = lease.path.join("locked-subdir");
+    std::fs::create_dir_all(&locked).expect("mkdir locked");
+    std::fs::write(locked.join("held.txt"), b"held\n").expect("seed held");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+    let premise_holds = std::fs::read_dir(&locked).is_err();
+    if premise_holds {
+        let _hook = release_test_seam::install(|_phase| {
+            release_test_seam::fail_next_remove(std::io::ErrorKind::TimedOut);
+        });
+
+        let outcome = release_full(&home, "agent-40i", false);
+
+        assert!(!outcome.released, "must never report success: {outcome:?}");
+        assert_eq!(outcome.code, Some("release_incomplete"), "{outcome:?}");
+        assert!(
+            !outcome.worktree_removed,
+            "directory still exists: {outcome:?}"
+        );
+        assert!(
+            tracked.exists(),
+            "#40: the premise of this test is that every tracked file survives"
+        );
+
+        // The decisive assertion: an intact worktree must NOT be published as
+        // damaged. Before the fix this tombstone was written and both the agent
+        // and `binding_state` were told tracked files may be gone.
+        let tombstone =
+            crate::agent::deletion_recovery::read(&home, "agent-40i").expect("tombstone readable");
+        assert!(
+            !matches!(
+                tombstone.as_ref().map(|t| &t.state),
+                Some(crate::agent::deletion_recovery::State::WorktreeUnusable { .. })
+            ),
+            "#40: an intact worktree that merely could not be deleted must not be \
+             flagged unusable — that misreports damage that does not exist: {tombstone:?}"
+        );
+    }
+
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+    assert!(
+        premise_holds,
+        "setup could not produce an unreadable directory (root? permissive fs?) — \
+         this machine cannot exercise the guard"
+    );
+}
+
+/// #40 (review finding F2): a tracked **dangling symlink** is still present on
+/// disk, so it must not be reported as a deleted tracked file.
+///
+/// `Path::exists()` calls `stat(2)`, which follows the link, so a committed
+/// link to a target that never existed reads as absent — the pre-fix
+/// comparator listed it in `missing_tracked` and published a completely healthy
+/// worktree as damaged, which is the mirror image of the defect #40 was opened
+/// about. This test would pass vacuously without the tracked symlink, so it
+/// asserts the link is genuinely tracked first.
+///
+/// The product repo has no tracked symlinks (`git ls-files -s | awk '$1=="120000"'`
+/// → 0), so no existing fixture covers this and only this test pins it.
+#[cfg(unix)]
+#[test]
+fn tracked_dangling_symlink_is_not_reported_as_a_deleted_tracked_file_40() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tmp_home("40-dangling-link");
+    let repo = tmp_repo("40-dangling-link-repo");
+    let lease = lease_bound(&home, &repo, "agent-40l", "feat/dangling-link");
+
+    let link = lease.path.join("dangling-link");
+    std::os::unix::fs::symlink("/nonexistent/agend-40-target", &link).expect("seed dangling link");
+    git_in(&lease.path, &["add", "dangling-link"]);
+    git_in(
+        &lease.path,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "seed tracked dangling symlink",
+        ],
+    );
+
+    // Premise guard: the link must be TRACKED for this to test anything, and it
+    // must actually be dangling for the F2 mechanism to apply.
+    let ls_files = std::process::Command::new("git")
+        .args(["ls-files", "dangling-link"])
+        .current_dir(&lease.path)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git ls-files");
+    let tracked = String::from_utf8_lossy(&ls_files.stdout).to_string();
+    assert!(
+        tracked.contains("dangling-link"),
+        "premise: the symlink must be tracked or this test proves nothing: {tracked}"
+    );
+    assert!(
+        !link.exists() && std::fs::symlink_metadata(&link).is_ok(),
+        "premise: the link must be dangling — exists()={} but the entry is on disk",
+        link.exists()
+    );
+
+    // An unreadable directory makes removal fail while leaving the tracked set
+    // untouched, so the comparator's answer decides the verdict outright.
+    let locked = lease.path.join("locked-subdir");
+    std::fs::create_dir_all(&locked).expect("mkdir locked");
+    std::fs::write(locked.join("held.txt"), b"held\n").expect("seed held");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+    let premise_holds = std::fs::read_dir(&locked).is_err();
+    if premise_holds {
+        let _hook = release_test_seam::install(|_phase| {
+            release_test_seam::fail_next_remove(std::io::ErrorKind::TimedOut);
+        });
+
+        let outcome = release_full(&home, "agent-40l", false);
+
+        assert!(!outcome.released, "must never report success: {outcome:?}");
+        // No "the link survived" assertion: when `git worktree remove` fails,
+        // the `remove_dir_all` fallback may legitimately delete the whole tree
+        // except the `0o000` directory that blocked it. Whether the link is
+        // still there is therefore not this test's premise — the DECISION is,
+        // and it is read off the tombstone and the caller-visible error below.
+
+        let tombstone =
+            crate::agent::deletion_recovery::read(&home, "agent-40l").expect("tombstone readable");
+        assert!(
+            !matches!(
+                tombstone.as_ref().map(|t| &t.state),
+                Some(crate::agent::deletion_recovery::State::WorktreeUnusable { .. })
+            ),
+            "#40 (F2): a tracked dangling symlink IS present on disk — reporting it as \
+             deleted publishes a healthy worktree as damaged: {tombstone:?}"
+        );
+        if let Some(error) = outcome.error.as_deref() {
+            assert!(
+                !error.contains("dangling-link"),
+                "#40 (F2): the dangling symlink must never appear in the missing list: \
+                 {error}"
+            );
+        }
+    }
+
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+    assert!(
+        premise_holds,
+        "setup could not produce an unreadable directory (root? permissive fs?) — \
+         this machine cannot exercise the guard"
+    );
+}
+
+/// Fleet Protocol §3.15 stress: the #40 marker update and `binding_state`'s
+/// tombstone read must remain atomic while a release transaction publishes the
+/// unusable state. There is no new lock acquisition in the release path (it
+/// holds the existing branch → agent-mutation → binding-file locks); readers
+/// are lock-free and must see either complete old/new JSON, never a truncated
+/// tombstone.
+#[test]
+fn unusable_tombstone_remains_atomic_under_concurrent_readers_40() {
+    let home = tmp_home("40-marker-stress");
+    let repo = tmp_repo("40-marker-stress-repo");
+    let lease = lease_bound(&home, &repo, "agent-40-stress", "feat/marker-stress");
+    let expected_worktree = lease.path.display().to_string();
+    prepare_release_journal(&home, "agent-40-stress").expect("durable release fence");
+
+    let readers = 6;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(readers + 1));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut threads = Vec::new();
+    for _ in 0..readers {
+        let home = home.clone();
+        let barrier = std::sync::Arc::clone(&barrier);
+        let stop = std::sync::Arc::clone(&stop);
+        let expected_worktree = expected_worktree.clone();
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            let mut reads = 0;
+            while !stop.load(std::sync::atomic::Ordering::Acquire) || reads < 200 {
+                let tombstone = crate::agent::deletion_recovery::read(&home, "agent-40-stress")
+                    .expect("atomic marker reads must never parse as partial JSON")
+                    .expect("release tombstone remains present");
+                assert_eq!(tombstone.instance, "agent-40-stress");
+                assert_eq!(tombstone.worktree, expected_worktree);
+                reads += 1;
+            }
+        }));
+    }
+
+    let writer_home = home.clone();
+    let writer_barrier = std::sync::Arc::clone(&barrier);
+    let writer_stop = std::sync::Arc::clone(&stop);
+    let writer = std::thread::spawn(move || {
+        writer_barrier.wait();
+        for i in 0..100 {
+            crate::agent::deletion_recovery::mark_worktree_unusable(
+                &writer_home,
+                "agent-40-stress",
+                &format!("partial removal attempt {i}"),
+            )
+            .expect("atomic unusable-state write");
+            // Model a retry transition that records ordinary recovery-required
+            // state before another removal attempt, exercising both variants.
+            crate::agent::deletion_recovery::mark_recovery_required(
+                &writer_home,
+                "agent-40-stress",
+                None,
+            )
+            .expect("atomic retry-state write");
+            std::thread::yield_now();
+        }
+        crate::agent::deletion_recovery::mark_worktree_unusable(
+            &writer_home,
+            "agent-40-stress",
+            "final timed-out removal",
+        )
+        .expect("final state write");
+        writer_stop.store(true, std::sync::atomic::Ordering::Release);
+    });
+
+    writer.join().expect("state writer");
+    for reader in threads {
+        reader.join().expect("concurrent state reader");
+    }
+    let final_state = crate::agent::deletion_recovery::read(&home, "agent-40-stress")
+        .expect("final tombstone readable")
+        .expect("final tombstone exists");
+    assert!(
+        matches!(
+            &final_state.state,
+            crate::agent::deletion_recovery::State::WorktreeUnusable { .. }
+        ),
+        "final state must remain explicitly unusable: {final_state:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}

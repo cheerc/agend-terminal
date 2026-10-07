@@ -20,7 +20,15 @@ pub(crate) use branch_cleanup::{
 // #3694: the pre-removal ignored-cache sweep is deadline-bounded (extracted to
 // keep this anti-monolith file under its 2500-LOC ceiling).
 mod build_cache;
-use build_cache::clean_ignored_build_cache;
+use build_cache::{apply_cache_cleanup, clean_ignored_build_cache};
+
+// #40: keep the removal outcome classifier + structured error projection out
+// of this lifecycle file so the source LOC ratchet stays armed.
+mod partial_removal;
+use partial_removal::{
+    mark_release_incomplete, record_damaged_remnant, remove_worktree, tracked_path_snapshot,
+    WorktreeRemoval,
+};
 
 mod release_recovery;
 pub(crate) use release_recovery::prepare_release_journal;
@@ -53,11 +61,16 @@ pub(crate) enum ReleaseTestPhase {
 pub(crate) mod release_test_seam {
     use super::ReleaseTestPhase;
     use std::cell::RefCell;
+    use std::io;
 
     type ReleaseHook = Box<dyn Fn(ReleaseTestPhase)>;
 
     thread_local! {
         static HOOK: RefCell<Option<ReleaseHook>> = RefCell::new(None);
+        // Fault-inject the git removal syscall, not the postcondition, so a
+        // test can leave a genuine partial on-disk worktree and exercise the
+        // actual release response/tombstone path without waiting 60s.
+        static REMOVE_ERROR: RefCell<Option<io::ErrorKind>> = const { RefCell::new(None) };
     }
 
     pub(crate) struct Guard;
@@ -65,6 +78,7 @@ pub(crate) mod release_test_seam {
     impl Drop for Guard {
         fn drop(&mut self) {
             HOOK.with(|slot| *slot.borrow_mut() = None);
+            REMOVE_ERROR.with(|slot| *slot.borrow_mut() = None);
         }
     }
 
@@ -79,6 +93,14 @@ pub(crate) mod release_test_seam {
                 hook(phase);
             }
         });
+    }
+
+    pub(crate) fn fail_next_remove(kind: io::ErrorKind) {
+        REMOVE_ERROR.with(|slot| *slot.borrow_mut() = Some(kind));
+    }
+
+    pub(crate) fn take_remove_error() -> Option<io::ErrorKind> {
+        REMOVE_ERROR.with(|slot| slot.borrow_mut().take())
     }
 }
 
@@ -276,6 +298,16 @@ pub struct ReleaseOutcome {
     // drops `None` only, never `Some`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_cleanup_skipped_reason: Option<String>,
+    /// #40: the pre-removal ignored-cache sweep left something behind — an
+    /// unreadable git-ignored directory, or the budget elapsed. It is NOT an
+    /// error: the worktree removal that follows deletes the directory anyway,
+    /// and the leftover is a disposable build cache rather than tracked work.
+    /// Present so a surviving cache is reported instead of looking clean.
+    ///
+    /// Deliberately does NOT carry a `check-ignore` failure: git being unable to
+    /// classify a candidate fails the release outright rather than skipping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_cache_cleanup_skipped: Option<String>,
     /// #t-21: on a `dry_run=true` release, a human-readable preview of the
     /// destructive effects that were deliberately NOT performed (worktree
     /// removal + binding clear). `None` on a real release. The pre-fix bug ran
@@ -565,69 +597,6 @@ fn cleanup_merged_branch(
     }
 }
 
-/// Hard-release an agent's daemon-managed worktree + binding.
-///
-/// Sprint 53 P0-X: closes the gap left by P0-1's auto-bind/auto-lease.
-/// Without this path, every PR-merge transition leaves a stale
-/// `.worktrees/<agent>` plus `runtime/<agent>/binding.json` behind, and the
-/// next dispatch trips P0-1.6's actual-HEAD check (worktree exists on prior
-/// branch). Operator manually `git worktree remove`-d for every transition;
-/// this function lets the `release_worktree` MCP tool do it instead.
-///
-/// Differs from `release()` (Phase 3 soft mark) by actually removing the
-/// worktree directory via `git worktree remove --force`.
-///
-/// Safety: only removes worktrees carrying the `.agend-managed` marker.
-/// Operator-created worktrees without the marker are left alone — surfaced
-/// as `released: false, error: "...no .agend-managed marker..."`.
-///
-/// Idempotent (#1465): second call on the same agent sees no binding and
-/// returns `released: true, already_released: true` (no error) — the release
-/// target state is already reached, so it's a success no-op. A genuine
-/// cleanup failure WITH a binding present still returns `released: false` +
-/// `error` (idempotent success applies only to the nothing-to-do path).
-///
-/// Transactional cleanup: a missing worktree may clear its stale binding, but
-/// a build-cache or worktree-removal failure retains the binding so the daemon
-/// never advertises an unbound target that still occupies disk/registry state.
-/// Result of worktree directory removal attempt.
-enum WorktreeRemoval {
-    Removed,
-    AlreadyAbsent,
-    Unmanaged(String),
-    Failed(String),
-}
-
-fn remaining_bytes(path: &Path) -> u64 {
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return 0;
-    };
-    if !metadata.is_dir() {
-        return metadata.len();
-    }
-    std::fs::read_dir(path)
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|entry| remaining_bytes(&entry.path()))
-                .fold(0_u64, u64::saturating_add)
-        })
-        .unwrap_or(0)
-}
-
-fn mark_release_incomplete(
-    out: &mut ReleaseOutcome,
-    stage: &'static str,
-    path: &Path,
-    error: String,
-) {
-    out.error = Some(error);
-    out.code = Some("release_incomplete");
-    out.stage = Some(stage);
-    out.path = Some(path.display().to_string());
-    out.bytes_remaining = Some(remaining_bytes(path));
-}
-
 fn source_repo_from_binding(binding: &serde_json::Value, wt_path: &Path) -> PathBuf {
     binding["source_repo"]
         .as_str()
@@ -641,79 +610,6 @@ fn source_repo_from_binding(binding: &serde_json::Value, wt_path: &Path) -> Path
                 .map(PathBuf::from)
         })
         .unwrap_or_default()
-}
-
-fn remove_worktree(agent: &str, wt_path: &Path, source_repo: &Path) -> WorktreeRemoval {
-    match std::fs::symlink_metadata(wt_path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            tracing::info!(agent, path = %wt_path.display(),
-                "release: worktree path already absent — pruning registry + clearing binding");
-            if !source_repo.as_os_str().is_empty() {
-                let _ = crate::git_helpers::git_bypass(source_repo, &["worktree", "prune"]);
-            }
-            return WorktreeRemoval::AlreadyAbsent;
-        }
-        Err(e) => {
-            return WorktreeRemoval::Failed(format!(
-                "opaque worktree target metadata at {}: {e}",
-                wt_path.display()
-            ))
-        }
-        Ok(meta) if !meta.is_dir() => {
-            return WorktreeRemoval::Failed(format!(
-                "opaque worktree target metadata at {}",
-                wt_path.display()
-            ))
-        }
-        Ok(_) => {}
-    }
-    if !is_daemon_managed(wt_path) {
-        tracing::warn!(agent, path = %wt_path.display(),
-            "release skipped: no .agend-managed marker — worktree left alone");
-        return WorktreeRemoval::Unmanaged(format!(
-            "worktree at {} has no .agend-managed marker — refusing to remove (binding NOT cleared)",
-            wt_path.display()
-        ));
-    }
-
-    // #2550 W2: empty source_repo → `git_worktree::remove_force` runs with NO
-    // `current_dir` (git resolves the repo from `--force <abs wt>` itself;
-    // `git_cmd`/`git_bypass` both REQUIRE a cwd, and `wt_path.parent()` is
-    // wrong — it's the worktrees-pool dir, outside the repo tree, per lead
-    // ruling). Converged with `worktree_pool/workspace.rs::teardown_workspace_worktree`'s
-    // byte-identical dual-cwd arm (see git_worktree.rs module doc).
-    // TODO(W1.2): audit whether the empty-source_repo branch is still
-    // reachable in practice; if dead, delete this arm rather than migrate it.
-    let wt_str = wt_path.display().to_string();
-    let result = crate::git_worktree::remove_force(source_repo, &wt_str);
-    match result {
-        Ok(o) if o.status.success() => WorktreeRemoval::Removed,
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-            tracing::warn!(agent, error = %stderr, path = %wt_path.display(),
-                "git worktree remove failed — falling back to remove_dir_all");
-            let _ = std::fs::remove_dir_all(wt_path);
-            if matches!(
-                std::fs::symlink_metadata(wt_path),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound
-            ) {
-                if !source_repo.as_os_str().is_empty() {
-                    if let Err(e) =
-                        crate::git_helpers::git_bypass(source_repo, &["worktree", "prune"])
-                    {
-                        tracing::warn!(agent, error = %e, "git worktree prune failed");
-                    }
-                }
-                WorktreeRemoval::Removed
-            } else {
-                WorktreeRemoval::Failed(format!("git worktree remove failed: {stderr}"))
-            }
-        }
-        Err(e) => {
-            tracing::warn!(agent, error = %e, "git command failed for release");
-            WorktreeRemoval::Failed(format!("git command failed: {e}"))
-        }
-    }
 }
 
 mod workspace;
@@ -854,6 +750,13 @@ fn release_known_locked(
             // path, so this fires only for the managed-worktree case
             // `remove_worktree` would actually delete — the workspace-teardown
             // callers of `remove_worktree` are intentionally left untouched.
+            // #40: baseline before any deletion this route performs. The ignored-cache
+            // sweep below deletes too, so a snapshot taken after it would already
+            // have lost whatever it removed and a genuine partial removal could
+            // read as an intact worktree. See the CONTRACT note at the third
+            // baseline site — a new deletion step added after this line needs the
+            // same review.
+            let tracked_baseline = tracked_path_snapshot(wt_path);
             if is_daemon_managed(wt_path) {
                 permit.set_stage("preserve_wip");
                 let branch = binding["branch"].as_str().unwrap_or("");
@@ -888,16 +791,9 @@ fn release_known_locked(
                     };
                 }
                 permit.set_stage("clean_build_cache");
-                if let Err((path, error)) = clean_ignored_build_cache(wt_path) {
-                    mark_release_incomplete(
-                        &mut out,
-                        "build_cache_cleanup",
-                        &path,
-                        format!(
-                            "release incomplete: could not remove ignored build cache at {}: {error}",
-                            path.display()
-                        ),
-                    );
+                // #40: an undeletable git-ignored cache is recorded, not fatal;
+                // a cache git could not CLASSIFY is fatal.
+                if apply_cache_cleanup(&mut out, clean_ignored_build_cache(wt_path)).is_err() {
                     return LockedRelease {
                         out,
                         notices,
@@ -912,7 +808,7 @@ fn release_known_locked(
             permit.set_stage("worktree_remove");
             #[cfg(test)]
             release_test_seam::hit(ReleaseTestPhase::BeforeWorktreeRemove);
-            match remove_worktree(agent, wt_path, &source_repo) {
+            match remove_worktree(agent, wt_path, &source_repo, tracked_baseline.as_ref()) {
                 WorktreeRemoval::Removed => {
                     managed_verified = true;
                     out.worktree_removed = true;
@@ -969,6 +865,34 @@ fn release_known_locked(
                 }
                 WorktreeRemoval::Unmanaged(err) => {
                     mark_release_incomplete(&mut out, "worktree_remove", wt_path, err);
+                    return LockedRelease {
+                        out,
+                        notices,
+                        clear_refusal_marker,
+                        finish_full_release: false,
+                        managed_verified,
+                        worktree_absent,
+                        was_dirty,
+                    };
+                }
+                // #40: the directory survives with tracked files already
+                // deleted. Mark the binding visibly invalid so `binding_state`
+                // stops reporting it as a usable worktree — an agent must never
+                // keep working in a tree that is silently losing its files.
+                WorktreeRemoval::PartiallyRemoved {
+                    cause,
+                    missing_tracked,
+                } => {
+                    managed_verified = true;
+                    record_damaged_remnant(
+                        &mut out,
+                        "worktree_remove",
+                        wt_path,
+                        home,
+                        agent,
+                        &cause,
+                        &missing_tracked,
+                    );
                     return LockedRelease {
                         out,
                         notices,
@@ -1552,9 +1476,27 @@ fn release_bound_target_exact_impl(
         return out;
     }
 
+    // #40: capture the tracked-path baseline BEFORE any deletion the release
+    // itself performs. The ignored-cache sweep that follows is itself a
+    // deletion, and the fault-injection seam sits between the two — so a
+    // baseline taken inside `remove_worktree` would already be missing
+    // anything the sweep removed, and a genuine partial removal could read as
+    // an intact worktree. Snapshot at the entry of the attempt.
+    //
+    // CONTRACT: this baseline is only correct while it precedes EVERY deletion
+    // step in this route. The `BeforeWorktreeRemove` seam fires after the cache
+    // sweep, so inserting a new deletion step between the two silently drops
+    // whatever it removes from the comparison — the damage still happens, the
+    // report just stops seeing it. Review the baseline whenever a deletion is
+    // added to a release route. Same applies at the other two call sites.
+    let tracked_baseline = tracked_path_snapshot(target);
     #[cfg(test)]
     release_test_seam::hit(ReleaseTestPhase::BeforeWorktreeRemove);
     let mut notices = Vec::new();
+    // #40: set inside the force-preservation block below, read onto the outcome
+    // after `out` is created. Declared here because the two are separated by
+    // the `remove_worktree` call site ordering.
+    let mut build_cache_skipped_reason: Option<String> = None;
     if require_force_identity
         && matches!(
             force_target_state,
@@ -1585,30 +1527,25 @@ fn release_bound_target_exact_impl(
             };
         }
         permit.set_stage("clean_build_cache");
-        if let Err((path, error)) = clean_ignored_build_cache(target) {
-            let mut out = ReleaseOutcome::default();
-            mark_release_incomplete(
-                &mut out,
-                "build_cache_cleanup",
-                &path,
-                format!(
-                    "release incomplete: could not remove ignored build cache at {}: {error}",
-                    path.display()
-                ),
-            );
+        let mut probe = ReleaseOutcome::default();
+        if apply_cache_cleanup(&mut probe, clean_ignored_build_cache(target)).is_err() {
             drop(_binding_lock);
             drop(_agent_lock);
             drop(branch_lock);
             for notice in notices {
                 notice.emit(home);
             }
-            return out;
+            return probe;
         }
+        build_cache_skipped_reason = probe.build_cache_cleanup_skipped;
     }
     permit.set_stage("worktree_remove");
     let mut out = ReleaseOutcome::default();
+    if let Some(reason) = build_cache_skipped_reason {
+        out.build_cache_cleanup_skipped = Some(reason);
+    }
     let mut clear_marker = false;
-    let remove = remove_worktree(agent, target, source_repo);
+    let remove = remove_worktree(agent, target, source_repo, tracked_baseline.as_ref());
     match remove {
         WorktreeRemoval::Removed => {
             out.worktree_removed = true;
@@ -1676,6 +1613,23 @@ fn release_bound_target_exact_impl(
         }
         WorktreeRemoval::Unmanaged(error) => {
             mark_release_incomplete(&mut out, "worktree_remove", target, error)
+        }
+        // #40: see the `PartiallyRemoved` doc. Binding stays (so the remnant
+        // remains attributable) but is flagged unusable and therefore visible
+        // to both the agent and the orchestrator.
+        WorktreeRemoval::PartiallyRemoved {
+            cause,
+            missing_tracked,
+        } => {
+            record_damaged_remnant(
+                &mut out,
+                "worktree_remove",
+                target,
+                home,
+                agent,
+                &cause,
+                &missing_tracked,
+            );
         }
         WorktreeRemoval::Failed(error) => {
             mark_release_incomplete(&mut out, "worktree_remove", target, error);
@@ -2047,6 +2001,17 @@ fn release_absent_target_impl(
         return out;
     }
     let mut discard_audit_detail: Option<String> = None;
+    // #40: baseline before any deletion this route performs — the ignored-cache
+    // sweep below deletes too, so a snapshot taken after it would already have
+    // lost whatever it removed.
+    //
+    // CONTRACT: the baseline is only correct while it precedes EVERY deletion
+    // step in this route. `BeforeWorktreeRemove` fires after the cache sweep, so
+    // a new deletion step inserted between the two silently drops whatever it
+    // removes from the comparison — the damage still happens, the report just
+    // stops seeing it. Review this line whenever a release route gains a
+    // deletion. Same applies at the other two baseline sites.
+    let tracked_baseline = tracked_path_snapshot(target);
     if matches!(target_state, crate::mcp::handlers::TargetState::Present) {
         permit.set_stage("preserve_wip");
         let mk_branch = marker_branch(target);
@@ -2400,16 +2365,7 @@ fn release_absent_target_impl(
             }
         }
         permit.set_stage("clean_build_cache");
-        if let Err((path, error)) = clean_ignored_build_cache(target) {
-            mark_release_incomplete(
-                &mut out,
-                "build_cache_cleanup",
-                &path,
-                format!(
-                    "release incomplete: could not remove ignored build cache at {}: {error}",
-                    path.display()
-                ),
-            );
+        if apply_cache_cleanup(&mut out, clean_ignored_build_cache(target)).is_err() {
             drop(_binding_lock);
             drop(_agent_lock);
             for notice in notices {
@@ -2419,7 +2375,7 @@ fn release_absent_target_impl(
         }
     }
     permit.set_stage("worktree_remove");
-    match remove_worktree(agent, target, source_repo) {
+    match remove_worktree(agent, target, source_repo, tracked_baseline.as_ref()) {
         WorktreeRemoval::Removed => {
             if let Some(detail) = &discard_audit_detail {
                 crate::event_log::log(home, "nested_dirt_discard_release", agent, detail);
@@ -2438,6 +2394,36 @@ fn release_absent_target_impl(
             out.already_released = true;
             #[cfg(test)]
             release_test_seam::hit(ReleaseTestPhase::AfterWorktreeRemoveBeforeBindingClear);
+        }
+        // #40: a remnant must never be reported as a clean nested-dirt discard
+        // either — the discard audit records that work was intentionally
+        // thrown away, which is true, but the directory itself is now damaged,
+        // so the binding is flagged rather than left looking usable.
+        WorktreeRemoval::PartiallyRemoved {
+            cause,
+            missing_tracked,
+        } => {
+            if let Some(detail) = &discard_audit_detail {
+                crate::event_log::log(
+                    home,
+                    "nested_dirt_discard_aborted",
+                    agent,
+                    &format!(
+                        "{detail} abort_reason=worktree_partially_removed \
+                         missing_tracked={}",
+                        missing_tracked.len()
+                    ),
+                );
+            }
+            record_damaged_remnant(
+                &mut out,
+                "worktree_remove",
+                target,
+                home,
+                agent,
+                &cause,
+                &missing_tracked,
+            );
         }
         WorktreeRemoval::Unmanaged(error) | WorktreeRemoval::Failed(error) => {
             if let Some(detail) = &discard_audit_detail {

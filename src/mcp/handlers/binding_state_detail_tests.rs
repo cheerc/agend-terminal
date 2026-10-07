@@ -746,3 +746,74 @@ fn arch14_identity_probe_error_without_mutation() {
     assert_eq!(before, after, "probe must not mutate the persisted binding");
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ─── #40 ─────────────────────────────────────────────────────────────────────
+
+/// #40 判準 1: `worktree_unusable` must be `null` in the healthy case, so every
+/// pre-existing reader of `binding_state` sees exactly the same shape it saw
+/// before this field existed. A daemon-core response-struct addition is only
+/// safe if that is actually true — this pins it rather than asserting it.
+#[test]
+fn worktree_unusable_is_null_for_a_healthy_binding_40() {
+    let home = tmp_home("40-null");
+    write_binding(&home, "dev", "owner/repo", "feat/x");
+
+    let r = handle_binding_state(&home, &json!({"instance": "dev"}), &None);
+
+    assert_eq!(r["bound"], true, "fixture must be bound: {r}");
+    assert!(
+        r["worktree_unusable"].is_null(),
+        "#40: a healthy binding must report worktree_unusable: null — existing \
+         readers must be unaffected: {r}"
+    );
+    // The rest of the established shape is unchanged.
+    assert_eq!(r["agent"], "dev", "{r}");
+    assert_eq!(r["branch"], "feat/x", "{r}");
+    assert_eq!(r["task_id"], "t", "{r}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #40 判準 1: once release records a killed removal, the SAME healthy-looking
+/// binding must stop advertising itself as usable. Without this the agent keeps
+/// working in a tree that is silently losing its files — the exact #40 failure.
+#[test]
+fn worktree_unusable_is_surfaced_after_a_killed_removal_40() {
+    let home = tmp_home("40-unusable");
+    write_binding(&home, "dev", "owner/repo", "feat/x");
+    let wt = home.join("wt-dev");
+
+    // A tombstone in the state release would have written.
+    let tombstone = json!({
+        "schema_version": 1,
+        "state": {"worktree_unusable": {"cause": "removal timed out mid-walk"}},
+        "instance": "dev",
+        "branch": "feat/x",
+        "worktree": wt.to_str().unwrap(),
+        "source_repo": home.join("src-dev").to_str().unwrap(),
+        "binding_sha256": "deadbeef",
+        "binding_signature_sha256": "deadbeef",
+        "archive": null,
+    });
+    std::fs::create_dir_all(home.join("deletion-recovery")).unwrap();
+    std::fs::write(
+        crate::agent::deletion_recovery::path(&home, "dev"),
+        serde_json::to_string_pretty(&tombstone).unwrap(),
+    )
+    .unwrap();
+
+    let r = handle_binding_state(&home, &json!({"instance": "dev"}), &None);
+
+    assert_eq!(r["bound"], true, "binding is still bound: {r}");
+    assert_eq!(
+        r["worktree_unusable"]["worktree"],
+        json!(wt.to_str().unwrap()),
+        "#40: a killed removal must reach the agent: {r}"
+    );
+    assert!(
+        r["worktree_unusable"]["cause"]
+            .as_str()
+            .is_some_and(|cause| cause.contains("removal timed out mid-walk")),
+        "the cause must be visible alongside the remnant path: {r}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

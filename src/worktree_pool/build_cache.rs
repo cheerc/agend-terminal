@@ -15,21 +15,123 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+mod cleanup_test_seam {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Hook = Box<dyn Fn(&Path)>;
+
+    thread_local! {
+        static AFTER_DIR: RefCell<Option<Hook>> = RefCell::new(None);
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            AFTER_DIR.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub(crate) fn install(hook: impl Fn(&Path) + 'static) -> Guard {
+        AFTER_DIR.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Guard
+    }
+
+    pub(super) fn after_dir(path: &Path) {
+        AFTER_DIR.with(|slot| {
+            if let Some(hook) = slot.borrow().as_ref() {
+                hook(path);
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+use cleanup_test_seam::after_dir;
+#[cfg(not(test))]
+fn after_dir(_path: &Path) {}
+
 /// #3694: hard cap on time spent pre-deleting an ignored `target/`. Kept well
 /// below the 60s `LOCAL_GIT_TIMEOUT` that bounds the subsequent
 /// `git worktree remove`, so this sweep can never consume the whole release
 /// budget. Normal caches are deleted far inside this window.
 pub(crate) const BUILD_CACHE_CLEANUP_BUDGET: Duration = Duration::from_secs(10);
 
-/// Remove an ignored `target/` cache before worktree removal, bounded by
+/// Outcome of the pre-removal ignored-cache sweep.
+///
+/// #40: the sweep's product is a git-ignored build cache, never tracked work.
+/// That is what makes a *skip* safe and a *fatal* unnecessary for the "could
+/// not delete" cases — but "could not tell what is disposable" is a different
+/// failure and must stay fatal, so the two are deliberately distinct variants
+/// rather than one skip bucket.
+#[derive(Debug)]
+pub(crate) enum CacheCleanup {
+    /// Every git-ignored cache was removed.
+    Complete,
+    /// Some caches survived (unreadable directory, or the budget elapsed).
+    /// Non-fatal: the release continues and the bounded
+    /// `git worktree remove --force` that follows still deletes the whole
+    /// worktree directory. The reason is recorded on the release outcome so a
+    /// surviving cache is visible instead of silently reported as clean.
+    Skipped(String),
+    /// Git could not classify what is disposable. Continuing would mean acting
+    /// on a directory of unknown provenance, so the caller fails the release
+    /// rather than guessing.
+    Fatal { path: PathBuf, reason: String },
+}
+
+/// Fold a sweep result into a release outcome.
+///
+/// A skip is recorded and the release continues: the leftover is a git-ignored
+/// build cache and the bounded worktree removal still deletes it. A fatal is
+/// written onto the outcome — the caller decides whether to return it or carry
+/// on, and both sites share this so the two never drift apart.
+///
+/// Split out of `worktree_pool.rs` for two reasons: the file sits at 2467 of a
+/// hard 2500-line ratchet (see `tests/src_file_size_invariant.rs`), and the
+/// three release routes were about to hold three hand-copied versions of this
+/// decision. The skip-vs-fatal split is the load-bearing part — do not collapse
+/// it back into one bucket, and do not inline it.
+pub(crate) fn apply_cache_cleanup(
+    out: &mut super::ReleaseOutcome,
+    result: CacheCleanup,
+) -> Result<(), (PathBuf, String)> {
+    match result {
+        CacheCleanup::Complete => Ok(()),
+        CacheCleanup::Skipped(reason) => {
+            out.build_cache_cleanup_skipped = Some(reason);
+            Ok(())
+        }
+        CacheCleanup::Fatal { path, reason } => {
+            mark_cache_cleanup_fatal(out, &path, &reason);
+            Err((path, reason))
+        }
+    }
+}
+
+/// Write the caller-visible failure for a cache the sweep could not classify.
+pub(crate) fn mark_cache_cleanup_fatal(out: &mut super::ReleaseOutcome, path: &Path, reason: &str) {
+    super::mark_release_incomplete(
+        out,
+        "build_cache_cleanup",
+        path,
+        format!(
+            "release incomplete: could not classify ignored build cache at {}: {reason}",
+            path.display()
+        ),
+    );
+}
+
+/// Remove an ignored build cache before worktree removal, bounded by
 /// [`BUILD_CACHE_CLEANUP_BUDGET`].
 ///
-/// Returns `Err((path, reason))` only for an opaque precondition failure — an
-/// unreadable `target/` metadata or a directory that cannot be enumerated at
-/// all (matching the old unbounded `remove_dir_all` contract). Budget
-/// exhaustion is a **non-fatal skip**: the leftover is deleted by the worktree
-/// removal that follows.
-pub(crate) fn clean_ignored_build_cache(worktree: &Path) -> Result<(), (PathBuf, String)> {
+/// #40: returning `Skipped` means the release still succeeds with a recorded
+/// reason; `Fatal` means the caller must fail the release. An unreadable
+/// `target/` metadata, or a directory that cannot be enumerated at all, is
+/// `Fatal` only when it defeats classification — see [`CacheCleanup`].
+pub(crate) fn clean_ignored_build_cache(worktree: &Path) -> CacheCleanup {
     clean_ignored_build_cache_with_budget(worktree, BUILD_CACHE_CLEANUP_BUDGET)
 }
 
@@ -38,35 +140,93 @@ pub(crate) fn clean_ignored_build_cache(worktree: &Path) -> Result<(), (PathBuf,
 pub(crate) fn clean_ignored_build_cache_with_budget(
     worktree: &Path,
     budget: Duration,
-) -> Result<(), (PathBuf, String)> {
-    let target = worktree.join("target");
-    let metadata = match std::fs::symlink_metadata(&target) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err((target, error.to_string())),
-    };
-    // A target directory is only a disposable cache when Git confirms the
-    // repository ignores it. An unignored target stays part of the ordinary
-    // WIP-preservation + worktree-removal transaction.
-    if !crate::git_helpers::git_ok(worktree, &["check-ignore", "-q", "--", "target/"]) {
-        return Ok(());
-    }
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return std::fs::remove_file(&target).map_err(|error| (target, error.to_string()));
-    }
-    match remove_dir_all_bounded(&target, Instant::now() + budget) {
-        Ok(()) => Ok(()),
-        Err(BoundedRemoval::Deadline) => {
+) -> CacheCleanup {
+    // ONE deadline starts before enumeration/classification and is shared by
+    // all `check-ignore` calls plus every directory deletion. This is the
+    // property most easily broken by a later change: do NOT recompute a
+    // per-directory deadline or give every cache its own git timeout. Three
+    // 9s caches must still get ONE 10s sweep, not 27s while holding the release
+    // locks and then competing with the 60s LOCAL_GIT_TIMEOUT removal.
+    let deadline = Instant::now() + budget;
+
+    let dirs = match ignored_cache_dirs(worktree, deadline) {
+        Ok(Some(dirs)) => dirs,
+        Ok(None) => {
             tracing::warn!(
-                path = %target.display(),
+                path = %worktree.display(),
                 budget_secs = budget.as_secs(),
-                "release: ignored build cache cleanup exceeded its budget — leaving the \
-                 remainder for the bounded worktree removal"
+                "release: ignored build-cache discovery exceeded its budget — leaving caches \
+                 for worktree removal"
             );
-            Ok(())
+            return CacheCleanup::Skipped(format!(
+                "discovery exceeded its {}s budget at {}",
+                budget.as_secs(),
+                worktree.display()
+            ));
         }
-        Err(BoundedRemoval::Io(error)) => Err((target, error)),
+        Err((path, reason)) => return CacheCleanup::Fatal { path, reason },
+    };
+
+    for dir in dirs {
+        let metadata = match std::fs::symlink_metadata(&dir) {
+            Ok(metadata) => metadata,
+            // Vanished between enumeration and deletion: someone else already
+            // reclaimed it, which is the outcome the sweep wanted anyway.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            // #40: the entry is already known to be git-ignored, so an
+            // unreadable stat says only that this sweep cannot delete it. That
+            // is not a reason to abort a release the bounded worktree removal
+            // would otherwise complete, so it is recorded and skipped.
+            Err(error) => {
+                tracing::warn!(
+                    path = %dir.display(),
+                    "release: ignored build cache is unreadable — leaving it for the bounded \
+                     worktree removal"
+                );
+                return CacheCleanup::Skipped(format!(
+                    "unreadable ignored cache at {}: {error}",
+                    dir.display()
+                ));
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            // Preserve the old `target` behaviour for a symlink/file while
+            // never following it outside the worktree.
+            let _ = std::fs::remove_file(&dir);
+            continue;
+        }
+        match remove_dir_all_bounded(&dir, deadline) {
+            Ok(()) => after_dir(&dir),
+            Err(BoundedRemoval::Deadline) => {
+                tracing::warn!(
+                    path = %dir.display(),
+                    budget_secs = budget.as_secs(),
+                    "release: ignored build cache cleanup exceeded its budget — leaving the \
+                     remainder for the bounded worktree removal"
+                );
+                // Every remaining directory would only burn the same exhausted
+                // deadline; stop here so the release keeps its single budget.
+                return CacheCleanup::Skipped(format!(
+                    "cleanup exceeded its {}s budget at {}",
+                    budget.as_secs(),
+                    dir.display()
+                ));
+            }
+            Err(BoundedRemoval::Io(error)) => {
+                tracing::warn!(
+                    path = %dir.display(),
+                    error = %error,
+                    "release: ignored build cache could not be enumerated — leaving it for the \
+                     bounded worktree removal"
+                );
+                return CacheCleanup::Skipped(format!(
+                    "could not enumerate ignored cache at {}: {error}",
+                    dir.display()
+                ));
+            }
+        }
     }
+    CacheCleanup::Complete
 }
 
 #[derive(Debug)]
@@ -101,6 +261,93 @@ fn remove_dir_all_bounded(dir: &Path, deadline: Instant) -> Result<(), BoundedRe
     }
     let _ = std::fs::remove_dir(dir);
     Ok(())
+}
+
+/// #40: enumerate git-ignored top-level directories, so a multi-GB
+/// `node_modules/` is swept just like a multi-GB `target/`.
+///
+/// Git is the authority on "disposable", never a hardcoded list. Every
+/// candidate is confirmed by `check-ignore` with the SAME deadline's remaining
+/// duration; one expensive ignore check therefore shortens every later check
+/// and every deletion instead of multiplying the 60s `LOCAL_GIT_TIMEOUT` by
+/// the number of directories.
+///
+/// Returns `Ok(None)` if the single shared budget is exhausted while enumerating
+/// or classifying; the caller records that as a skip. A `git check-ignore`
+/// failure is `Fatal`: git is the authority on "disposable", so an unknown
+/// verdict must fail the release rather than guess.
+fn ignored_cache_dirs(
+    worktree: &Path,
+    deadline: Instant,
+) -> Result<Option<Vec<PathBuf>>, (PathBuf, String)> {
+    let entries =
+        std::fs::read_dir(worktree).map_err(|error| (worktree.to_path_buf(), error.to_string()))?;
+    let mut candidates: Vec<(String, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // Structural entries are never disposable. Symlinks are included as
+        // candidates only because the sweep unlinks the symlink itself (never
+        // follows it); a git-ignored link out of the worktree is still just a
+        // link owned by this directory.
+        if name == ".git" || name == crate::worktree_pool::MANAGED_MARKER {
+            continue;
+        }
+        let is_dir = file_type.is_dir();
+        let is_symlink = file_type.is_symlink();
+        let preserve_legacy_target_shape = name == "target" && file_type.is_file();
+        if !is_dir && !is_symlink && !preserve_legacy_target_shape {
+            continue;
+        }
+        let pathspec = if is_dir || name == "target" {
+            // Preserve the exact pre-#40 `target/` check for the legacy target
+            // path, including symlink/file shapes; other ignored caches use
+            // their root-level basename.
+            format!("{name}/")
+        } else {
+            name.to_string()
+        };
+        candidates.push((pathspec, path));
+    }
+    if candidates.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    // One bounded git process per candidate, but every process receives the
+    // SAME deadline's remaining duration. Thus N dirs cost at most ONE budget,
+    // not N × LOCAL_GIT_TIMEOUT and not N × `budget`.
+    let mut ignored = Vec::new();
+    for (pathspec, path) in candidates {
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let args = ["check-ignore", "-q", "--", pathspec.as_str()];
+        match crate::git_helpers::git_bypass_timeout(worktree, &args, remaining) {
+            Ok(output) if output.status.success() => ignored.push(path),
+            Ok(output) if output.status.code() == Some(1) => {}
+            Ok(output) => {
+                return Err((
+                    path,
+                    format!(
+                        "git check-ignore failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => return Ok(None),
+            Err(error) => return Err((path, error.to_string())),
+        }
+    }
+    Ok(Some(ignored))
 }
 
 #[cfg(test)]
