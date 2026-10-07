@@ -7885,6 +7885,113 @@ fn intact_worktree_that_cannot_be_removed_is_failed_not_partially_removed_40() {
     );
 }
 
+/// #40 (review finding F2): a tracked **dangling symlink** is still present on
+/// disk, so it must not be reported as a deleted tracked file.
+///
+/// `Path::exists()` calls `stat(2)`, which follows the link, so a committed
+/// link to a target that never existed reads as absent — the pre-fix
+/// comparator listed it in `missing_tracked` and published a completely healthy
+/// worktree as damaged, which is the mirror image of the defect #40 was opened
+/// about. This test would pass vacuously without the tracked symlink, so it
+/// asserts the link is genuinely tracked first.
+///
+/// The product repo has no tracked symlinks (`git ls-files -s | awk '$1=="120000"'`
+/// → 0), so no existing fixture covers this and only this test pins it.
+#[cfg(unix)]
+#[test]
+fn tracked_dangling_symlink_is_not_reported_as_a_deleted_tracked_file_40() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tmp_home("40-dangling-link");
+    let repo = tmp_repo("40-dangling-link-repo");
+    let lease = lease_bound(&home, &repo, "agent-40l", "feat/dangling-link");
+
+    let link = lease.path.join("dangling-link");
+    std::os::unix::fs::symlink("/nonexistent/agend-40-target", &link).expect("seed dangling link");
+    git_in(&lease.path, &["add", "dangling-link"]);
+    git_in(
+        &lease.path,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "seed tracked dangling symlink",
+        ],
+    );
+
+    // Premise guard: the link must be TRACKED for this to test anything, and it
+    // must actually be dangling for the F2 mechanism to apply.
+    let ls_files = std::process::Command::new("git")
+        .args(["ls-files", "dangling-link"])
+        .current_dir(&lease.path)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git ls-files");
+    let tracked = String::from_utf8_lossy(&ls_files.stdout).to_string();
+    assert!(
+        tracked.contains("dangling-link"),
+        "premise: the symlink must be tracked or this test proves nothing: {tracked}"
+    );
+    assert!(
+        !link.exists() && std::fs::symlink_metadata(&link).is_ok(),
+        "premise: the link must be dangling — exists()={} but the entry is on disk",
+        link.exists()
+    );
+
+    // An unreadable directory makes removal fail while leaving the tracked set
+    // untouched, so the comparator's answer decides the verdict outright.
+    let locked = lease.path.join("locked-subdir");
+    std::fs::create_dir_all(&locked).expect("mkdir locked");
+    std::fs::write(locked.join("held.txt"), b"held\n").expect("seed held");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+    let premise_holds = std::fs::read_dir(&locked).is_err();
+    if premise_holds {
+        let _hook = release_test_seam::install(|_phase| {
+            release_test_seam::fail_next_remove(std::io::ErrorKind::TimedOut);
+        });
+
+        let outcome = release_full(&home, "agent-40l", false);
+
+        assert!(!outcome.released, "must never report success: {outcome:?}");
+        // No "the link survived" assertion: when `git worktree remove` fails,
+        // the `remove_dir_all` fallback may legitimately delete the whole tree
+        // except the `0o000` directory that blocked it. Whether the link is
+        // still there is therefore not this test's premise — the DECISION is,
+        // and it is read off the tombstone and the caller-visible error below.
+
+        let tombstone =
+            crate::agent::deletion_recovery::read(&home, "agent-40l").expect("tombstone readable");
+        assert!(
+            !matches!(
+                tombstone.as_ref().map(|t| &t.state),
+                Some(crate::agent::deletion_recovery::State::WorktreeUnusable { .. })
+            ),
+            "#40 (F2): a tracked dangling symlink IS present on disk — reporting it as \
+             deleted publishes a healthy worktree as damaged: {tombstone:?}"
+        );
+        if let Some(error) = outcome.error.as_deref() {
+            assert!(
+                !error.contains("dangling-link"),
+                "#40 (F2): the dangling symlink must never appear in the missing list: \
+                 {error}"
+            );
+        }
+    }
+
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+    assert!(
+        premise_holds,
+        "setup could not produce an unreadable directory (root? permissive fs?) — \
+         this machine cannot exercise the guard"
+    );
+}
+
 /// Fleet Protocol §3.15 stress: the #40 marker update and `binding_state`'s
 /// tombstone read must remain atomic while a release transaction publishes the
 /// unusable state. There is no new lock acquisition in the release path (it

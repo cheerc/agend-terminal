@@ -66,10 +66,24 @@ pub(super) fn tracked_path_snapshot(worktree: &Path) -> Option<BTreeSet<String>>
 ///
 /// Compared as SETS, not counts: untracked noise cannot perturb the verdict,
 /// and the result names exactly which tracked files are gone.
+///
+/// Existence is `symlink_metadata`, NOT `Path::exists()`. The criterion is
+/// "is this path still on disk", not "does its target resolve": `Path::exists()`
+/// calls `stat(2)`, which FOLLOWS a symlink, so a committed link whose target
+/// never existed reads as missing even though nothing was deleted — republishing
+/// a healthy worktree as damaged. `symlink_metadata` is `lstat(2)`, which answers
+/// the question actually being asked.
+///
+/// It also handles the parent-directory case correctly. A tracked path under a
+/// directory that was itself deleted yields `Err` (the file is genuinely
+/// unreachable → correctly reported missing), and a path reached THROUGH a
+/// symlinked parent directory resolves normally, failing only if a real
+/// component is gone. Those two plus the two symlink shapes exhaust the cases:
+/// there is no third way for `lstat` to disagree with "the entry itself is gone".
 fn missing_tracked_paths(worktree: &Path, before: &BTreeSet<String>) -> Vec<String> {
     before
         .iter()
-        .filter(|relative| !worktree.join(relative).exists())
+        .filter(|relative| std::fs::symlink_metadata(worktree.join(relative)).is_err())
         .cloned()
         .collect()
 }

@@ -3674,9 +3674,18 @@ fn discard_seam_newline_path_no_mutation() {
 
 // ─── #40 ─────────────────────────────────────────────────────────────────────
 
+/// Run a git command inside a #40 fixture.
+///
+/// Identity is pinned per-invocation, exactly like `git_run_ok` above. A
+/// machine-local `git config --global user.name` is NOT a given: CI runners
+/// have none, so an unpinned `commit` fails there with "Author identity
+/// unknown" while passing on any developer machine that has ever set one.
+/// That asymmetry is invisible to local runs, so pin it rather than rely on
+/// the environment.
 fn git40(dir: &Path, args: &[&str]) {
     let out = std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
         .args(args)
         .current_dir(dir)
         .output()
