@@ -3718,7 +3718,7 @@ fn discard_seam_cache_fatal_emits_abort_audit_48() {
     let event_log = home.join("event-log.jsonl");
     let before = std::fs::read_to_string(&event_log).unwrap_or_default();
 
-    let _seam = crate::worktree_pool::cache_fatal_test_seam::arm(
+    let _seam = crate::worktree_pool::build_cache::cache_fatal_test_seam::arm(
         info.path.join("target"),
         "injected cache-classification failure".to_string(),
     );

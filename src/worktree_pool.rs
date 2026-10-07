@@ -19,7 +19,7 @@ pub(crate) use branch_cleanup::{
 
 // #3694: the pre-removal ignored-cache sweep is deadline-bounded (extracted to
 // keep this anti-monolith file under its 2500-LOC ceiling).
-mod build_cache;
+pub(crate) mod build_cache;
 use build_cache::{apply_cache_cleanup, clean_ignored_build_cache};
 
 // #40: keep the removal outcome classifier + structured error projection out
@@ -110,42 +110,6 @@ pub(crate) mod release_test_seam {
 
 /// Marker file placed in daemon-managed worktrees (R14 mitigation).
 pub(crate) const MANAGED_MARKER: &str = ".agend-managed";
-
-/// #48: test-only injection of a `CacheCleanup::Fatal` sweep outcome.
-/// Production reaches `Fatal` when git cannot classify what is disposable (a
-/// `check-ignore` failure or an unreadable worktree root) — a state no
-/// hermetic fixture can produce on demand without breaking the earlier release
-/// steps that need the same git/worktree healthy. The seam fires inside the
-/// budgeted sweep entry point so the release route under test observes a
-/// genuine `Fatal`, not a re-implementation of it. Thread-local + RAII guard,
-/// same shape as `release_test_seam` above; `#[cfg(test)]`-gated, zero
-/// production effect.
-#[cfg(test)]
-pub(crate) mod cache_fatal_test_seam {
-    use std::cell::RefCell;
-    use std::path::PathBuf;
-
-    thread_local! {
-        static FORCE_FATAL: RefCell<Option<(PathBuf, String)>> = const { RefCell::new(None) };
-    }
-
-    pub(crate) struct Guard;
-
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            FORCE_FATAL.with(|slot| *slot.borrow_mut() = None);
-        }
-    }
-
-    pub(crate) fn arm(path: PathBuf, reason: String) -> Guard {
-        FORCE_FATAL.with(|slot| *slot.borrow_mut() = Some((path, reason)));
-        Guard
-    }
-
-    pub(crate) fn take() -> Option<(PathBuf, String)> {
-        FORCE_FATAL.with(|slot| slot.borrow_mut().take())
-    }
-}
 
 /// Root directory for daemon-managed worktrees in the new layout.
 /// `<home>/worktrees/` — contains `<agent>/<branch>/` subdirectories.
