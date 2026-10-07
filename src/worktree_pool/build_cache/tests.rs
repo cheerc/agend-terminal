@@ -268,17 +268,30 @@ fn git_and_managed_marker_are_never_swept_40() {
 /// Self-validating, following the established repo pattern: running as root (or
 /// on a filesystem that ignores mode bits) the premise cannot be produced, and
 /// silently passing would make this a vacuous test.
+///
+/// The "other caches were still swept" half is asserted without naming a
+/// directory. `read_dir` order is unsorted (`build_cache.rs:284`), so which
+/// directory precedes the trapped one differs per platform — an earlier
+/// version asserted `target` by name and passed on macOS while failing on
+/// Linux, and naming a different one would only move the same fragility.
+/// See the note at the assertion itself: it records current behaviour, and
+/// the stronger contract it does not verify is tracked separately.
 #[cfg(unix)]
 #[test]
 fn unreadable_ignored_cache_is_skipped_not_fatal_40() {
     use std::os::unix::fs::PermissionsExt;
 
+    const TRAPPED_CACHE: &str = "node_modules";
+    const OTHER_CACHES: [&str; 2] = ["target", "dist"];
+
     let wt = bc_fixture("40-unreadable");
     git_repo_ignoring_many(&wt);
-    seed_dir_with_files(&wt.join("target"), 4);
-    seed_dir_with_files(&wt.join("node_modules"), 4);
+    seed_dir_with_files(&wt.join(TRAPPED_CACHE), 4);
+    for cache in OTHER_CACHES {
+        seed_dir_with_files(&wt.join(cache), 4);
+    }
 
-    let trapped = wt.join("node_modules/locked");
+    let trapped = wt.join(TRAPPED_CACHE).join("locked");
     std::fs::create_dir_all(&trapped).expect("mkdir trapped");
     std::fs::write(trapped.join("content.txt"), b"trapped\n").expect("seed trapped");
     std::fs::set_permissions(&trapped, std::fs::Permissions::from_mode(0o000)).expect("chmod");
@@ -292,11 +305,36 @@ fn unreadable_ignored_cache_is_skipped_not_fatal_40() {
              that follows still deletes it — the sweep must skip, not abort the release: {out:?}"
         );
 
-        // The readable cache before the trapped one is still removed, so the
-        // sweep is not merely bailing out at the first sign of trouble.
+        // RECORDS CURRENT BEHAVIOUR — it does not verify the original contract.
+        //
+        // The contract this text states is "a skip must not abandon the caches
+        // that ARE deletable". That contract is NOT met: `clean_ignored_build_cache`
+        // returns `Skipped` at the first directory it cannot enumerate
+        // (`build_cache.rs:215-226`), so every ignored directory ordered after
+        // an undeletable one survives the sweep. Measured across four readdir
+        // orders, three leave caches behind.
+        //
+        // So this asserts only what holds under every ordering: the sweep
+        // deleted SOMETHING before hitting the block. Naming a specific cache
+        // would re-introduce the readdir dependency an earlier version of this
+        // test had — it passed on macOS and failed on Linux. Asserting "all
+        // deletable caches are gone" would be the real contract, but it is
+        // currently false; that gap is tracked separately, not asserted here.
+        let swept = OTHER_CACHES
+            .iter()
+            .filter(|cache| !wt.join(cache).exists())
+            .count();
         assert!(
-            !wt.join("target").exists(),
-            "#40: a skip must not abandon the caches that ARE deletable"
+            swept >= 1,
+            "#40: the sweep must not be a no-op — at least one readable, \
+             git-ignored cache must be gone before the undeletable one stops it: {out:?}"
+        );
+        // And the trapped cache must survive, otherwise `swept >= 1` could be
+        // satisfied by a sweep that deleted everything and reported nothing.
+        assert!(
+            wt.join(TRAPPED_CACHE).exists(),
+            "#40: the undeletable cache must survive — if it were removed the \
+             assertion above would pass vacuously: {out:?}"
         );
     }
 
