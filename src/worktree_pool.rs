@@ -111,6 +111,42 @@ pub(crate) mod release_test_seam {
 /// Marker file placed in daemon-managed worktrees (R14 mitigation).
 pub(crate) const MANAGED_MARKER: &str = ".agend-managed";
 
+/// #48: test-only injection of a `CacheCleanup::Fatal` sweep outcome.
+/// Production reaches `Fatal` when git cannot classify what is disposable (a
+/// `check-ignore` failure or an unreadable worktree root) — a state no
+/// hermetic fixture can produce on demand without breaking the earlier release
+/// steps that need the same git/worktree healthy. The seam fires inside the
+/// budgeted sweep entry point so the release route under test observes a
+/// genuine `Fatal`, not a re-implementation of it. Thread-local + RAII guard,
+/// same shape as `release_test_seam` above; `#[cfg(test)]`-gated, zero
+/// production effect.
+#[cfg(test)]
+pub(crate) mod cache_fatal_test_seam {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    thread_local! {
+        static FORCE_FATAL: RefCell<Option<(PathBuf, String)>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FORCE_FATAL.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub(crate) fn arm(path: PathBuf, reason: String) -> Guard {
+        FORCE_FATAL.with(|slot| *slot.borrow_mut() = Some((path, reason)));
+        Guard
+    }
+
+    pub(crate) fn take() -> Option<(PathBuf, String)> {
+        FORCE_FATAL.with(|slot| slot.borrow_mut().take())
+    }
+}
+
 /// Root directory for daemon-managed worktrees in the new layout.
 /// `<home>/worktrees/` — contains `<agent>/<branch>/` subdirectories.
 /// Used by lease, gc_candidates, and reconcile_hooks.
@@ -2366,6 +2402,21 @@ fn release_absent_target_impl(
         }
         permit.set_stage("clean_build_cache");
         if apply_cache_cleanup(&mut out, clean_ignored_build_cache(target)).is_err() {
+            // #48: the cache sweep could not classify what is disposable, so the
+            // release aborts here — before `remove_worktree`. The discard was
+            // already authorized above, so this path must emit the same abort
+            // audit the remove-phase failure arms emit, or the event log stays
+            // silent about an attempted-and-failed release. Shares the
+            // `release_failed` abort_reason convention (no new token, no
+            // missing-file list — nothing tracked vanished on this path).
+            if let Some(detail) = &discard_audit_detail {
+                crate::event_log::log(
+                    home,
+                    "nested_dirt_discard_aborted",
+                    agent,
+                    &format!("{detail} abort_reason=release_failed"),
+                );
+            }
             drop(_binding_lock);
             drop(_agent_lock);
             for notice in notices {

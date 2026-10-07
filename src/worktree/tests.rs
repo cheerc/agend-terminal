@@ -3693,6 +3693,97 @@ fn discard_seam_audit_targets_are_json_encoded() {
     }
 }
 
+/// #48: a cache-classification failure AFTER discard authorization must still
+/// emit `nested_dirt_discard_aborted` — the release is attempted and fails,
+/// so the event log must say "aborted", not stay silent.
+///
+/// Regression shape: `discard_audit_detail` is filled at discard authorization,
+/// but the cache-fatal early return left the route before the `remove_worktree`
+/// match arms that write the abort audit. A silent failure reads as
+/// "never started" instead of "attempted and failed".
+///
+/// The `Fatal` outcome is injected via `fatal_test_seam`: production reaches
+/// it when git cannot classify what is disposable, a state no hermetic fixture
+/// can produce on demand without breaking the earlier release steps that need
+/// the same git healthy.
+#[cfg(unix)]
+#[test]
+fn discard_seam_cache_fatal_emits_abort_audit_48() {
+    let home = release_tmp_home("discard-cache-fatal");
+    let super_repo = tmp_super_one_sub("discard-cache-fatal");
+    let info = create(&home, &super_repo, "agent1", Some("feat/cache-fatal")).expect("worktree");
+    std::fs::write(info.path.join("vendor/dep/vendored.txt"), b"nested-edit\n").unwrap();
+
+    let digest = nested_dirt_digest(&info.path);
+    let event_log = home.join("event-log.jsonl");
+    let before = std::fs::read_to_string(&event_log).unwrap_or_default();
+
+    let _seam = crate::worktree_pool::cache_fatal_test_seam::arm(
+        info.path.join("target"),
+        "injected cache-classification failure".to_string(),
+    );
+    let result = release_entry(
+        &home,
+        "agent1",
+        &info.path,
+        "feat/cache-fatal",
+        true,
+        true,
+        Some(&digest),
+    );
+    assert!(
+        result["error"].as_str().is_some(),
+        "cache fatal must fail the release: {result}"
+    );
+    assert_ne!(
+        result["released"].as_bool(),
+        Some(true),
+        "cache fatal must NOT report released: {result}"
+    );
+
+    // NB: the event-log file itself may not exist on the cache-fatal path —
+    // that silence is part of what #48 reports. Read defensively so the RED
+    // fails on the missing abort audit, not on a missing file.
+    let after = std::fs::read_to_string(&event_log).unwrap_or_default();
+    let new_lines: Vec<&str> = after.lines().skip(before.lines().count()).collect();
+    assert!(
+        !new_lines
+            .iter()
+            .any(|l| l.contains("nested_dirt_discard_release")),
+        "cache fatal must NOT emit success audit: {new_lines:?}"
+    );
+    let aborted: Vec<&str> = new_lines
+        .iter()
+        .copied()
+        .filter(|l| l.contains("nested_dirt_discard_aborted"))
+        .collect();
+    assert_eq!(
+        aborted.len(),
+        1,
+        "#48: the cache-fatal path must emit exactly one aborted audit: {new_lines:?}"
+    );
+    let detail = aborted[0];
+    assert!(
+        detail.contains("abort_reason=release_failed"),
+        "#48: cache fatal shares the release_failed abort_reason convention \
+         (no new token, no missing-file list): {detail}"
+    );
+    assert!(
+        !detail.contains("missing_tracked="),
+        "#48: `release_failed` means no tracked path vanished — a missing-file \
+         count on that branch contradicts it: {detail}"
+    );
+    assert!(
+        detail.contains("discard_digest="),
+        "#48: the abort audit must carry the already-authorized discard detail: {detail}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    if let Some(root) = super_repo.parent() {
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
 /// A file whose name contains a literal newline inside a dirty submodule triggers
 /// the non-canonical path gate: release is refused, worktree bytes are unchanged,
 /// and no success audit is emitted.

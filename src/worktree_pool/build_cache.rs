@@ -141,6 +141,13 @@ pub(crate) fn clean_ignored_build_cache_with_budget(
     worktree: &Path,
     budget: Duration,
 ) -> CacheCleanup {
+    // #48: test-only Fatal injection (see `super::cache_fatal_test_seam`).
+    // Fires before the deadline starts so the injected outcome is independent
+    // of timing.
+    #[cfg(test)]
+    if let Some((path, reason)) = super::cache_fatal_test_seam::take() {
+        return CacheCleanup::Fatal { path, reason };
+    }
     // ONE deadline starts before enumeration/classification and is shared by
     // all `check-ignore` calls plus every directory deletion. This is the
     // property most easily broken by a later change: do NOT recompute a
