@@ -45,7 +45,13 @@ pub(crate) struct SettlementOutcome {
 
 /// What would permit closure after the completion guard refused. Kept as one
 /// sentence so an agent can act on it without consulting the protocol.
-const SETTLEMENT_CLOSURE_CONDITION: &str =
+///
+/// #16: this is the single sentence behind BOTH the send-path settlement
+/// refusal (`settlement_json`) and the task-board `done` refusal
+/// (`handle_done`). Naming it once — instead of restating it in the second
+/// consumer — keeps the two refusals byte-identical now and on every later
+/// wording change. `&'static str` flows straight into `json!` on both sides.
+pub(crate) const DONE_GUARD_CLOSURE_CONDITION: &str =
     "close after the PR merges (a merge receipt or a squash-merge is proof), or ask the task's orchestrator to close it";
 
 impl SettlementOutcome {
@@ -75,7 +81,7 @@ impl SettlementOutcome {
             closed: false,
             code: Some("assignee_completion_blocked"),
             reason: Some(reason),
-            closure_condition: Some(SETTLEMENT_CLOSURE_CONDITION),
+            closure_condition: Some(DONE_GUARD_CLOSURE_CONDITION),
         }
     }
 }

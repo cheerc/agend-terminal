@@ -4400,10 +4400,7 @@ fn done_guard_refusal_projects_reason_and_closure_condition_16() {
     assert_eq!(claimed["task"]["status"], "claimed");
 
     let before = super::read_task_record(&home, &task_id).expect("task record");
-    let board = crate::task_events::board_root(
-        &home,
-        crate::task_events::DEFAULT_PROJECT,
-    );
+    let board = crate::task_events::board_root(&home, crate::task_events::DEFAULT_PROJECT);
     let events_before = crate::task_events::envelopes_for_task_at(&board, &task_id)
         .expect("envelopes before")
         .len();
@@ -4451,7 +4448,10 @@ fn done_guard_refusal_projects_reason_and_closure_condition_16() {
         before.metadata, after.metadata,
         "the refusal must not write task state"
     );
-    assert_eq!(before.status, after.status, "the refusal must not move status");
+    assert_eq!(
+        before.status, after.status,
+        "the refusal must not move status"
+    );
     let events_after = crate::task_events::envelopes_for_task_at(&board, &task_id)
         .expect("envelopes after")
         .len();
