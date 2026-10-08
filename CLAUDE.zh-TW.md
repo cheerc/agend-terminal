@@ -7,9 +7,15 @@
 提交任何 Rust 變更之前，**一律**執行：
 
 ```bash
-cargo fmt
+scripts/fmt-owned.sh          # owned-source fmt；不含 vendor/
 cargo clippy --all-targets -- -D warnings
 ```
+
+`scripts/fmt-owned.sh` 是本 repo 唯一的 owned-source rustfmt surface：它格式化 tracked
+加上 untracked/non-ignored 的 `*.rs`，並**排除 `vendor/`**，讓 in-tree agentic-git
+workspace 保有自己的 source-format boundary。CI、preflight 與 pre-push hook 執行的都是
+同一支腳本，所以絕不可改用裸 `cargo fmt`——它沒有 vendor exclusion，會改寫 vendored 的
+agentic-git source。只做驗證、不改檔時用 `scripts/fmt-owned.sh --check`。
 
 CI 會在 `ci.yml` 的前兩個步驟執行這些命令。本機略過它們，代表下一次 push 會失敗，還得多跑一輪「修 fmt／修 clippy」。
 
@@ -19,7 +25,7 @@ CI 會在 `ci.yml` 的前兩個步驟執行這些命令。本機略過它們，�
 scripts/preflight.sh          # 完整 matrix；--quick 會略過 Windows 檢查
 ```
 
-這是 CI `check` job 的一次性鏡像，也是避免 local-green → CI-red 往返的最佳方法。它會執行 `cargo fmt --check`、`cargo clippy --all-targets --features tray -- -D warnings`、`cargo nextest run --features tray`（unit + integration + invariant——CI 用的 runner）；若未安裝 cargo-nextest，preflight 會將 test step 明確標為 FAIL，附上安裝提示（`cargo install cargo-nextest --locked`），**不會**改跑 `cargo test --tests`，因為 bulk 結果無法區分 flaky 紅燈與真回歸。接著會執行關鍵的 **Windows cross-check**（`x86_64-pc-windows-msvc`）。Windows-only 程式碼（`libc::getppid`、`/bin/sh` spawn、`UnixStream`）在 Unix 開發機上可以順利編譯，卻會讓 CI 的 `windows-latest` runner 失敗。
+這是 CI `check` job 的一次性鏡像，也是避免 local-green → CI-red 往返的最佳方法。它會執行 `scripts/fmt-owned.sh --check`、`cargo clippy --all-targets --features tray -- -D warnings`、`cargo nextest run --features tray`（unit + integration + invariant——CI 用的 runner）；若未安裝 cargo-nextest，preflight 會將 test step 明確標為 FAIL，附上安裝提示（`cargo install cargo-nextest --locked`），**不會**改跑 `cargo test --tests`，因為 bulk 結果無法區分 flaky 紅燈與真回歸。接著會執行關鍵的 **Windows cross-check**（`x86_64-pc-windows-msvc`）。Windows-only 程式碼（`libc::getppid`、`/bin/sh` spawn、`UnixStream`）在 Unix 開發機上可以順利編譯，卻會讓 CI 的 `windows-latest` runner 失敗。
 
 Windows 步驟需要 MSVC C toolchain，因為 transitive C dependency（`ring`）在 macOS/Linux 上缺少它就無法 cross-compile。只需安裝一次：
 
@@ -37,7 +43,7 @@ cargo install cargo-xwin && rustup target add x86_64-pc-windows-msvc
 
 Pre-push hook（`scripts/hooks/pre-push`）會執行**兩道 gate**：
 
-1. **CI-parity**（#t-ci-parity-prepush-guard）——若 push range 觸及 `src/` / `tests/` / `Cargo.*` / `build.rs`，便執行 `scripts/preflight.sh --quick`（與 CI `check` 完全相同的命令：`cargo fmt --check`、`cargo clippy --all-targets --features tray -- -D warnings`、`cargo nextest run --features tray`），並在失敗時**阻擋 push**。這可防止一再發生的遺漏：agent 只執行 `cargo test --bin`——會略過 `tests/` integration target——便宣稱 CI-ready，接著被 CI 拒絕（#1734 stale-string integration test、#1735 block_on invariant）。Docs-only push 會略過 build。`--quick` 不執行 Windows cross-check（由 CI 的 `windows-latest` 後援）。
+1. **CI-parity**（#t-ci-parity-prepush-guard）——若 push range 觸及 `src/` / `tests/` / `Cargo.*` / `build.rs`，便執行 `scripts/preflight.sh --quick`（與 CI `check` 完全相同的命令：`scripts/fmt-owned.sh --check`、`cargo clippy --all-targets --features tray -- -D warnings`、`cargo nextest run --features tray`），並在失敗時**阻擋 push**。這可防止一再發生的遺漏：agent 只執行 `cargo test --bin`——會略過 `tests/` integration target——便宣稱 CI-ready，接著被 CI 拒絕（#1734 stale-string integration test、#1735 block_on invariant）。Docs-only push 會略過 build。`--quick` 不執行 Windows cross-check（由 CI 的 `windows-latest` 後援）。
 2. **claim-verify**——這是 best-effort 的本機提醒：每個 push ref 僅檢查
    最新 commit 的 `Claim:` trailer 是否符合實際 diff。它不是權威的 trust
    boundary；權威仍是 CI、daemon-side review 與 canonical merge gate。
