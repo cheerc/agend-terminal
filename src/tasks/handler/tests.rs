@@ -286,6 +286,284 @@ fn governing_fields_reject_direct_metadata_mutation_3419() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #14: the create-only refusal is the only `match key` arm that names neither a
+/// replacement action nor its parameter. The accepted fix is a MECHANICAL one —
+/// the response must carry a remedy naming a real task action plus the ACTUAL
+/// refused key, and that remedy must be executable by the same caller that was
+/// refused. This test never pins natural-language prose: it reads
+/// `remedy.action` / `remedy.parameter`, drives the real `tasks::handle` entry
+/// with them, and requires the successor to hold correct durable authority.
+///
+/// Both keys are covered, because the arm is shared and `parameter` must name
+/// the refused key rather than a fixed string.
+#[test]
+fn create_only_refusal_carries_an_executable_create_remedy_14() {
+    for key in ["review_class", "governing_decision_id"] {
+        let home = tmp_home(&format!("create-only-remedy-14-{key}"));
+        // The refused task carries NO authority of its own — this is the exact
+        // starting state that makes a dispatcher reach for metadata_set.
+        let predecessor = handle(
+            &home,
+            "lead",
+            &serde_json::json!({"action": "create", "title": "PR work"}),
+        )["id"]
+            .as_str()
+            .expect("predecessor id")
+            .to_string();
+
+        // A governing key must be answered with a value that is actually
+        // resolvable; an unverified value would prove nothing downstream.
+        let decision_id = if key == "governing_decision_id" {
+            let posted = crate::decisions::post(
+                &home,
+                "lead",
+                &serde_json::json!({
+                    "title": "governed remedy",
+                    "content": "single review required",
+                    "review_class": "single",
+                }),
+            );
+            posted["id"].as_str().expect("decision id").to_string()
+        } else {
+            String::new()
+        };
+        let refused_value = if key == "review_class" {
+            serde_json::json!("dual")
+        } else {
+            serde_json::json!(decision_id.clone())
+        };
+
+        let before = super::read_task_record(&home, &predecessor).expect("predecessor record");
+        let board = crate::task_events::board_root(
+            &home,
+            crate::task_events::DEFAULT_PROJECT,
+        );
+        let events_before = crate::task_events::envelopes_for_task_at(&board, &predecessor)
+            .expect("envelopes before")
+            .len();
+
+        let refused = handle(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "action": "metadata_set",
+                "id": &predecessor,
+                "metadata_key": key,
+                "metadata_value": refused_value,
+            }),
+        );
+
+        // The code is the stable machine contract and must not drift.
+        assert_eq!(
+            refused["code"], "create_only_metadata",
+            "{key} must keep its code: {refused}"
+        );
+        // The refusal itself must not touch the task: no record drift, and
+        // specifically no authority forged onto the old task.
+        let after = super::read_task_record(&home, &predecessor).expect("predecessor record");
+        assert_eq!(
+            before.metadata, after.metadata,
+            "{key} refusal must not write task metadata"
+        );
+        assert!(
+            !after.metadata.contains_key(key),
+            "{key} must stay absent on the refused task"
+        );
+        let events_after = crate::task_events::envelopes_for_task_at(&board, &predecessor)
+            .expect("envelopes after")
+            .len();
+        assert_eq!(
+            events_before, events_after,
+            "{key} refusal must not append an event"
+        );
+
+        // The mechanical remedy: a real action plus the ACTUAL refused key.
+        assert_eq!(
+            refused["remedy"]["action"], "create",
+            "{key} remedy must name the create action: {refused}"
+        );
+        assert_eq!(
+            refused["remedy"]["parameter"], key,
+            "{key} remedy must name the refused key itself: {refused}"
+        );
+
+        // Consume the remedy as the SAME caller that was refused. Reading the
+        // action/parameter back off the response is what makes this a contract
+        // test rather than a restatement of the implementation.
+        let remedy_action = refused["remedy"]["action"]
+            .as_str()
+            .expect("remedy action")
+            .to_string();
+        let remedy_parameter = refused["remedy"]["parameter"]
+            .as_str()
+            .expect("remedy parameter")
+            .to_string();
+        let successor = handle(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "action": remedy_action,
+                "title": "PR work (remediated)",
+                remedy_parameter.clone(): refused_value,
+            }),
+        );
+        let successor_id = successor["id"].as_str().expect("successor id");
+        let successor_record =
+            super::read_task_record(&home, successor_id).expect("successor record");
+        assert!(
+            successor_record.metadata.contains_key(&remedy_parameter),
+            "the successor must actually carry {remedy_parameter}: {successor}"
+        );
+        // The old task is untouched by the remedy: creating a successor is a
+        // new task, NOT an in-place disposition of the refused one.
+        let predecessor_after = super::read_task_record(&home, &predecessor).expect("predecessor");
+        assert_eq!(
+            before.metadata, predecessor_after.metadata,
+            "the remedy must not retroactively write the refused task"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
+
+/// #14 (second half): `supersedes` is the owner's own way to retire the refused
+/// task while still taking the create-time authority. This pins that the remedy
+/// stays truthful under the owner-declared successor path — WITHOUT claiming any
+/// obligation (dependencies, ci-watch, inbox expectations) is transferred.
+#[test]
+fn create_only_remedy_holds_through_owner_supersession_14() {
+    let home = tmp_home("create-only-remedy-supersedes-14");
+    let predecessor = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "PR work"}),
+    )["id"]
+        .as_str()
+        .expect("predecessor id")
+        .to_string();
+
+    let refused = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set",
+            "id": &predecessor,
+            "metadata_key": "review_class",
+            "metadata_value": "single",
+        }),
+    );
+    let remedy_action = refused["remedy"]["action"]
+        .as_str()
+        .expect("remedy action")
+        .to_string();
+    let remedy_parameter = refused["remedy"]["parameter"]
+        .as_str()
+        .expect("remedy parameter")
+        .to_string();
+
+    let successor = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": remedy_action,
+            "title": "PR work (remediated)",
+            "supersedes": predecessor,
+            remedy_parameter.clone(): "single",
+        }),
+    );
+    let successor_id = successor["id"].as_str().expect("successor id");
+
+    // The authority reaches the successor through the Created event, not through
+    // a MetadataSet appended by the supersession path — that is the whole chain
+    // a reviewer must be able to trust.
+    let successor_record = super::read_task_record(&home, successor_id).expect("successor");
+    assert_eq!(
+        successor_record.metadata.get("review_class"),
+        successor_record.metadata.get(&remedy_parameter),
+        "the successor must carry the create-time authority"
+    );
+    assert_eq!(
+        successor_record.metadata[&remedy_parameter],
+        serde_json::json!("single"),
+        "successor authority must be the requested value: {successor}"
+    );
+
+    // Supersession behaviour itself is unchanged by this PR: the owner-named
+    // predecessor reaches exactly the status it reached before.
+    let predecessor_after = super::read_task_record(&home, &predecessor).expect("predecessor");
+    assert_eq!(
+        predecessor_after.status,
+        crate::task_events::TaskStatus::Superseded,
+        "owner-declared supersession must still terminate the predecessor"
+    );
+    assert!(
+        !predecessor_after.metadata.contains_key("review_class"),
+        "superseding must not back-fill authority onto the retired task"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #14: the remedy is ADDITIVE. Every metadata write the board accepts today
+/// must keep behaving identically — the hint only ever rides along on the one
+/// refusal that carries it.
+#[test]
+fn normal_metadata_writes_are_unaffected_by_the_create_only_hint_14() {
+    let home = tmp_home("create-only-remedy-normal-writes-14");
+    let task_id = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "PR work"}),
+    )["id"]
+        .as_str()
+        .expect("task id")
+        .to_string();
+
+    let written = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set",
+            "id": &task_id,
+            "metadata_key": "plan",
+            "metadata_value": "ship the fix",
+        }),
+    );
+    assert_eq!(
+        written["event"], "metadata_set",
+        "an ordinary metadata write must still commit: {written}"
+    );
+    assert!(
+        written["remedy"].is_null(),
+        "a successful write must not carry a refusal remedy: {written}"
+    );
+    let record = super::read_task_record(&home, &task_id).expect("record");
+    assert_eq!(
+        record.metadata.get("plan"),
+        Some(&serde_json::json!("ship the fix")),
+        "the written value must be readable back"
+    );
+
+    // And the plan_acks sibling refusal — which already pointed at its own
+    // action — keeps its own code rather than inheriting this one.
+    let sibling = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set",
+            "id": &task_id,
+            "metadata_key": "plan_acks",
+            "metadata_value": ["someone-else"],
+        }),
+    );
+    assert_eq!(
+        sibling["code"], "plan_acks_immutable",
+        "the sibling refusal must keep its own code: {sibling}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #78445-2 (d): a cascade parent-cancel is terminal for EACH child — every
 /// cancelled child's dispatch_tracking rows must settle (plural), while a NON-child
 /// task's rows (even the same dispatcher) survive. This path previously cleared
