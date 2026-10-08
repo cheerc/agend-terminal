@@ -116,7 +116,8 @@ pub(crate) fn list_porcelain_exact(repo: &Path) -> std::io::Result<Vec<(PathBuf,
     Ok(parse_porcelain(&String::from_utf8_lossy(&out.stdout)))
 }
 
-/// `git worktree remove --force <wt_path>`.
+/// `git worktree remove --force <wt_path>` at the global
+/// [`LOCAL_GIT_TIMEOUT`](crate::git_helpers::LOCAL_GIT_TIMEOUT).
 ///
 /// `source_repo` empty → [`git_helpers::git_bypass_no_cwd`] (no `current_dir`;
 /// git resolves the repo from the absolute `wt_path`; still always-bypass +
@@ -130,6 +131,32 @@ pub(crate) fn remove_force(
         crate::git_helpers::git_bypass_no_cwd(&args)
     } else {
         crate::git_helpers::git_bypass(source_repo, &args)
+    }
+}
+
+/// `git worktree remove --force <wt_path>` with an explicit caller-chosen bound.
+///
+/// #40: same argv and the same empty-`source_repo` dual-cwd split as
+/// [`remove_force`], but the deadline is the caller's. This exists so a
+/// caller whose removal is legitimately slower than a normal local git op can
+/// opt into a longer bound WITHOUT widening [`remove_force`] for every other
+/// caller — `worktree_pool::workspace` teardown and `worktree_pool::gc` keep
+/// the 60s default through [`remove_force`].
+///
+/// It delegates to the existing [`git_helpers::git_bypass_timeout`] /
+/// [`git_helpers::git_bypass_no_cwd_timeout`] chokepoints, so the bypass-env
+/// contract and the process-group kill on timeout stay identical to every
+/// other bounded git spawn; no new spawn path is introduced.
+pub(crate) fn remove_force_timeout(
+    source_repo: &Path,
+    wt_path: &str,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    let args = ["worktree", "remove", "--force", wt_path];
+    if source_repo.as_os_str().is_empty() {
+        crate::git_helpers::git_bypass_no_cwd_timeout(&args, timeout)
+    } else {
+        crate::git_helpers::git_bypass_timeout(source_repo, &args, timeout)
     }
 }
 

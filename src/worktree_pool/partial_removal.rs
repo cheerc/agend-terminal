@@ -9,6 +9,23 @@
 use super::ReleaseOutcome;
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::time::Duration;
+
+/// #40: the deadline for the RELEASE removal's `git worktree remove
+/// --force`, deliberately longer than [`crate::git_helpers::LOCAL_GIT_TIMEOUT`].
+///
+/// A release is the one removal whose target is routinely large: a full
+/// checkout plus its untracked build artifacts, so git's own walk legitimately
+/// outruns the 60s bound sized for ordinary local ops. Killing it at 60s left
+/// the target half-unlinked — the failure this constant exists to prevent.
+///
+/// It is scoped to this path on purpose. Every other `remove_force` caller
+/// (workspace teardown, GC) keeps the global 60s default: a longer deadline
+/// there would only delay detecting a genuinely wedged removal. The release
+/// proxy already reports `release_in_flight` at 45s and the daemon notifies
+/// completion via `system:release_completed`, so a slow release is visible to
+/// the caller rather than silent.
+pub(super) const RELEASE_GIT_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Result of worktree-directory removal. These are deliberately distinct:
 /// `Failed` means removal did not complete AND every tracked file is still
@@ -307,10 +324,14 @@ pub(super) fn remove_worktree(
     let result = if let Some(kind) = injected_error {
         Err(std::io::Error::new(kind, "#40 injected remove failure"))
     } else {
-        crate::git_worktree::remove_force(source_repo, &wt_str)
+        crate::git_worktree::remove_force_timeout(source_repo, &wt_str, RELEASE_GIT_TIMEOUT)
     };
+    // #40: the release path uses the dedicated 600s bound; `remove_force`
+    // (60s, shared with workspace teardown and GC) is deliberately NOT used
+    // here. Both arms stay byte-identical apart from that one argument.
     #[cfg(not(test))]
-    let result = crate::git_worktree::remove_force(source_repo, &wt_str);
+    let result =
+        crate::git_worktree::remove_force_timeout(source_repo, &wt_str, RELEASE_GIT_TIMEOUT);
     match result {
         Ok(output) if output.status.success() => WorktreeRemoval::Removed,
         Ok(output) => {
@@ -357,5 +378,191 @@ pub(super) fn remove_worktree(
             tracing::warn!(agent, error = %error, "git command failed for release");
             WorktreeRemoval::Failed(format!("git command failed: {error}"))
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// A real git repo with `src/main.rs` + `src/lib.rs` COMMITTED, so
+    /// `tracked_path_snapshot`'s `git ls-files` actually returns paths. A
+    /// plain directory is not enough: the snapshot would be `None` and every
+    /// tracked-file assertion below would vacuously pass on an empty set.
+    fn committed_worktree(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-40-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .status()
+                .expect("spawn git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "init"]);
+        std::fs::write(dir.join(".agend-managed"), "").unwrap();
+        dir
+    }
+
+    /// #40: the release path gets its OWN 600s bound, not the global
+    /// 60s `LOCAL_GIT_TIMEOUT`. `git worktree remove --force` on a large
+    /// worktree legitimately outruns 60s, and the 60s kill left the target
+    /// half-unlinked. Every other `remove_force` caller (workspace teardown,
+    /// GC) keeps the global 60s default — this pins that only the RELEASE
+    /// bound moved.
+    #[test]
+    fn release_git_timeout_is_ten_minutes_not_the_global_local_timeout() {
+        assert_eq!(
+            super::RELEASE_GIT_TIMEOUT,
+            std::time::Duration::from_secs(600),
+            "release removal must use the dedicated 600s bound"
+        );
+        // The dedicated bound must actually be LOOSER than the global one,
+        // otherwise the constant is a no-op relabelling.
+        assert!(
+            super::RELEASE_GIT_TIMEOUT > crate::git_helpers::LOCAL_GIT_TIMEOUT,
+            "release bound ({:?}) must exceed the global LOCAL_GIT_TIMEOUT ({:?})",
+            super::RELEASE_GIT_TIMEOUT,
+            crate::git_helpers::LOCAL_GIT_TIMEOUT
+        );
+        // The global default is untouched by this change.
+        assert_eq!(
+            crate::git_helpers::LOCAL_GIT_TIMEOUT,
+            std::time::Duration::from_secs(60)
+        );
+    }
+
+    /// The release arm must call the explicit-bound helpers, and `remove_force`
+    /// must keep its original 60s signature so the workspace/GC callers cannot
+    /// be silently redirected onto the long bound.
+    #[test]
+    fn release_routes_through_the_timeout_bound_arm() {
+        let _: fn(&[&str], std::time::Duration) -> std::io::Result<std::process::Output> =
+            crate::git_helpers::git_bypass_no_cwd_timeout;
+        let _: fn(
+            &std::path::Path,
+            &[&str],
+            std::time::Duration,
+        ) -> std::io::Result<std::process::Output> = crate::git_helpers::git_bypass_timeout;
+        let _: fn(&std::path::Path, &str) -> std::io::Result<std::process::Output> =
+            crate::git_worktree::remove_force;
+        let _: fn(
+            &std::path::Path,
+            &str,
+            std::time::Duration,
+        ) -> std::io::Result<std::process::Output> = crate::git_worktree::remove_force_timeout;
+    }
+
+    /// The snapshot the classification depends on really enumerates tracked
+    /// files. This is the precondition the two tests below silently rely on;
+    /// it fails loudly if the fixture ever stops being a git repo, which would
+    /// otherwise make them pass on an empty set.
+    #[test]
+    fn snapshot_enumerates_tracked_paths_in_a_real_repo() {
+        let dir = committed_worktree("snapshot");
+        let snapshot =
+            super::tracked_path_snapshot(&dir).expect("snapshot must enumerate a git repo");
+        assert_eq!(snapshot.len(), 2, "unexpected tracked set: {snapshot:?}");
+        assert!(
+            snapshot.iter().any(|p| p.ends_with("main.rs")),
+            "snapshot missed a committed file: {snapshot:?}"
+        );
+        assert!(
+            snapshot.iter().any(|p| p.ends_with("lib.rs")),
+            "snapshot missed a committed file: {snapshot:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A timeout that fires while the directory survives must keep the
+    /// EXISTING remnant classification: tracked files still present → plain
+    /// `Failed`, not a fabricated `PartiallyRemoved`. #40 lengthens the
+    /// deadline only; it must not change what a timeout means.
+    #[test]
+    fn injected_timeout_on_intact_worktree_still_reports_failed_not_partial() {
+        let dir = committed_worktree("intact");
+
+        super::super::release_test_seam::fail_next_remove(std::io::ErrorKind::TimedOut);
+        let outcome = super::remove_worktree("impl-agent", &dir, std::path::Path::new(""), None);
+
+        match outcome {
+            // Every tracked file survived, so this is an ordinary failure.
+            WorktreeRemoval::Failed(message) => {
+                assert!(
+                    message.contains("git command failed"),
+                    "unexpected failure text: {message}"
+                );
+            }
+            other => panic!("expected Failed for an intact worktree, got {other:?}"),
+        }
+
+        // Nothing may be deleted on the injected-timeout path.
+        assert!(
+            dir.join("src/main.rs").exists(),
+            "tracked file must survive"
+        );
+        assert!(dir.join("src/lib.rs").exists(), "tracked file must survive");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A timeout that fires AFTER tracked files actually disappeared is the
+    /// damaged case: it must classify as `PartiallyRemoved` and carry the
+    /// missing paths, so the orchestrator never treats it as intact.
+    #[test]
+    fn injected_timeout_after_tracked_files_vanish_reports_partial_with_missing_paths() {
+        let dir = committed_worktree("partial");
+
+        // Snapshot BEFORE anything is unlinked, then delete ONE tracked file
+        // so the comparison sees a genuine partial removal.
+        let baseline = super::tracked_path_snapshot(&dir).expect("baseline snapshot");
+        assert_eq!(baseline.len(), 2, "fixture must start with 2 tracked files");
+        std::fs::remove_file(dir.join("src/lib.rs")).unwrap();
+
+        super::super::release_test_seam::fail_next_remove(std::io::ErrorKind::TimedOut);
+        let outcome = super::remove_worktree(
+            "impl-agent",
+            &dir,
+            std::path::Path::new(""),
+            Some(&baseline),
+        );
+
+        match outcome {
+            WorktreeRemoval::PartiallyRemoved {
+                cause,
+                missing_tracked,
+            } => {
+                assert_eq!(
+                    missing_tracked.len(),
+                    1,
+                    "exactly the vanished file must be reported: {missing_tracked:?}"
+                );
+                assert!(
+                    missing_tracked[0].ends_with("lib.rs"),
+                    "the vanished tracked file must be reported: {missing_tracked:?}"
+                );
+                assert!(
+                    cause.contains("git command failed"),
+                    "cause should name the failing git command: {cause}"
+                );
+            }
+            other => panic!("expected PartiallyRemoved, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
