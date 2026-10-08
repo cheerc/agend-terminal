@@ -53,6 +53,47 @@ use cleanup_test_seam::after_dir;
 #[cfg(not(test))]
 fn after_dir(_path: &Path) {}
 
+/// #48: test-only injection of a `Fatal` sweep outcome. Production reaches
+/// `Fatal` when git cannot classify what is disposable (a `check-ignore`
+/// failure or an unreadable worktree root) — a state no hermetic fixture can
+/// produce on demand without breaking the earlier release steps that need the
+/// same git/worktree healthy. The seam fires inside the budgeted sweep entry
+/// point so the release route under test observes a genuine `Fatal`, not a
+/// re-implementation of it. Thread-local + RAII guard, same shape as the
+/// sibling `cleanup_test_seam` above; `#[cfg(test)]`-gated, zero production
+/// effect.
+///
+/// Placement note: this lives here rather than in `super` (`worktree_pool.rs`)
+/// because that file sits 17 LOC under the 2500-LOC anti-monolith ratchet
+/// (`tests/src_file_size_invariant.rs`) — a `#[cfg(test)]` module there still
+/// counts against the ceiling. Its only consumer `take()` is in this file.
+#[cfg(test)]
+pub(crate) mod cache_fatal_test_seam {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    thread_local! {
+        static FORCE_FATAL: RefCell<Option<(PathBuf, String)>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FORCE_FATAL.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub(crate) fn arm(path: PathBuf, reason: String) -> Guard {
+        FORCE_FATAL.with(|slot| *slot.borrow_mut() = Some((path, reason)));
+        Guard
+    }
+
+    pub(crate) fn take() -> Option<(PathBuf, String)> {
+        FORCE_FATAL.with(|slot| slot.borrow_mut().take())
+    }
+}
+
 /// #3694: hard cap on time spent pre-deleting an ignored `target/`. Kept well
 /// below the 60s `LOCAL_GIT_TIMEOUT` that bounds the subsequent
 /// `git worktree remove`, so this sweep can never consume the whole release
@@ -141,6 +182,13 @@ pub(crate) fn clean_ignored_build_cache_with_budget(
     worktree: &Path,
     budget: Duration,
 ) -> CacheCleanup {
+    // #48: test-only Fatal injection (see `cache_fatal_test_seam` above).
+    // Fires before the deadline starts so the injected outcome is independent
+    // of timing.
+    #[cfg(test)]
+    if let Some((path, reason)) = cache_fatal_test_seam::take() {
+        return CacheCleanup::Fatal { path, reason };
+    }
     // ONE deadline starts before enumeration/classification and is shared by
     // all `check-ignore` calls plus every directory deletion. This is the
     // property most easily broken by a later change: do NOT recompute a

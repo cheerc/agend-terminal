@@ -19,7 +19,7 @@ pub(crate) use branch_cleanup::{
 
 // #3694: the pre-removal ignored-cache sweep is deadline-bounded (extracted to
 // keep this anti-monolith file under its 2500-LOC ceiling).
-mod build_cache;
+pub(crate) mod build_cache;
 use build_cache::{apply_cache_cleanup, clean_ignored_build_cache};
 
 // #40: keep the removal outcome classifier + structured error projection out
@@ -2366,6 +2366,21 @@ fn release_absent_target_impl(
         }
         permit.set_stage("clean_build_cache");
         if apply_cache_cleanup(&mut out, clean_ignored_build_cache(target)).is_err() {
+            // #48: the cache sweep could not classify what is disposable, so the
+            // release aborts here — before `remove_worktree`. The discard was
+            // already authorized above, so this path must emit the same abort
+            // audit the remove-phase failure arms emit, or the event log stays
+            // silent about an attempted-and-failed release. Shares the
+            // `release_failed` abort_reason convention (no new token, no
+            // missing-file list — nothing tracked vanished on this path).
+            if let Some(detail) = &discard_audit_detail {
+                crate::event_log::log(
+                    home,
+                    "nested_dirt_discard_aborted",
+                    agent,
+                    &format!("{detail} abort_reason=release_failed"),
+                );
+            }
             drop(_binding_lock);
             drop(_agent_lock);
             for notice in notices {
