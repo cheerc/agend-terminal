@@ -7,9 +7,17 @@
 Before committing any Rust change, **always** run:
 
 ```bash
-cargo fmt
+scripts/fmt-owned.sh          # owned-source fmt; vendor/ is excluded
 cargo clippy --all-targets -- -D warnings
 ```
+
+`scripts/fmt-owned.sh` is the repository's single owned-source rustfmt surface:
+it formats tracked plus untracked/non-ignored `*.rs` and **excludes `vendor/`**,
+so the in-tree agentic-git workspace keeps its own source-format boundary. CI,
+preflight and the pre-push hook all run that same script, so never substitute a
+bare `cargo fmt` — it carries no vendor exclusion and rewrites the vendored
+agentic-git sources. Use `scripts/fmt-owned.sh --check` for the non-mutating
+verification form.
 
 CI runs these in the first two steps of `ci.yml`. Skipping them locally means
 the next push fails and needs an extra "fix fmt / fix clippy" round trip.
@@ -21,7 +29,7 @@ scripts/preflight.sh          # full matrix; --quick skips the Windows check
 ```
 
 This is the one-shot mirror of CI's `check` job and the best way to avoid a
-local-green → CI-red round trip. It runs `cargo fmt --check`,
+local-green → CI-red round trip. It runs `scripts/fmt-owned.sh --check`,
 `cargo clippy --all-targets --features tray -- -D warnings`,
 `cargo nextest run --features tray` (unit + integration + invariants — CI's
 runner). If cargo-nextest is missing, preflight marks the test step FAILED with
@@ -85,11 +93,11 @@ The pre-push hook (`scripts/hooks/pre-push`) runs **two gates**:
 
 1. **CI-parity** (#t-ci-parity-prepush-guard) — on a push whose range touches
    `src/` / `tests/` / `Cargo.*` / `build.rs`, it runs `scripts/preflight.sh
-   --quick` (the exact CI `check` commands: `cargo fmt --check`, `cargo clippy
-   --all-targets --features tray -- -D warnings`, `cargo nextest run --features
-   tray`) and **blocks the push if they fail**. This closes the recurring miss
-   where an agent ran only `cargo test --bin` — which SKIPS the `tests/`
-   integration targets — declared CI-ready, and CI then rejected it
+   --quick` (the exact CI `check` commands: `scripts/fmt-owned.sh --check`,
+   `cargo clippy --all-targets --features tray -- -D warnings`, `cargo nextest
+   run --features tray`) and **blocks the push if they fail**. This closes the
+   recurring miss where an agent ran only `cargo test --bin` — which SKIPS the
+   `tests/` integration targets — declared CI-ready, and CI then rejected it
    (#1734 stale-string integration test, #1735 block_on invariant). Docs-only
    pushes skip the build. `--quick` omits the Windows cross-check (CI's
    `windows-latest` is the backstop for that).
