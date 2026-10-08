@@ -4367,3 +4367,185 @@ fn an_ownerless_row_is_completable_by_any_caller_because_the_acl_admits_everyone
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// #16: `handle_done`'s assignee-completion-guard refusal carries only
+/// `error` + `code` — the caller can see WHAT was denied but not WHY it failed
+/// or what would permit closure. The accepted fix is MECHANICAL: project the
+/// guard's actual `Deny(reason)` onto a `reason` field and the closure
+/// sentence onto `closure_condition`, in the same shape the send path already
+/// uses (`SettlementOutcome` → `settlement_json`, #3293).
+///
+/// This test never pins prose: it asserts `reason` quotes the guard's exact
+/// denial for the fixture, that `closure_condition` names an executable
+/// next step, and that the refused task's record and event log are untouched.
+#[test]
+fn done_guard_refusal_projects_reason_and_closure_condition_16() {
+    let home = tmp_home("done-guard-diagnostic-16");
+    let created = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "create",
+            "title": "must retain proof",
+            "assignee": "dev",
+            "branch": "feat/no-proof-16",
+        }),
+    );
+    let task_id = created["task"]["id"].as_str().unwrap().to_string();
+    let claimed = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action": "claim", "id": task_id}),
+    );
+    assert_eq!(claimed["task"]["status"], "claimed");
+
+    let before = super::read_task_record(&home, &task_id).expect("task record");
+    let board = crate::task_events::board_root(
+        &home,
+        crate::task_events::DEFAULT_PROJECT,
+    );
+    let events_before = crate::task_events::envelopes_for_task_at(&board, &task_id)
+        .expect("envelopes before")
+        .len();
+
+    let refused = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action": "done", "id": task_id}),
+    );
+
+    // The code is the stable machine contract and must not drift.
+    assert_eq!(
+        refused["code"], "assignee_completion_blocked",
+        "the guard refusal must keep its code: {refused}"
+    );
+    // `reason` is the guard's ACTUAL denial for this fixture — quoted, so the
+    // caller reads the same sentence the guard produced, not a paraphrase.
+    let reason = refused["reason"].as_str().expect("refusal reason");
+    assert!(
+        reason.contains("unconsumed merge receipt"),
+        "reason must quote the guard's actual denial: {refused}"
+    );
+    assert_eq!(
+        reason,
+        refused["error"].as_str().expect("error"),
+        "reason and error must be the same guard sentence: {refused}"
+    );
+    // `closure_condition` names an executable next step — the caller must be
+    // able to act without consulting the protocol.
+    let condition = refused["closure_condition"]
+        .as_str()
+        .expect("closure_condition");
+    assert!(
+        condition.contains("merge"),
+        "closure_condition must name what would permit closure: {refused}"
+    );
+    assert!(
+        condition.contains("orchestrator"),
+        "closure_condition must name the non-merge path too: {refused}"
+    );
+
+    // The refusal writes nothing: record and event log are byte-identical.
+    let after = super::read_task_record(&home, &task_id).expect("task record");
+    assert_eq!(
+        before.metadata, after.metadata,
+        "the refusal must not write task state"
+    );
+    assert_eq!(before.status, after.status, "the refusal must not move status");
+    let events_after = crate::task_events::envelopes_for_task_at(&board, &task_id)
+        .expect("envelopes after")
+        .len();
+    assert_eq!(
+        events_before, events_after,
+        "the refusal must not append an event"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #16 (second half): the diagnosis is ADDITIVE. Ordinary `done` calls — the
+/// branchless path the guard has no opinion about, and the sibling refusals
+/// that never reach the guard — keep behaving exactly as before.
+#[test]
+fn normal_done_paths_are_unaffected_by_the_guard_diagnosis_16() {
+    let home = tmp_home("done-guard-normal-paths-16");
+
+    // 1. The guard has no opinion about branchless tasks and the refusal shape
+    // must never appear there: a branchless `done` still commits cleanly.
+    let plain = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "plain work"}),
+    )["id"]
+        .as_str()
+        .expect("task id")
+        .to_string();
+    let settled = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "done", "id": plain}),
+    );
+    assert_eq!(
+        settled["status"], "done",
+        "a branchless done must still settle: {settled}"
+    );
+    assert!(
+        settled["reason"].is_null() && settled["closure_condition"].is_null(),
+        "a settled done must not carry guard diagnosis: {settled}"
+    );
+
+    // 2. A refusal that never reaches the guard keeps its own shape.
+    let blocked = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "done", "id": "t-nonexistent-16"}),
+    );
+    assert!(
+        blocked.get("error").is_some(),
+        "an unknown task must still be refused: {blocked}"
+    );
+    assert_ne!(
+        blocked["code"], "assignee_completion_blocked",
+        "a non-guard refusal must not inherit the guard code: {blocked}"
+    );
+    assert!(
+        blocked["reason"].is_null() && blocked["closure_condition"].is_null(),
+        "a non-guard refusal must not carry guard diagnosis: {blocked}"
+    );
+
+    // 3. A different guard denial still projects faithfully: the SAME fields,
+    // the GUARD's sentence — never a fixed string. (Here: same no-binding
+    // fixture as the first test, proving the projection reads the reason
+    // off the live denial rather than restating it.)
+    let branched = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "create",
+            "title": "branched work",
+            "assignee": "dev",
+            "branch": "feat/also-no-proof-16",
+        }),
+    )["id"]
+        .as_str()
+        .expect("task id")
+        .to_string();
+    let claimed = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action": "claim", "id": branched}),
+    );
+    assert_eq!(claimed["task"]["status"], "claimed");
+    let second = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action": "done", "id": branched}),
+    );
+    assert_eq!(second["code"], "assignee_completion_blocked");
+    let own_reason = second["reason"].as_str().expect("reason");
+    assert!(
+        own_reason.contains("unconsumed merge receipt"),
+        "each denial projects its own guard sentence: {second}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
