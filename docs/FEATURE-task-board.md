@@ -128,6 +128,7 @@ warm queries independent of history size.
 - Force mode records an audit entry in the event log.
 - Appends a `Done` event.
 - After completion, attempts best-effort cleanup of the bound worktree's init commit.
+- **Refusal diagnosis:** when the assignee completion guard refuses a `done` (`code: assignee_completion_blocked`), the response carries `reason` (the guard's actual denial for that refusal) and `closure_condition` (what would permit closure — merge the PR or ask the orchestrator to close it), in the same shape the send path's settlement outcome uses. Other `done` refusals (not found, route, ACL, illegal transition) are unchanged.
 
 ## 9. `task action=update`
 

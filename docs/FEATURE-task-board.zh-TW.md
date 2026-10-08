@@ -123,6 +123,7 @@ Task board 是 fleet 共用的工作追蹤介面。它採用 event-sourced 模�
 - Force mode 會在 event log 記錄 audit entry。
 - 附加 `Done` event。
 - 完成後，會 best-effort 嘗試清理綁定 worktree 的 init commit。
+- **拒絕診斷：** 當 assignee completion guard 拒絕 `done`（`code: assignee_completion_blocked`）時，回應帶有 `reason`（該次拒絕的實際守衛理由）與 `closure_condition`（什麼能讓它通過——合併 PR 或請 orchestrator 關閉），形狀與 send 路徑的 settlement outcome 相同。其他 `done` 拒絕（not found、route、ACL、illegal transition）維持不變。
 
 ## 9. `task action=update`
 

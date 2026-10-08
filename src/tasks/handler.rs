@@ -644,10 +644,20 @@ fn handle_done(
     }
     let completion_receipt = match super::assignee_completion_guard(home, &id, &caller, &record) {
         super::CompletionGate::Permit(receipt) => receipt,
+        // #16: this refusal used to carry only `error` + `code` — the
+        // caller could see WHAT was denied but neither WHY nor what would
+        // permit closure. `reason` quotes the guard's ACTUAL denial for
+        // this refusal (same sentence as `error` — it is not a paraphrase),
+        // and `closure_condition` names an executable next step in the
+        // same sentence the send path projects through `settlement_json`.
+        // Both are purely informational: the arm still only returns — it
+        // never mutates state, and the `code` contract is byte-unchanged.
         super::CompletionGate::Deny(reason) => {
             return serde_json::json!({
                 "error": reason,
                 "code": "assignee_completion_blocked",
+                "reason": reason,
+                "closure_condition": crate::agent_ops::messaging::DONE_GUARD_CLOSURE_CONDITION,
             })
         }
         // NOT a permit — the guard had no opinion, and the only authority that
