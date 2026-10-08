@@ -334,10 +334,7 @@ fn create_only_refusal_carries_an_executable_create_remedy_14() {
         };
 
         let before = super::read_task_record(&home, &predecessor).expect("predecessor record");
-        let board = crate::task_events::board_root(
-            &home,
-            crate::task_events::DEFAULT_PROJECT,
-        );
+        let board = crate::task_events::board_root(&home, crate::task_events::DEFAULT_PROJECT);
         let events_before = crate::task_events::envelopes_for_task_at(&board, &predecessor)
             .expect("envelopes before")
             .len();

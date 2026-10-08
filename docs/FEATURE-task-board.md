@@ -150,6 +150,7 @@ warm queries independent of history size.
 - `get` returns one task's full record by `id`/`task_id`.
 - `activity` returns the task's event history.
 - `metadata_set` and `metadata_get` write/read a named metadata value; mutation follows the task ACL.
+  - **Exception:** `review_class` and `governing_decision_id` are create-only task authority captured in the `Created` event. `metadata_set` refuses them for every identity with `code: create_only_metadata`, and the refusal carries `remedy = {action: "create", parameter: <the refused key>}`. Supply them through the matching `task action=create` parameter instead; they can be neither set nor changed after creation. The remedy is informational — it does not modify, retire, or transfer anything from the refused task, and no dependency or other obligation moves automatically.
 - `ack_plan` records an idempotent non-assignee acknowledgement used by the plan-ack gate.
 
 ## 10. Plan-Ack Gate (`#2249`)

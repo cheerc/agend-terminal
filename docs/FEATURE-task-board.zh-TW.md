@@ -145,6 +145,7 @@ Task board 是 fleet 共用的工作追蹤介面。它採用 event-sourced 模�
 - `get` 依 `id`/`task_id` 回傳單一 task 的完整 record。
 - `activity` 回傳 task 的 event history。
 - `metadata_set` 與 `metadata_get` 寫入／讀取具名 metadata value；mutation 遵循 task ACL。
+  - **例外：**`review_class` 與 `governing_decision_id` 是 create-only 的 task authority，於 `Created` event 中擷取。`metadata_set` 對任何身分都會以 `code: create_only_metadata` 拒絕，且拒絕回應帶有 `remedy = {action: "create", parameter: <被拒的 key>}`。請改用 `task action=create` 對應的參數傳入；這兩者建立後既不能設定也不能變更。此 remedy 僅為資訊——它不會修改、終結或轉移被拒 task 的任何事物，也不會自動搬移任何 dependency 或其他義務。
 - `ack_plan` 記錄 plan-ack gate 使用、具 idempotency 的非 assignee acknowledgement。
 
 ## 10. Plan-Ack Gate（`#2249`）

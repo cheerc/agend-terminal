@@ -1951,10 +1951,37 @@ fn metadata_write_outcome(
         // #3419: these fields are immutable authority captured in Created.
         // Generic metadata writes must never forge, downgrade, or even
         // rewrite the same value after creation.
+        //
+        // #14: this arm used to be the ONLY branch of this `match` that named
+        // neither a replacement action nor its parameter — its sibling
+        // `plan_acks` arm already told the caller which action to use instead.
+        // A refusal that cannot be acted on costs the caller a second attempt
+        // to discover the same thing. So the diagnostic now names a real,
+        // executable next step: the value is captured in `Created`, so it is set
+        // by CREATING a task with the parameter named below — never by
+        // `metadata_set`, and never by retroactively editing the refused task.
+        //
+        // `remedy.parameter` is `key` itself, so the caller is told which
+        // argument to pass rather than having to infer it. `remedy` is purely
+        // informational: nothing here mutates state, and creating a successor
+        // is the CALLER's decision — this response neither creates a task nor
+        // disposes of the refused one, transfers its dependencies, or moves
+        // any obligation attached to it.
         "review_class" | "governing_decision_id" => {
             MetadataWriteOutcome::Denied(serde_json::json!({
                 "error": format!("{key} is create-only task authority"),
                 "code": "create_only_metadata",
+                "hint": format!(
+                    "{key} is captured in a task's Created event and can only be supplied when \
+                     the task is created. Set it with the `{key}` parameter of \
+                     `task action=create`; `metadata_set` can never set or change it. Creating \
+                     a new task does not modify, retire, or transfer anything from this one — \
+                     no dependency, ci-watch, or pending expectation moves on its own.",
+                ),
+                "remedy": serde_json::json!({
+                    "action": "create",
+                    "parameter": key,
+                }),
             }))
         }
         // I1: plan_acks is system-managed (only `ack_plan` / the reopen-reset write
