@@ -5256,6 +5256,152 @@ fn unified_send_typed_code_review_scans_canonical_message_3079() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+// #8: the API adapter's #3293 work showed how easy it is to pin one renderer
+// and leave the other free. The auto-close projection is a service outcome, so
+// this drives the REAL MCP send path a reviewer actually calls and asserts the
+// same envelope the API adapter test asserts — both renderers, one contract.
+#[test]
+fn mcp_verified_review_receipt_projects_auto_close_8() {
+    let _g = fleet_test_guard();
+    const HEAD: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    // `handle_tool_rt` resolves home through AGEND_HOME, so this fixture must go
+    // through `setup_recorder` and then overwrite its minimal fleet with the
+    // team + stable ids the typed assignment needs.
+    let (_rec, home) = setup_recorder("mcp-review-auto-close-8");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    let lead_id = crate::types::InstanceId::new();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  sender-agent:\n    backend: claude\n    id: {}\n  target-agent:\n    backend: claude\n    id: {}\nteams:\n  archfix:\n    members: [sender-agent, target-agent]\n    orchestrator: target-agent\n",
+            reviewer_id.full(),
+            lead_id.full(),
+        ),
+    )
+    .unwrap();
+    crate::daemon::pr_state::record_ci_result(
+        &home,
+        "owner/repo",
+        "fix/typed",
+        HEAD,
+        crate::daemon::pr_state::CiConclusion::Green,
+        vec!["target-agent".into()],
+        crate::daemon::pr_state::ReviewClass::Single,
+    );
+    crate::daemon::pr_state::with_pr_state(&home, "owner/repo", "fix/typed", |state| {
+        state.pr_number = 8;
+    })
+    .unwrap();
+    let assignment = crate::daemon::assignment_authority::ActiveAssignment::new_pending_typed(
+        "owner/repo",
+        "fix/typed",
+        "sender-agent",
+        reviewer_id,
+        8,
+        HEAD,
+        crate::review_receipt::ReviewSlot::Primary,
+        "target-agent",
+        "t-8-mcp-review",
+        crate::daemon::pr_state::ReviewClass::Single,
+        crate::mcp::handlers::comms_gates::ReviewAuthor::External("octocat".into()),
+        "review exact head",
+        None,
+        None,
+        "2026-10-09T00:00:00Z",
+    );
+    crate::daemon::assignment_authority::persist(&home, &assignment).unwrap();
+
+    // The review task exists and is claimed by the reviewer: the receipt's
+    // auto-close has a real row to close.
+    let tid = crate::task_events::TaskId("t-8-mcp-review".into());
+    crate::task_events::append_batch(
+        &home,
+        &crate::task_events::InstanceName::from("test:seed"),
+        vec![
+            crate::task_events::TaskEvent::Created {
+                task_id: tid.clone(),
+                title: "#8 mcp review fixture".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
+            },
+            crate::task_events::TaskEvent::Claimed {
+                task_id: tid.clone(),
+                by: crate::task_events::InstanceName::from("sender-agent"),
+            },
+        ],
+    )
+    .expect("seed #8 mcp review task");
+
+    let _sender = crate::identity::Sender::new("sender-agent").unwrap();
+    let result = handle_tool_rt(
+        "send",
+        &json!({
+            "instance": "target-agent",
+            "message": "VERIFIED — exact review\n\n### Evidence\nran: cargo test → passed",
+            "request_kind": "report",
+            "report_purpose": "code_review",
+            "correlation_id": "t-8-mcp-review",
+            "code_review": {
+                "assignment_id": assignment.assignment_id,
+                "verdict": "verified",
+                "evidence_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+        }),
+        "sender-agent",
+    );
+
+    assert!(
+        is_ok_result(&result),
+        "a typed review must still deliver: {result}"
+    );
+    let outcome = &result["auto_close"];
+    assert!(
+        outcome.is_object(),
+        "the MCP adapter must disclose the receipt's close too: {result}"
+    );
+    assert_eq!(outcome["closed"], true, "{result}");
+    assert_eq!(
+        outcome["code"].as_str(),
+        Some("review_receipt_auto_closed"),
+        "{result}"
+    );
+    assert_eq!(outcome["task_id"].as_str(), Some("t-8-mcp-review"), "{result}");
+    assert_eq!(
+        outcome["evidence_locator"]["assignment_id"].as_str(),
+        Some(assignment.assignment_id.to_string().as_str()),
+        "{result}"
+    );
+    assert_eq!(
+        outcome["evidence_locator"]["reviewed_head"].as_str(),
+        Some(HEAD),
+        "{result}"
+    );
+    let status = crate::task_events::replay_at(&home)
+        .expect("replay board")
+        .tasks
+        .get(&tid)
+        .map(|record| record.status);
+    assert_eq!(
+        status,
+        Some(crate::task_events::TaskStatus::Done),
+        "{result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn send_message_from_file_missing() {
     let _g = fleet_test_guard();
