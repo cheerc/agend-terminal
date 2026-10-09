@@ -1034,3 +1034,104 @@ fn hot_reload_team_name_collision_reuses_existing_tab() {
     assert_eq!(tab.root().pane_count(), 2);
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// #44 (3): a remote restart that fails — or loses its identity correlation —
+/// must be visible to the operator. `restart_instance` fails closed with
+/// `restart_identity_unavailable` when fleet.yaml and the registry disagree on
+/// the id, and before this the TUI showed nothing at all: the pane simply did
+/// not restart, with only a WARN in the log to explain it. That silent no-op is
+/// exactly #44's reported symptom.
+#[test]
+fn remote_restart_failure_surfaces_on_the_pane_44() {
+    let home = team_fixture_home("remote-restart-failure-44");
+    let fleet_path = crate::fleet::fleet_yaml_path(&home);
+    std::fs::write(&fleet_path, "instances: {}\n").ok();
+    let registry: crate::agent::AgentRegistry =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+    let app_restart_gate = crate::api::app_restart::AppRestartGate::new();
+    let daemon_binary_stale = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let attached_run_dir = None;
+    let (task_rpc_tx, _task_rpc_rx) = crossbeam_channel::unbounded::<rpc::TaskRequest>();
+    let (remote_state_rpc_tx, _remote_state_rpc_rx) =
+        crossbeam_channel::unbounded::<rpc::AgentStateRequest>();
+    let (remote_restart_request_tx, _remote_restart_request_rx) =
+        crossbeam_channel::unbounded::<commands::RemoteRestartRequest>();
+    let (remote_restart_worker_tx, _remote_restart_worker_rx) =
+        crossbeam_channel::unbounded::<commands::RemoteRestartRequest>();
+    let deps = AppDeps {
+        home: &home,
+        fleet_path: &fleet_path,
+        registry: &registry,
+        wakeup_tx: &wakeup_tx,
+        app_restart_gate: &app_restart_gate,
+        daemon_binary_stale: &daemon_binary_stale,
+        telegram_status: TelegramStatus::NotConfigured,
+        attached_run_dir: &attached_run_dir,
+        attached_mode: false,
+        size_debug: false,
+        task_rpc_tx: &task_rpc_tx,
+        remote_state_rpc_tx: &remote_state_rpc_tx,
+        remote_restart_request_tx: &remote_restart_request_tx,
+        remote_restart_worker_tx: &remote_restart_worker_tx,
+    };
+
+    let old_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 4400);
+    let mut state = AppState::new();
+    let mut pane = test_remote_pane(&mut state.ui.layout, "drifted-agent").expect("test pane");
+    pane.instance_ref = Some(old_ref);
+    state.ui.layout.add_tab(Tab::new("team".into(), pane));
+
+    // Register the pending restart exactly as the TUI does before dispatching it.
+    state.remote_restarts.insert(
+        "restart-44".to_string(),
+        super::app_state::RemoteRestartPending {
+            request: commands::RemoteRestartRequest {
+                restart_id: "restart-44".to_string(),
+                old_instance_ref: Some(old_ref),
+                tab_index: 0,
+                pane_id: 0,
+                name: "drifted-agent".to_string(),
+            },
+            successor_instance_ref: None,
+            conflicted: false,
+            provisional: false,
+            created_at: std::time::Instant::now(),
+        },
+    );
+
+    state.handle_remote_restart_outcome(
+        Ok(rpc::RemoteRestartOutcome {
+            request: commands::RemoteRestartRequest {
+                restart_id: "restart-44".to_string(),
+                old_instance_ref: Some(old_ref),
+                tab_index: 0,
+                pane_id: 0,
+                name: "drifted-agent".to_string(),
+            },
+            result: Err("runtime registry has no live identity for 'drifted-agent'".to_string()),
+        }),
+        &deps,
+    );
+
+    let shown = state
+        .ui
+        .layout
+        .find_agent_pane("drifted-agent")
+        .and_then(|(tab, pane_id)| state.ui.layout.tabs[tab].root().find_pane(pane_id))
+        .and_then(crate::layout::Pane::restart_error)
+        .map(str::to_owned);
+    assert!(
+        shown
+            .as_deref()
+            .is_some_and(|text| text.contains("restart failed")),
+        "#44 RED: a failed restart must be visible on the pane, not log-only. got {shown:?}"
+    );
+    assert!(
+        shown
+            .as_deref()
+            .is_some_and(|text| text.contains("no live identity")),
+        "#44: the pane must carry the reason, not a generic marker: {shown:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
