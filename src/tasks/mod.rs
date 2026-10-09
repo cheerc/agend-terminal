@@ -1,5 +1,12 @@
 //! Task board — fleet-wide task tracking via JSON file.
 
+/// #9: the identity a report-driven auto-close writes into its terminal event.
+/// Named because downstream consumers — notably `assignment_authority`, which
+/// retires the reviewer's assignment on that same terminal event — must be able
+/// to tell a SETTLED review from any other way a task reached a terminal status.
+/// Underscore form, matching `acl::SYSTEM_IDENTITIES`.
+pub(crate) const AUTO_CLOSE_INSTANCE: &str = "system:auto_close";
+
 mod acl;
 mod activity;
 pub mod auto_close;

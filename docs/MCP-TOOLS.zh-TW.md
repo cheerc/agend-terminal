@@ -305,6 +305,18 @@ Drain 或管理 caller 的 durable inbox。
 
 - 必填：`assignment_id`。
 
+**#9 — 退役通知會說明「為什麼」。** 當 assignment 的 delivery 已經交到 reviewer 手上，退役它時也會在該 reviewer 的 inbox 留下一則 durable 通知。該通知依退役的成因投影，因此絕不會宣稱一場沒有發生的撤銷——最重要的是，reviewer 自己的 `VERIFIED` receipt 會結案它的 review task，而那正是以「成功」為由退役該 assignment。
+
+| 成因 | `kind` | `from` | 意義 |
+|---|---|---|---|
+| 你的審查已結案 | `review-assignment-settled` | `system:assignment_retirement` | 你的審查已入帳，其 task 已關閉 |
+| task 已 terminal，成因無法歸屬 | `review-assignment-retired` | `system:assignment_retirement` | 該 task 進入終態；此處無從得知是結案還是取消 |
+| 此 branch 上已被取代 | `review-assignment-replaced` | `system:assignment_retirement` | 已有較新的 assignment 接替 |
+| 退役（例如 review-class 更正） | `review-assignment-retired` | `system:assignment_retirement` | 該 assignment 不再是權威 |
+| 明確撤銷 | `review-assignment-revoked` | 實際執行撤銷者 | 有人真的把它收回了 |
+
+`review-assignment-revoked` 是唯一代表「撤銷」的 kind，也是唯一歸屬於人而非 system identity 的。背後的 nonce 去重與 supersede 行為不變。
+
 ### `usage_limit_takeover`
 
 針對持久化 usage-limit takeover episode 的 operator-only PREPARE 步驟。它會寫入 durable prepared journal，但不執行 takeover。

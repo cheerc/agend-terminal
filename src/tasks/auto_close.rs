@@ -137,7 +137,10 @@ fn auto_close_on_report_with_mode(
     // CR-2026-06-14: underscore form, matching `acl::SYSTEM_IDENTITIES` +
     // status_summary. The prior hyphen variant was absent from the ACL allow-list,
     // so `is_system_identity` denied it if routed through `can_mutate_record`.
-    let emitter = crate::task_events::InstanceName::from("system:auto_close");
+    // #9: named so consumers can recognise a settled review by its emitter —
+    // `assignment_authority` reads this exact identity off the terminal event to
+    // decide whether a retirement was a settlement or something else.
+    let emitter = crate::task_events::InstanceName::from(super::AUTO_CLOSE_INSTANCE);
     // #1873: re-validate →Done UNDER the lock — a concurrent cancel between the
     // out-of-lock status check above and this append must not be flipped to Done.
     // #2760 items 2+3: additionally under the per-id router lock with write-time

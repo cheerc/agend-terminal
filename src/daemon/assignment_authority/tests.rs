@@ -1467,7 +1467,11 @@ fn duplicate_terminal_event_key_is_a_durable_no_op() {
 
 /// Notices currently present in `target`'s inbox that are retirement notices
 /// (i.e. carrying the retirement nonce), whatever their kind.
-fn retirement_notices(home: &Path, target: &str, assignment_id: uuid::Uuid) -> Vec<crate::inbox::InboxMessage> {
+fn retirement_notices(
+    home: &Path,
+    target: &str,
+    assignment_id: uuid::Uuid,
+) -> Vec<crate::inbox::InboxMessage> {
     rows_with_nonce(home, target, &format!("revoked-{assignment_id}"))
 }
 
@@ -1478,11 +1482,29 @@ fn settled_review_emits_no_revocation_semantics_9() {
     let home = tmp_home("9-settled");
     let task_id = "t-settled-review";
     seed_open_task(&home, task_id);
-    let mut assignment = mk_record("o/r", "feat/settled", "reviewer", 42, "2026-10-09T00:00:00Z");
+    let mut assignment = mk_record(
+        "o/r",
+        "feat/settled",
+        "reviewer",
+        42,
+        "2026-10-09T00:00:00Z",
+    );
     assignment.task_id = task_id.into();
     persist(&home, &assignment).unwrap();
-    durable_enqueue(&home, "o/r", "feat/settled", "reviewer", "2026-10-09T00:00:05Z").unwrap();
-    mark_row_read(&home, "reviewer", &assignment.delivery_nonce, "2026-10-09T00:00:07Z");
+    durable_enqueue(
+        &home,
+        "o/r",
+        "feat/settled",
+        "reviewer",
+        "2026-10-09T00:00:05Z",
+    )
+    .unwrap();
+    mark_row_read(
+        &home,
+        "reviewer",
+        &assignment.delivery_nonce,
+        "2026-10-09T00:00:07Z",
+    );
 
     assert!(
         list_active(&home, "o/r", "feat/settled").len() == 1,
@@ -1551,12 +1573,37 @@ fn settled_review_emits_no_revocation_semantics_9() {
 #[test]
 fn explicit_revoke_keeps_revocation_shape_and_names_the_actor_9() {
     let home = tmp_home("9-explicit");
-    let assignment = mk_record("o/r", "feat/explicit", "reviewer", 42, "2026-10-09T00:00:00Z");
+    let assignment = mk_record(
+        "o/r",
+        "feat/explicit",
+        "reviewer",
+        42,
+        "2026-10-09T00:00:00Z",
+    );
     persist(&home, &assignment).unwrap();
-    durable_enqueue(&home, "o/r", "feat/explicit", "reviewer", "2026-10-09T00:00:05Z").unwrap();
-    mark_row_read(&home, "reviewer", &assignment.delivery_nonce, "2026-10-09T00:00:07Z");
+    durable_enqueue(
+        &home,
+        "o/r",
+        "feat/explicit",
+        "reviewer",
+        "2026-10-09T00:00:05Z",
+    )
+    .unwrap();
+    mark_row_read(
+        &home,
+        "reviewer",
+        &assignment.delivery_nonce,
+        "2026-10-09T00:00:07Z",
+    );
 
-    assert!(revoke(&home, "o/r", "feat/explicit", "reviewer", "2026-10-09T00:00:10Z").unwrap());
+    assert!(revoke(
+        &home,
+        "o/r",
+        "feat/explicit",
+        "reviewer",
+        "2026-10-09T00:00:10Z"
+    )
+    .unwrap());
 
     let notices = retirement_notices(&home, "reviewer", assignment.assignment_id);
     assert_eq!(
@@ -1595,18 +1642,25 @@ fn cause_projection_preserves_nonce_dedup_and_supersede_9() {
     let mut assignment = mk_record("o/r", "feat/dedup", "reviewer", 42, "2026-10-09T00:00:00Z");
     assignment.task_id = task_id.into();
     persist(&home, &assignment).unwrap();
-    durable_enqueue(&home, "o/r", "feat/dedup", "reviewer", "2026-10-09T00:00:05Z").unwrap();
-    mark_row_read(&home, "reviewer", &assignment.delivery_nonce, "2026-10-09T00:00:07Z");
-
-    assert!(
-        crate::tasks::auto_close::auto_close_on_validated_review(
-            &home,
-            task_id,
-            "reviewer",
-            "VERIFIED",
-        )
-        .unwrap()
+    durable_enqueue(
+        &home,
+        "o/r",
+        "feat/dedup",
+        "reviewer",
+        "2026-10-09T00:00:05Z",
+    )
+    .unwrap();
+    mark_row_read(
+        &home,
+        "reviewer",
+        &assignment.delivery_nonce,
+        "2026-10-09T00:00:07Z",
     );
+
+    assert!(crate::tasks::auto_close::auto_close_on_validated_review(
+        &home, task_id, "reviewer", "VERIFIED",
+    )
+    .unwrap());
     assert!(
         list_active(&home, "o/r", "feat/dedup").is_empty(),
         "precondition: the terminal event retired the authority record"
@@ -1635,7 +1689,10 @@ fn cause_projection_preserves_nonce_dedup_and_supersede_9() {
     .unwrap();
     let after_replay = retirement_notices(&home, "reviewer", assignment.assignment_id).len();
 
-    assert_eq!(after_replay, first, "a replayed retirement must not duplicate");
+    assert_eq!(
+        after_replay, first,
+        "a replayed retirement must not duplicate"
+    );
     assert!(
         !crate::inbox::storage::nonce_present_actionable(
             &home,
@@ -1645,7 +1702,11 @@ fn cause_projection_preserves_nonce_dedup_and_supersede_9() {
         "the original actionable delivery must stay superseded"
     );
     let original = rows_with_nonce(&home, "reviewer", &assignment.delivery_nonce);
-    assert_eq!(original.len(), 1, "the original row is superseded, not removed");
+    assert_eq!(
+        original.len(),
+        1,
+        "the original row is superseded, not removed"
+    );
     // supersede_by_nonce_strict stamps `superseded_by` only on an UNREAD row; a
     // row the reviewer already read is retired by its read_at staying set and
     // the row never becoming actionable again. Either spelling is a supersede —

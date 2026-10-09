@@ -631,18 +631,101 @@ fn revocation_nonce(assignment_id: uuid::Uuid) -> String {
     format!("revoked-{assignment_id}")
 }
 
-fn build_revocation_notice(
+/// #9: WHY an assignment stopped being authoritative. The retirement notice used
+/// to be spelled `has been revoked` for every cause, so a reviewer whose VERIFIED
+/// receipt settled its own review task read a "revoked" notice and spent four tool
+/// calls ruling out that its verdict had expired. The cause is supplied by the
+/// CALLER — it knows which retirement path it took — and the notice projects it.
+///
+/// Each variant names the truth as the reviewer can act on it. Only
+/// [`RetirementCause::ExplicitlyRevoked`] is a revocation; a settled review is not
+/// one, and saying so is the whole point of this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetirementCause {
+    /// A validated receipt settled the reviewer's own review task, so the
+    /// assignment is retired as a CONSEQUENCE of a successful review — not because
+    /// anything went wrong.
+    TaskSettled,
+    /// The assignment was retired by an explicit CAS (`retire_if_id_matches`) that
+    /// had no terminal event to attribute: the task was terminal, but WHETHER that
+    /// was this review settling or an operator cancelling is not knowable here.
+    ///
+    /// #9: deliberately makes no claim about the task's outcome. Attributing it to
+    /// a settled review would be projecting a guess as fact — the exact failure
+    /// mode this enum exists to remove. The reviewer is told the assignment is
+    /// gone, not why.
+    TaskTerminalUnattributed,
+    /// A different assignment on the same branch replaced this one.
+    Replaced,
+    /// An explicit CAS retire (`retire_if_id_matches`) with a cause other than the
+    /// two above.
+    Retired,
+    /// A real actor withdrew the assignment — the MCP revoke tool, or instance
+    /// teardown. This is the ONLY cause that is a revocation.
+    ExplicitlyRevoked,
+}
+
+impl RetirementCause {
+    /// The notice `kind`, `from`, and wording for this cause.
+    ///
+    /// #9: `from` is the CAUSE's actor, not always the dispatcher. A
+    /// system-driven cause must not be attributed to the lead who dispatched the
+    /// review — that reads as "your lead revoked this". A real revocation is
+    /// attributed to `record.sender`, the actor who actually pulled it.
+    fn project(self, record: &ActiveAssignment) -> (String, &'static str, String) {
+        let subject = format!(
+            "Reviewer assignment for PR #{} ({}@{})",
+            record.pr_number, record.repo, record.branch
+        );
+        match self {
+            RetirementCause::TaskSettled => (
+                "system:assignment_retirement".to_string(),
+                "review-assignment-settled",
+                format!(
+                    "{subject} is complete: your review was recorded and its task closed, so the assignment no longer needs your attention."
+                ),
+            ),
+            RetirementCause::TaskTerminalUnattributed => (
+                "system:assignment_retirement".to_string(),
+                "review-assignment-retired",
+                format!(
+                    "{subject} has been retired: the task it belonged to reached a terminal state, so the assignment no longer needs your attention."
+                ),
+            ),
+            RetirementCause::Replaced => (
+                "system:assignment_retirement".to_string(),
+                "review-assignment-replaced",
+                format!(
+                    "{subject} was replaced by a newer assignment for this branch."
+                ),
+            ),
+            RetirementCause::Retired => (
+                "system:assignment_retirement".to_string(),
+                "review-assignment-retired",
+                format!(
+                    "{subject} has been retired and no longer needs your attention."
+                ),
+            ),
+            RetirementCause::ExplicitlyRevoked => (
+                record.sender.clone(),
+                "review-assignment-revoked",
+                format!("{subject} has been revoked."),
+            ),
+        }
+    }
+}
+
+fn build_retirement_notice(
     record: &ActiveAssignment,
+    cause: RetirementCause,
     now: &str,
     nonce: &str,
 ) -> crate::inbox::InboxMessage {
+    let (from, kind, text) = cause.project(record);
     crate::inbox::InboxMessage {
-        from: record.sender.clone(),
-        text: format!(
-            "Reviewer assignment for PR #{} ({}@{}) has been revoked.",
-            record.pr_number, record.repo, record.branch
-        ),
-        kind: Some("review-assignment-revoked".to_string()),
+        from,
+        text,
+        kind: Some(kind.to_string()),
         timestamp: now.to_string(),
         task_id: Some(record.task_id.clone()),
         correlation_id: Some(record.task_id.clone()),
@@ -964,7 +1047,12 @@ pub(crate) fn persist(home: &Path, record: &ActiveAssignment) -> anyhow::Result<
                         crate::inbox::storage::enqueue(
                             home,
                             &record.target,
-                            build_revocation_notice(&old, &record.created_at, &nonce),
+                            build_retirement_notice(
+                                &old,
+                                RetirementCause::Replaced,
+                                &record.created_at,
+                                &nonce,
+                            ),
                         )?;
                     }
                 }
@@ -1142,14 +1230,25 @@ pub(crate) fn revoke(
 /// failure at any point preserves the authority — fail closed. Retry after
 /// interruption converges: supersede is idempotent on an already-superseded
 /// row, so re-running after a crash between supersede and delete is safe.
+/// #9: everything a retirement needs to carry beyond the record it retires.
+///
+/// Bundled because `retire_under_lock` already takes the record coordinates; the
+/// cause, the clock, and the caller's cleanup accumulator are one decision, not
+/// three independent knobs, and passing them separately pushed the function past
+/// the argument ceiling where a mistaken pairing would be easy.
+struct Retirement<'a> {
+    cause: RetirementCause,
+    now: &'a str,
+    cleanup_tasks: &'a mut Vec<String>,
+}
+
 fn retire_under_lock(
     home: &Path,
     repo: &str,
     branch: &str,
     target: &str,
     expected_id: uuid::Uuid,
-    now: &str,
-    cleanup_tasks: &mut Vec<String>,
+    retirement: Retirement<'_>,
 ) -> anyhow::Result<bool> {
     let path = record_file(home, repo, branch, target);
     let record = match read_record(&path)? {
@@ -1164,15 +1263,16 @@ fn retire_under_lock(
         "review assignment authority retired",
     )?;
     if cancelled {
-        cleanup_tasks.push(record.task_id.clone());
+        retirement.cleanup_tasks.push(record.task_id.clone());
     }
 
-    retire_delivery_under_lock(home, &record, now)
+    retire_delivery_under_lock(home, &record, retirement.cause, retirement.now)
 }
 
 fn retire_delivery_under_lock(
     home: &Path,
     record: &ActiveAssignment,
+    cause: RetirementCause,
     now: &str,
 ) -> anyhow::Result<bool> {
     let expected_id = record.assignment_id;
@@ -1193,7 +1293,7 @@ fn retire_delivery_under_lock(
             crate::inbox::storage::enqueue(
                 home,
                 target,
-                build_revocation_notice(record, now, &nonce),
+                build_retirement_notice(record, cause, now, &nonce),
             )?;
         }
     }
@@ -1212,14 +1312,22 @@ pub(crate) fn retire_if_id_matches(
     let mut cleanup_tasks = Vec::new();
     let result = {
         let _lock = lock_branch(home, repo, branch)?;
+        // #9: this entry has no terminal event to consult, so it must not claim
+        // the review settled. It is reached from the reconciler's cascade
+        // fallback, from PR-scanner cleanup, and from dispatch-time rollback —
+        // none of which can distinguish "the review settled" from "an operator
+        // cancelled". The notice says the assignment is retired and stops there.
         retire_under_lock(
             home,
             repo,
             branch,
             target,
             expected_id,
-            now,
-            &mut cleanup_tasks,
+            Retirement {
+                cause: RetirementCause::TaskTerminalUnattributed,
+                now,
+                cleanup_tasks: &mut cleanup_tasks,
+            },
         )
     };
     for task_id in cleanup_tasks {
@@ -1261,8 +1369,11 @@ pub(crate) fn retire_for_review_class_correction(
                 branch,
                 &record.target,
                 record.assignment_id,
-                now,
-                &mut cleanup_tasks,
+                Retirement {
+                    cause: RetirementCause::Retired,
+                    now,
+                    cleanup_tasks: &mut cleanup_tasks,
+                },
             )?);
         }
         let invalidated_receipts =
@@ -1341,8 +1452,21 @@ pub(crate) fn retire_for_terminal_event(
                 &branch,
                 &record.target,
                 record.assignment_id,
-                now,
-                &mut cleanup_tasks,
+                // #9: the verified terminal event carries its EMITTER, so the
+                // settled-vs-cancelled question has a real answer here rather
+                // than a guess. `auto_close` is the emitter a validated VERIFIED
+                // receipt produces; any other emitter that closed the task gets
+                // the unattributed wording instead of being told its review
+                // settled.
+                Retirement {
+                    cause: if instance == crate::tasks::AUTO_CLOSE_INSTANCE {
+                        RetirementCause::TaskSettled
+                    } else {
+                        RetirementCause::TaskTerminalUnattributed
+                    },
+                    now,
+                    cleanup_tasks: &mut cleanup_tasks,
+                },
             )?);
         }
         ledger.insert(key.clone());
@@ -1372,7 +1496,12 @@ pub(crate) fn retire_current_terminal_task_checked(
             || {
                 for record in list_active_checked(home, &repo, &branch)? {
                     if record.task_id == task_id {
-                        retired += usize::from(retire_delivery_under_lock(home, &record, now)?);
+                        retired += usize::from(retire_delivery_under_lock(
+                            home,
+                            &record,
+                            RetirementCause::TaskTerminalUnattributed,
+                            now,
+                        )?);
                     }
                 }
                 Ok(())
@@ -1436,7 +1565,16 @@ fn retire_operator_settlement_after_preflight(
                     if record.task_id == task_id {
                         // The task is already terminal under its writer lock. Do not
                         // call cancellation, which would re-enter that same lock.
-                        retired += usize::from(retire_delivery_under_lock(home, &record, now)?);
+                        retired += usize::from(retire_delivery_under_lock(
+                            home,
+                            &record,
+                            if instance == crate::tasks::AUTO_CLOSE_INSTANCE {
+                                RetirementCause::TaskSettled
+                            } else {
+                                RetirementCause::TaskTerminalUnattributed
+                            },
+                            now,
+                        )?);
                     }
                 }
                 ledger.insert(key.clone());
@@ -1495,7 +1633,12 @@ fn revoke_under_lock(
         crate::inbox::storage::enqueue(
             home,
             target,
-            build_revocation_notice(&record, now, &revocation_nonce(record.assignment_id)),
+            build_retirement_notice(
+                &record,
+                RetirementCause::ExplicitlyRevoked,
+                now,
+                &revocation_nonce(record.assignment_id),
+            ),
         )?;
     }
     remove_if_assignment_matches_strict(&path, record.assignment_id)
