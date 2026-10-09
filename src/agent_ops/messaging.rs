@@ -104,11 +104,20 @@ impl SettlementOutcome {
     /// #8: a VERIFIED receipt was validated but did NOT close its task. Still
     /// `closed: false`, still the receipt's evidence — a silent success-shaped
     /// response is precisely what #8 removes.
+    ///
+    /// The reason deliberately says NOTHING about the row's status. A skipped
+    /// close does not imply the row is still open: when a caller sends
+    /// `terminal: true` alongside a typed VERIFIED receipt on a branchless
+    /// task, the terminal path closes the row first and the receipt's own close
+    /// is then skipped as a status outside the whitelist. Asserting "the task is
+    /// still open" would report a falsehood on exactly the combination this
+    /// whole fix exists to describe truthfully. Naming the possibility is the
+    /// accurate claim; stating the status is not available here.
     fn review_receipt_not_closed(locator: ReviewEvidenceLocator, task_id: String) -> Self {
         Self {
             closed: false,
             code: Some("review_receipt_auto_close_skipped"),
-            reason: Some("the validated receipt did not close its exact task; the task is still open, so the verdict lives only in the delivered report".into()),
+            reason: Some("the validated receipt's close was skipped, so this receipt did not move the board row; the row may still be open, or may already have been closed by another path".into()),
             closure_condition: Some(DONE_GUARD_CLOSURE_CONDITION),
             task_id: Some(task_id),
             evidence_locator: Some(locator),

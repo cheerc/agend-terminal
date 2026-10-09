@@ -154,8 +154,9 @@ Report task results or review conclusions. Typically paired with `correlation_id
 | `ack_inbox` | With `true`, atomically acknowledge the reporter's delivering messages for this `correlation_id` after the send succeeds |
 
 **#8 — the response reports what it actually closed.** A `report` can close its
-task by two independent authorities, and both are disclosed in the same
-`auto_close` object:
+task by two independent authorities. Both answer in the same `auto_close` field;
+if both fired on one send, the receipt's outcome is the one reported, because it
+names the exact task it closed.
 
 | Authority | Trigger | Codes |
 |---|---|---|
@@ -169,6 +170,11 @@ regardless of `terminal`. Its outcomes also carry `task_id` and an
 can see which row moved and prove why. Before #8 that close was invisible: the
 response was byte-identical to one that had done nothing, so reviewers went on
 to call `task update → done` and hit `illegal_transition`.
+
+`_skipped` means *this receipt's* close did not run — it says nothing about the
+row's status. Sending `terminal: true` together with a validated receipt can
+close the row on the terminal path first, leaving the receipt's own close
+skipped on an already-`Done` task.
 
 ### update — Status Updates
 

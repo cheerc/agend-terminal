@@ -154,7 +154,8 @@ task 類型支援額外的任務管理參數：
 | `ack_inbox` | 設為 `true` 時，在 send 成功後原子確認 reporter 此 `correlation_id` 的 delivering messages |
 
 **#8 — 回應會說明它實際關掉了什麼。** 一次 `report` 可能出於兩種彼此獨立的權威
-而關閉任務，兩者都投影在同一個 `auto_close` 物件裡：
+而關閉任務。兩者都回在同一個 `auto_close` 欄位；若一次 send 同時觸發兩者，回報的
+是 receipt 那一側的結果，因為它會指名自己關掉的是哪一個 task。
 
 | 權威 | 觸發條件 | code |
 |---|---|---|
@@ -167,6 +168,10 @@ head、evidence digest），因此不論 `terminal` 為何都會關閉它的 rev
 `verdict`），讓 reviewer 看得到是哪一列動了、以及憑什麼而動。#8 之前這個關閉完全
 不可見：回應與「什麼都沒做」逐位元組相同，於是 reviewer 接著呼叫
 `task update → done`，並撞上 `illegal_transition`。
+
+`_skipped` 的意思是「這個 receipt 自己的關閉沒有執行」，它不對該列的狀態做任何
+斷言。當 `terminal: true` 與已驗證 receipt 同時送出時，該列可能已經在 terminal
+路徑被關閉，receipt 自己的關閉則因為狀態已不在白名單而被跳過。
 
 ### update — 狀態更新
 

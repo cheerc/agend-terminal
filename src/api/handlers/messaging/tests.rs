@@ -5476,10 +5476,77 @@ fn validated_receipt_that_cannot_close_is_still_disclosed_8() {
         !outcome["reason"].as_str().unwrap_or_default().is_empty(),
         "{result}"
     );
+    // #8 r1 (F2): the reason must never assert the row's status. The code knows
+    // only that ITS close was skipped; whether the row is open is not
+    // available here, and on the terminal+receipt combination below it is
+    // demonstrably not open.
+    let reason = outcome["reason"].as_str().unwrap_or_default();
+    for forbidden in ["still open", "is open", "remains open", "task is still"] {
+        assert!(
+            !reason.contains(forbidden),
+            "a skipped close must not assert the row's status ({forbidden:?}): {reason:?}"
+        );
+    }
     assert_eq!(
         task_status_of(&home, "t-code-review-2760"),
         Some(crate::task_events::TaskStatus::Claimed),
         "the row must not have moved"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #8 r1 (F2), the exact combination the reviewer derived: a caller sends
+/// `terminal: true` ALONGSIDE a typed VERIFIED receipt. The terminal path closes
+/// the branchless review task first (a branchless task is a guard permit), then
+/// the receipt's own close is skipped because the row is now `Done` — a status
+/// outside the close whitelist.
+///
+/// Before this fix that combination answered `review_receipt_auto_close_skipped`
+/// with a reason claiming "the task is still open", while the row sat at `Done`:
+/// the response stated a falsehood, which is the one thing this ticket exists to
+/// prevent. Driven through the REAL send entry so the ordering is production's.
+#[test]
+fn skipped_receipt_reason_does_not_assert_status_when_terminal_closed_first_8() {
+    let home = tmp_home("8-terminal-plus-receipt");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    write_typed_review_fleet(&home, reviewer_id, crate::types::InstanceId::new());
+    let assignment = seed_typed_review_subject(&home, reviewer_id);
+    // Branchless + claimed by the reviewer: the ordinary shape of a review task,
+    // and the shape on which the terminal path is a permit.
+    seed_review_task(&home, "t-code-review-2760", "typed-reviewer");
+
+    let ctx = test_ctx(&home);
+    let mut params = typed_review_params(assignment.assignment_id, "verified", "VERIFIED");
+    params["terminal"] = json!(true);
+    let result = handle_send(&params, &ctx);
+
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(
+        task_status_of(&home, "t-code-review-2760"),
+        Some(crate::task_events::TaskStatus::Done),
+        "precondition: the terminal path closes a branchless row before the bridge reads it"
+    );
+
+    let reason = result["auto_close"]["reason"]
+        .as_str()
+        .unwrap_or_else(|| panic!("skipped outcome must carry a reason: {result}"));
+    for forbidden in ["still open", "is open", "remains open", "task is still"] {
+        assert!(
+            !reason.contains(forbidden),
+            "the row is Done here, so a skipped receipt must not claim it is open \
+             ({forbidden:?}): {reason:?}"
+        );
+    }
+    assert_eq!(
+        result["auto_close"]["closed"], false,
+        "the RECEIPT's own close is what is being reported, and it did not run: {result}"
+    );
+    assert_eq!(
+        result["auto_close"]["task_id"].as_str(),
+        Some("t-code-review-2760"),
+        "{result}"
     );
     std::fs::remove_dir_all(&home).ok();
 }
