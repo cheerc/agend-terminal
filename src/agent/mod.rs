@@ -1369,9 +1369,8 @@ pub(crate) fn spawn_agent_with_capture_home(
         if deleting::is_deleting(home_path, name) {
             anyhow::bail!(
                 "#1915: refusing to spawn '{name}' — instance is mid-delete (deleting-set \
-                 chokepoint). #39 journal path: {}. Inspect with `binding_state`; finish or \
-                 inspect the release with `agend-terminal admin recover-worktree`",
-                crate::agent::deletion_recovery::path(home_path, name).display()
+                 chokepoint). {}",
+                crate::agent::deletion_recovery::fence_guidance(home_path, name)
             );
         }
     }
@@ -1392,9 +1391,8 @@ pub(crate) fn spawn_agent_with_capture_home(
             drop(transport_generation_guard);
             anyhow::bail!(
                 "#1915: refusing to spawn '{name}' — instance entered deletion after lane \
-                 admission. #39 journal path: {}. Inspect with `binding_state`; finish or \
-                 inspect the release with `agend-terminal admin recover-worktree`",
-                crate::agent::deletion_recovery::path(home_path, name).display()
+                 admission. {}",
+                crate::agent::deletion_recovery::fence_guidance(home_path, name)
             );
         }
     }

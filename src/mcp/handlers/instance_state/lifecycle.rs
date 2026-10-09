@@ -231,18 +231,8 @@ pub(crate) fn full_delete_instance_with_precondition(
     // also prevents every spawn/reconcile chokepoint from reusing the name.
     if let Some(existing) = crate::agent::deletion_recovery::read(home, name)? {
         if existing.state != crate::agent::deletion_recovery::State::Recovered {
-            // #39: this refusal used to name only the condition, yet it is the
-            // operator's dead end — `recover-worktree` ALSO refuses while the
-            // managed marker survives, so this message is the single place that
-            // can point at what to try next. Name the journal file and both
-            // routes; the refusal itself is unchanged.
-            return Err(format!(
-                "recovery_required: instance '{name}' already has a pending delete tombstone \
-                 (state={:?}, journal={}). #39 journal path: {}. Inspect with `binding_state`; \
-                 finish or inspect the release with `agend-terminal admin recover-worktree`",
-                existing.state,
-                existing.worktree,
-                crate::agent::deletion_recovery::path(home, name).display()
+            return Err(crate::agent::deletion_recovery::describe_pending_delete(
+                home, name, &existing,
             ));
         }
     }
