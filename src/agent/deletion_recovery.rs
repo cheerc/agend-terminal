@@ -218,6 +218,32 @@ pub(crate) fn begin_from_binding(home: &Path, instance: &str) -> Result<Option<T
     Ok(Some(tombstone))
 }
 
+/// #39: mark the journal as pending recovery, preserving an existing
+/// `WorktreeUnusable` state.
+///
+/// This is the SINGLE convergence point for every production transition into
+/// `RecoveryRequired` — the Delete lane (`instance_state/lifecycle.rs`), and the
+/// four release-lane call sites through `mark_release_recovery_required`. Guarding
+/// here therefore protects all of them at once, rather than scattering the same
+/// check at each site (which is what would make it impossible to tell later which
+/// copies were deliberate).
+///
+/// Why it matters: `binding_state` reports the operator's ONLY view of the damage
+/// source through `worktree_unusable { worktree, cause }`, which is non-null only
+/// for `WorktreeUnusable`. Downgrading the state to `RecoveryRequired` does not
+/// just relabel it — it erases `cause`, so an operator whose release failed
+/// afterwards can no longer learn what was already destroyed.
+///
+/// The tombstone is PERSISTENT state that outlives any single release attempt:
+/// "this attempt took the Removed branch" does not imply "the journal is not
+/// already Unusable" from an earlier attempt. That earlier state is exactly what
+/// an operator needs preserved. So the transition is refused here rather than at
+/// the call sites.
+///
+/// Deliberately NOT done: no new state, no journal field, no repair path. When a
+/// release later succeeds it calls `clear`, which removes the journal outright;
+/// by then the damage source has been either archived (a later slice) or
+/// explicitly superseded by the operator.
 pub(crate) fn mark_recovery_required(
     home: &Path,
     instance: &str,
@@ -225,6 +251,13 @@ pub(crate) fn mark_recovery_required(
 ) -> Result<(), String> {
     let mut tombstone = read(home, instance)?
         .ok_or_else(|| "recovery_required: delete tombstone is missing".to_string())?;
+    if matches!(tombstone.state, State::WorktreeUnusable { .. }) {
+        // Preserve both the state and `cause`. Returning Ok (not Err) keeps every
+        // existing caller's control flow intact — none of them treats this as a
+        // failure today, and making it one would newly fail a delete that
+        // currently succeeds. The durable record simply stops changing here.
+        return Ok(());
+    }
     tombstone.state = State::RecoveryRequired;
     tombstone.archive = archive.map(|path| path.display().to_string());
     write(home, &tombstone)
@@ -283,4 +316,170 @@ fn write(home: &Path, tombstone: &Tombstone) -> Result<(), String> {
         .map_err(|error| format!("serialize deletion tombstone: {error}"))?;
     crate::store::atomic_write(&path, &body)
         .map_err(|error| format!("write deletion tombstone {}: {error}", path.display()))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn tmp_home(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-39-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Plant a tombstone in `state` without going through a real signed binding —
+    /// the guard under test reads the journal, not the signature.
+    fn plant(home: &Path, instance: &str, state: State) {
+        write(
+            home,
+            &Tombstone {
+                schema_version: SCHEMA_VERSION,
+                state,
+                instance: instance.to_string(),
+                branch: "feat/x".to_string(),
+                worktree: "/tmp/wt".to_string(),
+                source_repo: "/tmp/repo".to_string(),
+                binding_sha256: "a".repeat(64),
+                binding_signature_sha256: "b".repeat(64),
+                archive: None,
+            },
+        )
+        .unwrap();
+    }
+
+    fn state_of(home: &Path, instance: &str) -> State {
+        read(home, instance).unwrap().unwrap().state
+    }
+
+    /// #39: the core guarantee. An Unusable journal keeps its state AND its cause
+    /// when a later release lane calls `mark_recovery_required` — because
+    /// `binding_state` reports the damage source ONLY through this state, so
+    /// downgrading it would erase the operator's only view of what was destroyed.
+    #[test]
+    fn unusable_survives_a_later_recovery_required_transition_39() {
+        let home = tmp_home("unusable-preserved");
+        plant(
+            &home,
+            "agent",
+            State::WorktreeUnusable {
+                cause: "12 tracked files missing (e.g. src/main.rs)".to_string(),
+            },
+        );
+
+        // The Delete lane and all four release-lane call sites converge here.
+        mark_recovery_required(&home, "agent", None).expect("transition must not error");
+
+        let tombstone = read(&home, "agent").unwrap().unwrap();
+        assert!(
+            matches!(tombstone.state, State::WorktreeUnusable { .. }),
+            "#39: a later RecoveryRequired transition must not downgrade Unusable — \
+             that erases the operator's only view of the damage source. got {:?}",
+            tombstone.state
+        );
+        assert_eq!(
+            tombstone.state,
+            State::WorktreeUnusable {
+                cause: "12 tracked files missing (e.g. src/main.rs)".to_string()
+            },
+            "#39: the cause must survive byte-for-byte"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The guard must return Ok, not Err: every existing caller continues on this
+    /// path today, so turning it into a failure would newly fail a delete that
+    /// currently succeeds.
+    #[test]
+    fn unusable_transition_is_a_no_op_not_an_error_39() {
+        let home = tmp_home("unusable-noop");
+        plant(
+            &home,
+            "agent",
+            State::WorktreeUnusable {
+                cause: "c".to_string(),
+            },
+        );
+        let before = std::fs::read(path(&home, "agent")).unwrap();
+        mark_recovery_required(&home, "agent", None).expect("must be Ok");
+        assert_eq!(
+            std::fs::read(path(&home, "agent")).unwrap(),
+            before,
+            "#39: the journal must not even be rewritten — no needless write race"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #39: an archive argument must not be able to launder an Unusable journal
+    /// either. Admin recovery passes `Some(&archive)`; although its own
+    /// precondition currently excludes Unusable, the convergence point must not
+    /// depend on every caller's precondition to hold.
+    #[test]
+    fn unusable_is_preserved_even_when_an_archive_is_supplied_39() {
+        let home = tmp_home("unusable-with-archive");
+        plant(
+            &home,
+            "agent",
+            State::WorktreeUnusable {
+                cause: "c".to_string(),
+            },
+        );
+        let archive = home.join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        mark_recovery_required(&home, "agent", Some(&archive)).expect("must be Ok");
+        assert!(
+            matches!(state_of(&home, "agent"), State::WorktreeUnusable { .. }),
+            "#39: supplying an archive must not downgrade Unusable at the convergence point"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Non-Unusable states keep their existing behaviour exactly: the transition
+    /// still happens, and `archive` still records.
+    #[test]
+    fn non_unusable_states_still_transition_39() {
+        for (tag, start) in [
+            ("deleting", State::Deleting),
+            ("recovery", State::RecoveryRequired),
+        ] {
+            let home = tmp_home(tag);
+            plant(&home, "agent", start.clone());
+            let archive = home.join("archive");
+            std::fs::create_dir_all(&archive).unwrap();
+            mark_recovery_required(&home, "agent", Some(&archive)).expect("must be Ok");
+            let tombstone = read(&home, "agent").unwrap().unwrap();
+            assert_eq!(
+                tombstone.state,
+                State::RecoveryRequired,
+                "#39: {tag:?} must keep transitioning to RecoveryRequired"
+            );
+            assert_eq!(
+                tombstone.archive.as_deref(),
+                Some(archive.display().to_string().as_str()),
+                "#39: {tag:?} must still record the archive"
+            );
+            std::fs::remove_dir_all(&home).ok();
+        }
+    }
+
+    /// A missing journal still errors — unchanged behaviour, pinned so the guard
+    /// cannot be mistaken for a blanket success.
+    #[test]
+    fn missing_tombstone_still_errors_39() {
+        let home = tmp_home("missing");
+        let error = mark_recovery_required(&home, "ghost", None).expect_err("must still error");
+        assert!(
+            error.contains("delete tombstone is missing"),
+            "unchanged: {error}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

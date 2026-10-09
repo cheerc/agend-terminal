@@ -113,6 +113,20 @@ pub(super) fn recover_absent_worktree(
     tombstone: &crate::agent::deletion_recovery::Tombstone,
     permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
 ) -> Result<super::RecoveryReport, String> {
+    // #39: same message correction as the entry point — an Unusable journal is a
+    // damaged worktree the release lane still owns, not a pending recovery. The
+    // refusal stands and no second exit is opened; only the reason changes.
+    if matches!(
+        tombstone.state,
+        crate::agent::deletion_recovery::State::WorktreeUnusable { .. }
+    ) {
+        return Err(format!(
+            "recovery refused: the worktree is damaged ({}) and operator recovery does not \
+             apply. Re-run the release lane (repo action=release) for '{}' to finish it; \
+             `binding_state` reports worktree_unusable with the cause.",
+            tombstone.worktree, instance
+        ));
+    }
     if !matches!(
         tombstone.state,
         crate::agent::deletion_recovery::State::Deleting
@@ -255,6 +269,20 @@ pub(super) fn recover_recorded_archive(
     tombstone: &crate::agent::deletion_recovery::Tombstone,
     permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
 ) -> Result<super::RecoveryReport, String> {
+    // #39: same message correction as the entry point — an Unusable journal is a
+    // damaged worktree the release lane still owns, not a pending recovery. The
+    // refusal stands and no second exit is opened; only the reason changes.
+    if matches!(
+        tombstone.state,
+        crate::agent::deletion_recovery::State::WorktreeUnusable { .. }
+    ) {
+        return Err(format!(
+            "recovery refused: the worktree is damaged ({}) and operator recovery does not \
+             apply. Re-run the release lane (repo action=release) for '{}' to finish it; \
+             `binding_state` reports worktree_unusable with the cause.",
+            tombstone.worktree, instance
+        ));
+    }
     if !matches!(
         tombstone.state,
         crate::agent::deletion_recovery::State::Deleting

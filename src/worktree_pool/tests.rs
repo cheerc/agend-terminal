@@ -8077,3 +8077,246 @@ fn unusable_tombstone_remains_atomic_under_concurrent_readers_40() {
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&repo).ok();
 }
+
+/// #39 acceptance #1, the branch-reachability question in executable form.
+///
+/// The four `mark_release_recovery_required` call sites live only in the
+/// `Removed` / `AlreadyAbsent` arms, while `WorktreeUnusable` is written only
+/// from `PartiallyRemoved`. That STRUCTURE alone does not settle reachability:
+/// the tombstone is persistent state that outlives one attempt, so "this attempt
+/// took the Removed branch" does not imply "the journal is not already Unusable
+/// from an earlier attempt".
+///
+/// This drives the real seam end to end: a partial removal produces Unusable,
+/// then a SECOND release runs with no further fault injected — deleting only
+/// tracked file `tracked-after.txt` and letting the retry proceed. The result
+/// says which arm the retry actually reached, so the reachability claim rests on
+/// an executed path rather than on reading the match arms.
+#[test]
+fn unusable_state_then_retry_reaches_which_removal_arm_39() {
+    let home = tmp_home("39-retry-arm");
+    let repo = tmp_repo("39-retry-arm-repo");
+    let lease = lease_bound(&home, &repo, "agent-39", "feat/retry-arm");
+
+    let tracked_before = lease.path.join("tracked-before.txt");
+    let tracked_after = lease.path.join("tracked-after.txt");
+    std::fs::write(&tracked_before, b"a\n").expect("seed first tracked file");
+    std::fs::write(&tracked_after, b"b\n").expect("seed second tracked file");
+    git_in(
+        &lease.path,
+        &["add", "tracked-before.txt", "tracked-after.txt"],
+    );
+    git_in(
+        &lease.path,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "seed",
+        ],
+    );
+
+    // Attempt 1: git's walk is killed after unlinking one tracked file, so the
+    // directory survives damaged. This is what writes Unusable.
+    let doomed = tracked_before.clone();
+    let hook1 = release_test_seam::install(move |phase| {
+        if phase == ReleaseTestPhase::BeforeWorktreeRemove {
+            std::fs::remove_file(&doomed).expect("simulate partial git walk");
+            release_test_seam::fail_next_remove(std::io::ErrorKind::TimedOut);
+        }
+    });
+    let first = release_full(&home, "agent-39", false);
+    drop(hook1);
+
+    let after_first = crate::agent::deletion_recovery::read(&home, "agent-39")
+        .expect("readable")
+        .expect("journal present");
+    assert!(
+        matches!(
+            after_first.state,
+            crate::agent::deletion_recovery::State::WorktreeUnusable { .. }
+        ),
+        "precondition: attempt 1 must leave Unusable, got {:?}",
+        after_first.state
+    );
+
+    // Attempt 2: no fault injected. The seam already deleted one tracked file,
+    // so the retry's own tracked-baseline comparison still sees a missing file —
+    // this is what decides the arm, and it is production behaviour, not a
+    // fixture trick: `tracked_path_snapshot` reads the INDEX, which an unlink
+    // does not perturb, so the vanished file is still in the baseline.
+    let second = release_full(&home, "agent-39", false);
+
+    let after_second_opt = crate::agent::deletion_recovery::read(&home, "agent-39")
+        .ok()
+        .flatten();
+    eprintln!(
+        "#39 probe: first.code={:?} first.stage={:?} | second.code={:?} second.stage={:?} \
+         second.worktree_removed={:?} second.released={:?} | journal_after_retry={:?}",
+        first.code,
+        first.stage,
+        second.code,
+        second.stage,
+        second.worktree_removed,
+        second.released,
+        after_second_opt.as_ref().map(|t| format!("{:?}", t.state))
+    );
+    let Some(after_second) = after_second_opt else {
+        // Executed result: the retry SUCCEEDED, so the journal was cleared on the
+        // success path and no RecoveryRequired transition was ever attempted.
+        // Record it and return rather than assert a state that cannot exist here.
+        assert!(
+            second.released && second.worktree_removed,
+            "#39 probe: retry neither succeeded nor left a journal — got {:?}",
+            second
+        );
+        drop(lease);
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+        return;
+    };
+
+    // The load-bearing assertion for #39: the retry must not have laundered the
+    // damage source away.
+    assert!(
+        matches!(
+            after_second.state,
+            crate::agent::deletion_recovery::State::WorktreeUnusable { .. }
+        ),
+        "#39: a retry that fails again must leave the damage source visible, got {:?}",
+        after_second.state
+    );
+    if let (
+        crate::agent::deletion_recovery::State::WorktreeUnusable { cause: before },
+        crate::agent::deletion_recovery::State::WorktreeUnusable { cause: after },
+    ) = (&after_first.state, &after_second.state)
+    {
+        assert_eq!(
+            before, after,
+            "#39: the cause must survive the retry unchanged"
+        );
+    }
+
+    // Record which arm the retry reached, so the reachability claim in the PR
+    // cites an executed result instead of an inspection of the match arms.
+    eprintln!(
+        "#39 reachability probe: first={:?} second_code={:?} second_stage={:?} \
+         second_worktree_removed={:?}",
+        first.code, second.code, second.stage, second.worktree_removed
+    );
+    assert!(
+        second.stage == Some("worktree_remove"),
+        "#39: the retry must fail at the removal stage for this probe to mean \
+         anything, got stage={:?} error={:?}",
+        second.stage,
+        second.error
+    );
+    assert!(
+        !second.worktree_removed,
+        "#39: probe requires the removal NOT to have completed"
+    );
+
+    drop(lease);
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// #39: the case where the guard is actually load-bearing.
+///
+/// The reachability probe showed a retry that succeeds clears the journal on the
+/// success path, so it cannot distinguish guarded from unguarded. This drives the
+/// scenario that does: the `Removed` arm is reached, the recovery state is
+/// written, and then the release is interrupted BEFORE the journal is cleared.
+///
+/// Without the guard, `mark_recovery_required` downgrades `WorktreeUnusable` to
+/// `RecoveryRequired` and erases `cause` — and because the journal then SURVIVES
+/// (the clear never ran), that downgrade is permanent. `binding_state` reports
+/// the operator's only view of the damage source through `worktree_unusable`,
+/// so from then on the damage is invisible. That is the #39 failure this guard
+/// exists to prevent.
+///
+/// Uses the existing `AfterWorktreeRemoveBeforeBindingClear` phase — no new seam.
+#[test]
+fn interruption_after_removed_arm_keeps_the_damage_source_visible_39() {
+    let home = tmp_home("39-guard-loadbearing");
+    let repo = tmp_repo("39-guard-loadbearing-repo");
+    let lease = lease_bound(&home, &repo, "agent-39", "feat/guard");
+
+    let tracked = lease.path.join("tracked.txt");
+    std::fs::write(&tracked, b"committed\n").expect("seed tracked file");
+    git_in(&lease.path, &["add", "tracked.txt"]);
+    git_in(
+        &lease.path,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "seed",
+        ],
+    );
+
+    // Attempt 1: partial removal → Unusable, which is the state at risk.
+    let doomed = tracked.clone();
+    let hook1 = release_test_seam::install(move |phase| {
+        if phase == ReleaseTestPhase::BeforeWorktreeRemove {
+            std::fs::remove_file(&doomed).expect("simulate partial git walk");
+            release_test_seam::fail_next_remove(std::io::ErrorKind::TimedOut);
+        }
+    });
+    release_full(&home, "agent-39", false);
+    drop(hook1);
+
+    let after_first = crate::agent::deletion_recovery::read(&home, "agent-39")
+        .expect("readable")
+        .expect("journal present");
+    let crate::agent::deletion_recovery::State::WorktreeUnusable { cause } =
+        after_first.state.clone()
+    else {
+        panic!(
+            "precondition: attempt 1 must leave Unusable, got {:?}",
+            after_first.state
+        );
+    };
+
+    // Attempt 2: the removal completes (Removed arm), the recovery state is
+    // written, and the daemon dies before the journal is cleared.
+    let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _hook = release_test_seam::install(|phase| {
+            if phase == ReleaseTestPhase::AfterWorktreeRemoveBeforeBindingClear {
+                panic!("simulate daemon interruption before the journal is cleared");
+            }
+        });
+        release_full(&home, "agent-39", false);
+    }));
+    assert!(
+        interrupted.is_err(),
+        "the seam must simulate an interruption"
+    );
+
+    // The journal must SURVIVE the interruption — that is what makes the
+    // difference between guarded and unguarded observable at all.
+    let after_second = crate::agent::deletion_recovery::read(&home, "agent-39")
+        .expect("readable after interruption")
+        .expect("#39: journal must survive — it is only cleared on the success path");
+
+    assert_eq!(
+        after_second.state,
+        crate::agent::deletion_recovery::State::WorktreeUnusable {
+            cause: cause.clone()
+        },
+        "#39: the guard must keep the damage source intact when the release is \
+         interrupted after the Removed arm. Unguarded, this transition erases the \
+         cause AND leaves the downgraded journal behind permanently, so \
+         binding_state stops reporting worktree_unusable."
+    );
+
+    drop(lease);
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}

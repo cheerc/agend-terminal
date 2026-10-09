@@ -176,6 +176,24 @@ pub(crate) fn recover_markerless_bound_worktree(
         );
     }
     if let Some(tombstone) = durable_tombstone.as_ref() {
+        // #39: an Unusable journal was reporting "supplied identity does not match
+        // the delete tombstone", which points an operator at the wrong evidence —
+        // branch/worktree/source_repo all DO match; what differs is the STATE.
+        // Report the real reason and route them at the release lane. This is a
+        // message correction ONLY: the refusal stands, no second exit is opened,
+        // and Unusable stays out of the allowlist above.
+        if matches!(
+            tombstone.state,
+            crate::agent::deletion_recovery::State::WorktreeUnusable { .. }
+        ) {
+            return Err(format!(
+                "recovery refused: the worktree is damaged ({}) and operator recovery does \
+                 not apply. Re-run the release lane (repo action=release) for \
+                 '{}' to finish it; `binding_state` reports worktree_unusable with the \
+                 cause.",
+                tombstone.worktree, instance
+            ));
+        }
         if tombstone.instance != instance
             || !matches!(
                 tombstone.state,
