@@ -943,6 +943,61 @@ impl FleetConfig {
         resolve::resolve_env_value(self, name, destination)
     }
 
+    /// #44: instance names that are about to be given a FRESH id while a live
+    /// handle already holds that name under a different id — the silent
+    /// identity drift that makes `restart_instance` fail closed.
+    ///
+    /// Only the "row has no id at all" case counts. A row that HAS an id which
+    /// disagrees with a live handle is a DIFFERENT state (pre-existing damage,
+    /// or an operator hand-edit) and is deliberately NOT folded in here — #44
+    /// does not explain or repair that, and conflating the two would make this
+    /// guard refuse loads it should not.
+    ///
+    /// Returns `(name, live id)` pairs. Offline contexts publish no registry
+    /// (`get_pending_registry()` is `None`), so the guard is absent there and
+    /// backfill proceeds exactly as before — by definition there is no live
+    /// handle to drift from.
+    /// The conflict-detection core, over an already-resolved set of live
+    /// `(name, id)` pairs.
+    ///
+    /// Detection is separated from the registry read so it is testable without
+    /// publishing the process-global `PENDING_REGISTRY` `OnceLock`. That slot is
+    /// set-once-per-process with no reset, so a test that populated it would
+    /// depend on test ordering and leak into every other test in the binary —
+    /// `agent::tests::pending_registry_publish_and_observe_945` already documents
+    /// that constraint by skipping when the slot is taken. Constructing a real
+    /// `AgentHandle` instead would need a `#[cfg(test)]` seam on
+    /// `crate::agent`, which is a GRANDFATHERED can-shrink-not-grow file.
+    fn id_conflicts_against_live(&self, live: &[(String, String)]) -> Vec<(String, String)> {
+        let idless: std::collections::HashSet<&str> = self
+            .instances
+            .iter()
+            .filter(|(_, entry)| entry.id.is_none())
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if idless.is_empty() {
+            return Vec::new();
+        }
+        live.iter()
+            .filter(|(name, _)| idless.contains(name.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    fn live_handle_id_conflicts(&self) -> Vec<(String, String)> {
+        let Some(registry) = crate::agent::get_pending_registry() else {
+            return Vec::new();
+        };
+        let live: Vec<(String, String)> = {
+            let handles = crate::agent::lock_registry(&registry);
+            handles
+                .values()
+                .map(|handle| (handle.name.to_string(), handle.id.full()))
+                .collect()
+        };
+        self.id_conflicts_against_live(&live)
+    }
+
     /// Get all instance names.
     /// Sprint 46 P1: assign UUIDv4 IDs to instances that lack them.
     /// Writes back to fleet.yaml unless AGEND_FLEET_NO_AUTO_MIGRATE=1.
@@ -988,6 +1043,27 @@ impl FleetConfig {
                 return;
             }
         };
+
+        // #44: check BEFORE taking the fleet flock. The registry lock is a
+        // different tier, and taking it while `mutate_fleet_yaml` holds the flock
+        // is exactly the lock-order shape the repo's ordering invariants forbid.
+        // So the candidate names are collected from the in-memory view first,
+        // and the live-handle read happens here, with no lock held.
+        let conflicts = self.live_handle_id_conflicts();
+        if !conflicts.is_empty() {
+            for (name, live_id) in &conflicts {
+                tracing::error!(
+                    name = %name,
+                    live_id = %live_id,
+                    "#44: refusing to mint a new fleet.yaml id for '{name}' — a live \
+                     handle already holds this name under a different id. The row lost \
+                     its id and the identity would silently drift, breaking \
+                     identity-dependent paths (restart, self-send, inbox routing). \
+                     Restore the row's id, or release the live handle and retry."
+                );
+            }
+            return;
+        }
 
         // Under the flock: re-read disk, assign missing IDs on the fresh
         // view (preserves concurrent peer additions / deletions), write

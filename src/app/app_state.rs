@@ -1590,6 +1590,13 @@ impl AppState {
             return;
         };
         let restart_id = outcome.request.restart_id.clone();
+        let Some(agent_name) = self
+            .remote_restarts
+            .get(&restart_id)
+            .map(|pending| pending.request.name.clone())
+        else {
+            return;
+        };
         let Some(pending) = self.remote_restarts.get_mut(&restart_id) else {
             return;
         };
@@ -1605,11 +1612,57 @@ impl AppState {
             }
             Ok(_) => {
                 self.remote_restarts.remove(&restart_id);
-                tracing::warn!(restart_id = %restart_id, "remote restart identity correlation failed");
+                // #44: a failed correlation must not be silent. Previously both
+                // failure legs only logged, so `:restart` on an instance whose
+                // fleet.yaml identity had drifted looked like a no-op with nothing
+                // but a WARN in the log to explain it.
+                let visible = format!("restart lost its live identity correlation ({restart_id})");
+                tracing::warn!(
+                    restart_id = %restart_id,
+                    error = %visible,
+                    "remote restart identity correlation failed"
+                );
+                self.show_restart_failure(&agent_name, &visible);
             }
             Err(error) => {
-                tracing::warn!(restart_id = %restart_id, error = %error, "remote restart failed");
                 self.remote_restarts.remove(&restart_id);
+                // #44: surface the reason on the pane. `restart_instance` fails
+                // closed with `restart_identity_unavailable` when fleet.yaml and
+                // the registry disagree on the id, and that was previously
+                // invisible in the TUI — exactly #44's reported symptom.
+                let visible = format!("restart failed: {error}");
+                tracing::warn!(
+                    restart_id = %restart_id,
+                    error = %error,
+                    "remote restart failed"
+                );
+                self.show_restart_failure(&agent_name, &visible);
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// #44: publish a restart failure where the operator can see it. Attached
+    /// remote panes carry the text through the existing `restart_error` surface;
+    /// a name-only local pane gets the same text so the failure is never log-only.
+    fn show_restart_failure(&mut self, name: &str, error: &str) {
+        let located = self.ui.layout.find_agent_pane(name);
+        for tab_index in 0..self.ui.layout.tabs.len() {
+            let pane_ids = self.ui.layout.tabs[tab_index].root().pane_ids();
+            for pane_id in pane_ids {
+                let is_target = located == Some((tab_index, pane_id))
+                    || self.ui.layout.tabs[tab_index]
+                        .root()
+                        .find_pane(pane_id)
+                        .is_some_and(|pane| pane.agent_name.as_str() == name);
+                if is_target {
+                    if let Some(pane) = self.ui.layout.tabs[tab_index]
+                        .root_mut()
+                        .find_pane_mut(pane_id)
+                    {
+                        pane.set_restart_error(error);
+                    }
+                }
             }
         }
         self.dirty = true;

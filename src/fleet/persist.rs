@@ -366,7 +366,26 @@ pub fn remove_instances_from_yaml(home: &Path, names: &[String]) -> Result<()> {
     mutate_fleet_yaml(home, "", |doc| {
         if let Some(instances) = doc.get_mut("instances").and_then(|v| v.as_mapping_mut()) {
             for name in names {
-                instances.remove(serde_yaml_ng::Value::String(name.clone()));
+                // #44: this removal is how a live instance's row can disappear
+                // without its id being carried anywhere, so a later re-add mints a
+                // fresh UUID while the live handle still holds the old one. The
+                // single-instance sibling already logs; this batch form did not,
+                // which is why #44 had no log line naming the operation that
+                // stripped an id.
+                let key = serde_yaml_ng::Value::String(name.clone());
+                let carried_id = instances
+                    .get(&key)
+                    .and_then(|entry| entry.get("id"))
+                    .and_then(serde_yaml_ng::Value::as_str)
+                    .map(str::to_string);
+                let removed = instances.remove(&key).is_some();
+                tracing::warn!(
+                    name = %name,
+                    removed,
+                    had_id = %carried_id.as_deref().unwrap_or("<none>"),
+                    "#44: removed fleet.yaml row in batch — a re-add of this name must \
+                     restore its id, or the live handle's identity will drift"
+                );
             }
         }
         Ok(true)
@@ -393,7 +412,23 @@ pub fn remove_instances_from_yaml_for_generation(
                     .and_then(serde_yaml_ng::Value::as_str)
                     == Some(*generation);
                 if owned {
+                    // #44: generation-scoped removal, same hazard as the
+                    // name-only batch form — record whether the row actually
+                    // disappeared and whether it carried an id, so the next
+                    // occurrence is diagnosable from logs rather than inferred.
+                    let carried_id = instances
+                        .get(&key)
+                        .and_then(|entry| entry.get("id"))
+                        .and_then(serde_yaml_ng::Value::as_str)
+                        .map(str::to_string);
                     instances.remove(&key);
+                    tracing::warn!(
+                        name = %name,
+                        generation = %generation,
+                        had_id = %carried_id.as_deref().unwrap_or("<none>"),
+                        "#44: removed generation-owned fleet.yaml row — a re-add of \
+                         this name must restore its id"
+                    );
                 } else if instances.contains_key(&key) {
                     preserved.push((*name).to_string());
                 }

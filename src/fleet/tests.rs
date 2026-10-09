@@ -2623,3 +2623,141 @@ instances:
     fs::remove_dir_all(&dir).ok();
     fs::remove_dir_all(&dir2).ok();
 }
+
+/// #44 reproduction: removing a live instance's fleet.yaml row and re-adding it
+/// through the production entry-construction path produces an entry with NO
+/// `id`, which the next `FleetConfig::load` backfills to a FRESH UUID — while the
+/// runtime registry handle still holds the original. That divergence is exactly
+/// what makes `restart_instance` fail closed with `restart_identity_unavailable`.
+///
+/// This test drives the two real production helpers in sequence — no hand-edited
+/// YAML, no simulated state — so its result is evidence about the product, not
+/// about the fixture. It was written as the RED reproduction and still is: it is
+/// what proved the teardown/re-add mechanism real rather than hypothesised. The
+/// final assertion now pins the REMAINING offline residual (see below).
+#[test]
+fn offline_remove_re_add_mints_a_fresh_id_44() {
+    let home = tmp_home_962("re-add-44");
+    let name = "drifted";
+    let original_id = "b e1 93903-b28f-4a30-a3e8-9a77b4555f87".replace(' ', "");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  {name}:\n    backend: claude\n    id: {original_id}\n    \
+             deployment_generation: gen-1\n"
+        ),
+    )
+    .expect("plant fleet.yaml with a known id");
+
+    // Precondition: the live row really carries the id we will compare against.
+    let before: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+        &std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).unwrap(),
+    )
+    .expect("parse fleet.yaml before");
+    assert_eq!(
+        before["instances"][name]["id"].as_str(),
+        Some(original_id.as_str()),
+        "precondition: the live row must start with a known id"
+    );
+
+    // The production removal path, then the production re-add path.
+    remove_instances_from_yaml(&home, &[name.to_string()]).expect("remove instance row");
+    let entry = InstanceYamlEntry {
+        backend: Some("claude".to_string()),
+        deployment_generation: Some("gen-1".to_string()),
+        ..Default::default()
+    };
+    add_instances_to_yaml(&home, &[(name, &entry)]).expect("re-add instance row");
+
+    // RESIDUAL, pinned deliberately rather than asserted as fixed: this is the
+    // OFFLINE shape, and the approved guard is registry-aware by construction —
+    // with no published registry there is no live handle to drift FROM, so the
+    // backfill proceeds and mints a fresh id. That is correct for a genuinely
+    // offline teardown/re-deploy, so this cannot be asserted equal.
+    //
+    // What this pins is that the residual is BOUNDED and DOCUMENTED: it is
+    // reachable only where no live handle exists, and #44's online case is
+    // covered by `id_conflict_detected_when_a_live_handle_owns_an_idless_row_44`.
+    // If a future change makes the drift reachable WITH a live handle present,
+    // this test's precondition (no registry published) must stop holding, and
+    // that is the signal to re-open the issue rather than update this assertion.
+    let assigned = resolve_uuid(&home, name)
+        .expect("instance still resolves after the backfill load")
+        .full();
+    assert_ne!(
+        assigned, original_id,
+        "#44 residual: the offline remove/re-add path still mints a fresh id. If \
+         this assertion ever needs inverting, the offline guard's premise changed."
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #44 (1) guard: an instance row that lost its `id` must NOT be silently
+/// re-minted while a live handle already holds that name under a different id —
+/// that divergence is what makes `restart_instance` fail closed.
+///
+/// Detection is driven with an already-resolved live `(name, id)` set rather
+/// than a real registry: `PENDING_REGISTRY` is a set-once `OnceLock` with no
+/// reset, and `crate::agent` is a GRANDFATHERED file that cannot take a new
+/// `#[cfg(test)]` seam. Both constraints are noted at the function under test.
+#[test]
+fn id_conflict_detected_when_a_live_handle_owns_an_idless_row_44() {
+    let name = "drifted";
+    let live_id = crate::types::InstanceId::new().full();
+    let config: FleetConfig =
+        serde_yaml_ng::from_str(&format!("instances:\n  {name}:\n    backend: claude\n"))
+            .expect("parse fleet with an idless row");
+
+    // Precondition: with no live handle, there is nothing to drift from.
+    assert!(
+        config.id_conflicts_against_live(&[]).is_empty(),
+        "precondition: no live handle means no conflict"
+    );
+
+    let conflicts = config.id_conflicts_against_live(&[(name.to_string(), live_id.clone())]);
+    assert_eq!(
+        conflicts,
+        vec![(name.to_string(), live_id)],
+        "#44 RED: an idless row whose name is held by a live handle must be \
+         detected before a fresh id is minted"
+    );
+}
+
+/// The guard must NOT fire for a row that HAS an id, even when a live handle
+/// disagrees. #44 does not explain or repair that state (it may be pre-existing
+/// damage or an operator hand-edit), and folding it in would make the guard
+/// refuse loads it should not — the brief called this distinction out explicitly.
+#[test]
+fn no_conflict_when_the_row_already_carries_an_id_44() {
+    let name = "intact";
+    let row_id = crate::types::InstanceId::new().full();
+    let config: FleetConfig = serde_yaml_ng::from_str(&format!(
+        "instances:\n  {name}:\n    backend: claude\n    id: {row_id}\n"
+    ))
+    .expect("parse fleet with an identified row");
+    let other_id = crate::types::InstanceId::new().full();
+
+    assert!(
+        config
+            .id_conflicts_against_live(&[(name.to_string(), other_id)])
+            .is_empty(),
+        "#44: a row that carries an id is a DIFFERENT state from drift; the guard \
+         must not conflate them"
+    );
+}
+
+/// #44 (1): the offline shape — the conflict set is empty because no live
+/// handle exists — must leave a genuinely id-less row free to be backfilled, or
+/// the guard would break legitimate fresh deploys.
+#[test]
+fn no_live_handles_leaves_an_idless_row_eligible_for_backfill_44() {
+    let name = "fresh";
+    let config: FleetConfig =
+        serde_yaml_ng::from_str(&format!("instances:\n  {name}:\n    backend: claude\n"))
+            .expect("parse fleet with an idless row");
+    assert!(
+        config.id_conflicts_against_live(&[]).is_empty(),
+        "#44: offline / no-live-handle must not be blocked — that is the legitimate \
+         fresh-deploy case"
+    );
+}
