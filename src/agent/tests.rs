@@ -6941,3 +6941,84 @@ fn pty_read_loop_dev_modal_dismissed_even_if_in_cooldown_after_idle_3616() {
         "PR #3616 F2: dev modal arriving in cooldown past idle must retry upon cooldown expiry even without subsequent PTY output"
     );
 }
+
+/// #39 (a): `spawn_agent`'s #1915 refusal is the chokepoint every restart,
+/// crash-respawn and direct-spawn path surfaces. Its message named the
+/// chokepoint but never the fence's on-disk home, so an agent (and the operator
+/// reading its transcript) had no way to learn that a durable journal — not a
+/// live delete — was the thing refusing the spawn.
+///
+/// The message must name the exact journal file plus both recovery routes, so
+/// the refusal is self-diagnosing instead of requiring source archaeology.
+#[test]
+fn spawn_refusal_names_the_journal_path_and_recovery_routes_39() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static C: AtomicU32 = AtomicU32::new(0);
+    let home = std::env::temp_dir().join(format!(
+        "agend-spawn-guidance-39-{}-{}",
+        std::process::id(),
+        C.fetch_add(1, Ordering::Relaxed)
+    ));
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    // The DURABLE fence (survives a daemon restart) — the half that produced the
+    // incident and the half with no log line of its own.
+    std::fs::create_dir_all(home.join("deletion-recovery")).expect("create journal dir");
+    std::fs::write(
+        home.join("deletion-recovery").join("victim.json"),
+        serde_json::json!({
+            "schema_version": 1,
+            "state": "deleting",
+            "instance": "victim",
+            "branch": "feat/victim",
+            "worktree": home.join("worktrees").join("victim").display().to_string(),
+            "source_repo": home.join("src").display().to_string(),
+            "binding_sha256": "0".repeat(64),
+            "binding_signature_sha256": "0".repeat(64),
+            "archive": null,
+        })
+        .to_string(),
+    )
+    .expect("seed durable deletion journal");
+
+    assert!(
+        crate::agent::deleting::is_deleting(&home, "victim"),
+        "precondition: a Deleting journal must fence the spawn"
+    );
+
+    let cfg = SpawnConfig {
+        name: "victim",
+        backend: None,
+        backend_command: "true",
+        args: &[],
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: None,
+        working_dir: None,
+        submit_key: "\r",
+        home: Some(&home),
+        crash_tx: None,
+        shutdown: None,
+    };
+    let err = match spawn_agent(&cfg, &registry) {
+        Ok(_) => panic!("#39: a journal-fenced spawn must be refused, got Ok"),
+        Err(e) => format!("{e}"),
+    };
+    assert!(
+        err.contains("mid-delete") || err.contains("#1915"),
+        "refusal should still name the chokepoint, got: {err}"
+    );
+    assert!(
+        err.contains("deletion-recovery/victim.json"),
+        "#39: the refusal must name the exact journal file: {err}"
+    );
+    assert!(
+        err.contains("binding_state") && err.contains("recover-worktree"),
+        "#39: the refusal must name both recovery routes: {err}"
+    );
+    assert!(
+        registry.lock().is_empty(),
+        "#39: guidance text must not change the zero-side-effect verdict"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

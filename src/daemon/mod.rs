@@ -1939,9 +1939,17 @@ fn spawn_and_register_agent(
     // fleet.yaml entry; this deleting-set check covers the in-flight teardown
     // (entry not yet removed). Leaf-lock check, no registry lock held.
     if crate::agent::deleting::is_deleting(home, name) {
+        // #39: a skip line is the ONLY thing an operator sees when an instance
+        // never boots, and it used to name neither the fence nor a way out — the
+        // diagnosis had to be reverse-engineered from the log text. Name the exact
+        // journal file, and the two routes that either inspect or clear it. The
+        // `#39 journal path:` prefix is the greppable handle.
         tracing::info!(
             agent = %name,
-            "skipping spawn — instance is mid-delete (#1915 deleting-set chokepoint)"
+            journal = %crate::agent::deletion_recovery::path(home, name).display(),
+            "skipping spawn — instance is mid-delete (#1915 deleting-set chokepoint); \
+             #39 journal path: see the `journal` field. Inspect with `binding_state`; \
+             finish or inspect the release with `agend-terminal admin recover-worktree`"
         );
         return Ok(());
     }

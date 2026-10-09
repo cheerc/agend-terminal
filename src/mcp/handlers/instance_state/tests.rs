@@ -2124,3 +2124,64 @@ fn restart_report_carries_tui_handoff_false_when_spawn_fails() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// #39 (a): a delete refused because a durable recovery fence already exists
+/// used to name only the condition. That refusal is the operator's dead end in
+/// the #39 incident — `recover-worktree` ALSO refuses while the managed marker
+/// survives — so the error is the single place that can point at the three
+/// things worth trying next.
+///
+/// The message must name the journal file plus both inspection/recovery routes,
+/// and must NOT change the refusal itself.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn delete_refusal_over_pending_tombstone_names_journal_and_routes_39() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = tmp_home_for_create_instance_team("delete-guidance-39");
+    let instance = "delete-guidance";
+
+    // A pending (non-Recovered) tombstone is exactly what the check trips on.
+    std::fs::create_dir_all(home.join("deletion-recovery")).unwrap();
+    let journal = home
+        .join("deletion-recovery")
+        .join(format!("{instance}.json"));
+    std::fs::write(
+        &journal,
+        serde_json::json!({
+            "schema_version": 1,
+            "state": "deleting",
+            "instance": instance,
+            "branch": "feat/pending",
+            "worktree": home.join("worktrees").join(instance).display().to_string(),
+            "source_repo": home.join("source-repo").display().to_string(),
+            "binding_sha256": "0".repeat(64),
+            "binding_signature_sha256": "0".repeat(64),
+            "archive": null,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let refused = handle_delete_instance(&home, &serde_json::json!({"instance": instance}), &None);
+    let error = refused["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a refusal error, got {refused}"));
+
+    assert!(
+        error.contains("pending delete tombstone"),
+        "#39: the refusal condition must still be stated: {error}"
+    );
+    assert!(
+        error.contains(&format!("deletion-recovery/{instance}.json")),
+        "#39: the refusal must name the exact journal file: {error}"
+    );
+    assert!(
+        error.contains("binding_state") && error.contains("recover-worktree"),
+        "#39: the refusal must name both inspection and recovery routes: {error}"
+    );
+    assert!(
+        journal.exists(),
+        "#39: guidance text must not settle the journal it points at"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
