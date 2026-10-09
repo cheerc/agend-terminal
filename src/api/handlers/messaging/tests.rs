@@ -5428,6 +5428,62 @@ fn non_verified_receipt_carries_no_auto_close_projection_8() {
     }
 }
 
+/// #8: the receipt's close is disclosed on BOTH outcomes, not only the happy
+/// one. A VERIFIED receipt whose task was never claimed by the reviewer cannot
+/// close it (`auto_close` skips a non-assignee), which used to be a silent
+/// no-op. The caller must now see `closed: false` WITH the evidence that proved
+/// the verdict, so it knows the board row did not move.
+#[test]
+fn validated_receipt_that_cannot_close_is_still_disclosed_8() {
+    let home = tmp_home("8-receipt-no-close");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    write_typed_review_fleet(&home, reviewer_id, crate::types::InstanceId::new());
+    let assignment = seed_typed_review_subject(&home, reviewer_id);
+    // Claimed by someone OTHER than the reviewer: the validated receipt is still
+    // delivered and ingested, but the close is skipped (non-assignee).
+    seed_review_task(&home, "t-code-review-2760", "someone-else");
+
+    let ctx = test_ctx(&home);
+    let result = handle_send(
+        &typed_review_params(assignment.assignment_id, "verified", "VERIFIED"),
+        &ctx,
+    );
+
+    assert_eq!(result["ok"], true, "the verdict still delivers: {result}");
+    let outcome = &result["auto_close"];
+    assert_eq!(
+        outcome["closed"], false,
+        "a non-assignee row must not close: {result}"
+    );
+    assert_eq!(
+        outcome["code"].as_str(),
+        Some("review_receipt_auto_close_skipped"),
+        "a skipped close must be distinguishable from a silent no-op: {result}"
+    );
+    assert_eq!(
+        outcome["task_id"].as_str(),
+        Some("t-code-review-2760"),
+        "{result}"
+    );
+    assert_eq!(
+        outcome["evidence_locator"]["assignment_id"].as_str(),
+        Some(assignment.assignment_id.to_string().as_str()),
+        "the locator is what makes this answer checkable: {result}"
+    );
+    assert!(
+        !outcome["reason"].as_str().unwrap_or_default().is_empty(),
+        "{result}"
+    );
+    assert_eq!(
+        task_status_of(&home, "t-code-review-2760"),
+        Some(crate::task_events::TaskStatus::Claimed),
+        "the row must not have moved"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// Control (green before and after): the ordinary `terminal: true` report path
 /// keeps its #3293 shape exactly. The new receipt path must not add its code,
 /// task id, or evidence locator onto the settlement projection.

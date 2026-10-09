@@ -153,6 +153,23 @@ Report task results or review conclusions. Typically paired with `correlation_id
 | `reviewed_head` | Git HEAD SHA at review time |
 | `ack_inbox` | With `true`, atomically acknowledge the reporter's delivering messages for this `correlation_id` after the send succeeds |
 
+**#8 — the response reports what it actually closed.** A `report` can close its
+task by two independent authorities, and both are disclosed in the same
+`auto_close` object:
+
+| Authority | Trigger | Codes |
+|---|---|---|
+| Requested settlement | `terminal: true` on a correlated report | (none) on success, `assignee_completion_blocked`, `settlement_not_applicable` |
+| Typed review receipt | `report_purpose: code_review` with a validated `VERIFIED` receipt — no `terminal` needed | `review_receipt_auto_closed`, `review_receipt_auto_close_skipped`, `review_receipt_auto_close_failed` |
+
+A validated receipt carries its own authority (assignment id, exact task,
+reviewer identity, reviewed head, evidence digest), so it closes its review task
+regardless of `terminal`. Its outcomes also carry `task_id` and an
+`evidence_locator` (`assignment_id`, `reviewed_head`, `verdict`) so the reviewer
+can see which row moved and prove why. Before #8 that close was invisible: the
+response was byte-identical to one that had done nothing, so reviewers went on
+to call `task update → done` and hit `illegal_transition`.
+
 ### update — Status Updates
 
 Informational messages that don't require a reply.

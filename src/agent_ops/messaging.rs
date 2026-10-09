@@ -41,6 +41,24 @@ pub(crate) struct SettlementOutcome {
     pub(crate) code: Option<&'static str>,
     pub(crate) reason: Option<String>,
     pub(crate) closure_condition: Option<&'static str>,
+    /// #8: the task this outcome actually closed, when the close came from a
+    /// typed review receipt. A receipt names its own exact task, so the caller
+    /// never has to guess which row moved.
+    pub(crate) task_id: Option<String>,
+    /// #8: the evidence identity that WAS completion authority — the validated
+    /// receipt's own assignment / head / verdict, so a reviewer can prove what
+    /// closed the task instead of trusting a bare `closed: true`.
+    pub(crate) evidence_locator: Option<ReviewEvidenceLocator>,
+}
+
+/// #8: the already-validated receipt's own identity, projected to the reporter.
+/// Every field here was proven by `authorize_report` before the close ran, so
+/// none of it is caller-supplied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReviewEvidenceLocator {
+    pub(crate) assignment_id: String,
+    pub(crate) reviewed_head: String,
+    pub(crate) verdict: &'static str,
 }
 
 /// What would permit closure after the completion guard refused. Kept as one
@@ -61,6 +79,56 @@ impl SettlementOutcome {
             code: None,
             reason: None,
             closure_condition: None,
+            task_id: None,
+            evidence_locator: None,
+        }
+    }
+
+    /// #8: the typed review receipt's own close. A distinct code from the
+    /// ordinary `terminal` settlement so a caller can tell WHICH authority
+    /// closed the task: here it was a validated receipt (assignment id, exact
+    /// task, reviewer identity, reviewed head/evidence), not a `terminal: true`
+    /// request. That distinction matters because a receipt closes without
+    /// `terminal` ever being set — the reviewer asked for nothing and got this.
+    fn review_receipt_closed(locator: ReviewEvidenceLocator, task_id: String) -> Self {
+        Self {
+            closed: true,
+            code: Some("review_receipt_auto_closed"),
+            reason: None,
+            closure_condition: None,
+            task_id: Some(task_id),
+            evidence_locator: Some(locator),
+        }
+    }
+
+    /// #8: a VERIFIED receipt was validated but did NOT close its task. Still
+    /// `closed: false`, still the receipt's evidence — a silent success-shaped
+    /// response is precisely what #8 removes.
+    fn review_receipt_not_closed(locator: ReviewEvidenceLocator, task_id: String) -> Self {
+        Self {
+            closed: false,
+            code: Some("review_receipt_auto_close_skipped"),
+            reason: Some("the validated receipt did not close its exact task; the task is still open, so the verdict lives only in the delivered report".into()),
+            closure_condition: Some(DONE_GUARD_CLOSURE_CONDITION),
+            task_id: Some(task_id),
+            evidence_locator: Some(locator),
+        }
+    }
+
+    /// #8: the receipt's close FAILED out of band. The reviewer's verdict was
+    /// delivered regardless; this says the board row did not move.
+    fn review_receipt_failed(
+        locator: ReviewEvidenceLocator,
+        task_id: String,
+        reason: String,
+    ) -> Self {
+        Self {
+            closed: false,
+            code: Some("review_receipt_auto_close_failed"),
+            reason: Some(reason),
+            closure_condition: Some(DONE_GUARD_CLOSURE_CONDITION),
+            task_id: Some(task_id),
+            evidence_locator: Some(locator),
         }
     }
 
@@ -73,6 +141,8 @@ impl SettlementOutcome {
             code: Some("settlement_not_applicable"),
             reason: None,
             closure_condition: None,
+            task_id: None,
+            evidence_locator: None,
         }
     }
 
@@ -82,6 +152,8 @@ impl SettlementOutcome {
             code: Some("assignee_completion_blocked"),
             reason: Some(reason),
             closure_condition: Some(DONE_GUARD_CLOSURE_CONDITION),
+            task_id: None,
+            evidence_locator: None,
         }
     }
 }
@@ -860,7 +932,7 @@ pub(crate) fn track_dispatch(
                 }
             }
         }
-        bridge_verdict_to_review_task(home, from, msg);
+        bridge_verdict_to_review_task(home, from, msg, &mut settlement);
     } else if matches!(kind_str, "update" | "query") {
         if let Some(corr) = msg.correlation_id.as_deref().or(msg.task_id.as_deref()) {
             let _ = crate::daemon::dispatch_idle::refresh_issued_at(home, corr, from);
@@ -869,7 +941,28 @@ pub(crate) fn track_dispatch(
     settlement
 }
 
-fn bridge_verdict_to_review_task(home: &Path, reporter: &str, msg: &crate::inbox::InboxMessage) {
+/// #8: bridge a validated verdict to its exact review task, and ANSWER the
+/// reporter when that bridge closed the task.
+///
+/// The close itself is pre-existing behavior and unchanged: a VERIFIED receipt is
+/// completion authority on its own, without any `terminal: true` request. What
+/// was missing was the answer — the `send` response stayed byte-identical to one
+/// that closed nothing, so the reviewer could not tell "the board agreed with
+/// me" from "nothing happened", then tried `task update → done` and collected
+/// `illegal_transition`. So the close result and the receipt's own evidence
+/// identity are written into the caller's settlement outcome.
+///
+/// A receipt close always fills `settlement` — even when `settlement` already
+/// holds the ordinary `terminal` outcome — because the caller is owed the receipt
+/// disclosure and the two authorities are not the same fact. When both fired,
+/// the receipt wins `settlement`: it names the exact task it closed, so the
+/// caller learns WHICH row moved.
+fn bridge_verdict_to_review_task(
+    home: &Path,
+    reporter: &str,
+    msg: &crate::inbox::InboxMessage,
+    settlement: &mut Option<SettlementOutcome>,
+) {
     let Some(receipt) = msg.validated_code_review.as_ref() else {
         return;
     };
@@ -892,11 +985,46 @@ fn bridge_verdict_to_review_task(home: &Path, reporter: &str, msg: &crate::inbox
         match crate::tasks::auto_close::auto_close_on_validated_review(
             home, task_id, reporter, &msg.text,
         ) {
-            Ok(true) => {}
-            Ok(false) => tracing::warn!(%reporter, %task_id,
-                "validated review receipt did not close its exact task"),
-            Err(error) => tracing::warn!(%reporter, %task_id, %error,
-                "validated review task auto-close failed"),
+            Ok(true) => {
+                *settlement = Some(SettlementOutcome::review_receipt_closed(
+                    ReviewEvidenceLocator {
+                        assignment_id: summary.assignment_id.to_string(),
+                        reviewed_head: summary.reviewed_head.clone(),
+                        verdict: "verified",
+                    },
+                    task_id.clone(),
+                ));
+            }
+            Ok(false) => {
+                tracing::warn!(%reporter, %task_id,
+                    "validated review receipt did not close its exact task");
+                // #8: a VERIFIED receipt that did NOT close leaves the caller in
+                // exactly the state this fix exists to end. Project that too,
+                // rather than let the response read like a silent no-op.
+                *settlement = Some(SettlementOutcome::review_receipt_not_closed(
+                    ReviewEvidenceLocator {
+                        assignment_id: summary.assignment_id.to_string(),
+                        reviewed_head: summary.reviewed_head.clone(),
+                        verdict: "verified",
+                    },
+                    task_id.clone(),
+                ));
+            }
+            Err(error) => {
+                tracing::warn!(%reporter, %task_id, %error,
+                    "validated review task auto-close failed");
+                // Same reasoning as `Ok(false)`: a close that failed out of band
+                // must not be indistinguishable from one that succeeded.
+                *settlement = Some(SettlementOutcome::review_receipt_failed(
+                    ReviewEvidenceLocator {
+                        assignment_id: summary.assignment_id.to_string(),
+                        reviewed_head: summary.reviewed_head.clone(),
+                        verdict: "verified",
+                    },
+                    task_id.clone(),
+                    error.to_string(),
+                ));
+            }
         }
     }
 }

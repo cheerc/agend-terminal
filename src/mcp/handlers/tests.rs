@@ -5378,7 +5378,11 @@ fn mcp_verified_review_receipt_projects_auto_close_8() {
         Some("review_receipt_auto_closed"),
         "{result}"
     );
-    assert_eq!(outcome["task_id"].as_str(), Some("t-8-mcp-review"), "{result}");
+    assert_eq!(
+        outcome["task_id"].as_str(),
+        Some("t-8-mcp-review"),
+        "{result}"
+    );
     assert_eq!(
         outcome["evidence_locator"]["assignment_id"].as_str(),
         Some(assignment.assignment_id.to_string().as_str()),
