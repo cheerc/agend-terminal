@@ -36,6 +36,18 @@ fn settlement_json(settlement: &crate::agent_ops::messaging::SettlementOutcome) 
     if let Some(condition) = settlement.closure_condition {
         value["closure_condition"] = json!(condition);
     }
+    // #8: only a typed review receipt carries these, so an ordinary `terminal`
+    // settlement keeps its #3293 shape exactly.
+    if let Some(task_id) = &settlement.task_id {
+        value["task_id"] = json!(task_id);
+    }
+    if let Some(locator) = &settlement.evidence_locator {
+        value["evidence_locator"] = json!({
+            "assignment_id": locator.assignment_id,
+            "reviewed_head": locator.reviewed_head,
+            "verdict": locator.verdict,
+        });
+    }
     value
 }
 

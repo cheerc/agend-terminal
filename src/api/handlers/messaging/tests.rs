@@ -5260,3 +5260,333 @@ fn non_terminal_report_omits_settlement_outcome_3293() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── #8: a validated VERIFIED receipt's auto-close must reach its own sender ──
+//
+// #3293 disclosed the settlement outcome for the `terminal: true` REPORT path.
+// A typed review receipt closes its exact review task on a DIFFERENT path —
+// `bridge_verdict_to_review_task` calls `auto_close_on_validated_review` without
+// consulting `terminal`, because the receipt (assignment id, exact task,
+// reviewer identity, reviewed head/evidence) is already validated authority.
+// That close ran out of band: the `send` response stayed byte-identical to one
+// that closed nothing, so the reviewer believed the board agreed with it and
+// then tried `task update → done`, which `done → done` refuses.
+//
+// These drive the REAL API SEND entry with a REAL persisted typed assignment
+// (not a hand-built receipt), because the whole defect lives in what the
+// response does or does not carry.
+
+/// The reviewer's own close is disclosed, with the evidence identity the typed
+/// receipt actually proved — never merely "closed: true".
+#[test]
+fn validated_verified_receipt_auto_close_is_disclosed_to_the_sender_8() {
+    let home = tmp_home("8-verified-auto-close");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    write_typed_review_fleet(&home, reviewer_id, crate::types::InstanceId::new());
+    let assignment = seed_typed_review_subject(&home, reviewer_id);
+    seed_review_task(&home, "t-code-review-2760", "typed-reviewer");
+
+    let ctx = test_ctx(&home);
+    let result = handle_send(
+        &typed_review_params(assignment.assignment_id, "verified", "VERIFIED"),
+        &ctx,
+    );
+
+    assert_eq!(result["ok"], true, "delivery must still succeed: {result}");
+    let outcome = &result["auto_close"];
+    assert!(
+        outcome.is_object(),
+        "the validated receipt closed a task; its own reporter must be told: {result}"
+    );
+    assert_eq!(
+        outcome["closed"], true,
+        "an exact validated receipt IS completion authority: {result}"
+    );
+    assert_eq!(
+        outcome["code"].as_str(),
+        Some("review_receipt_auto_closed"),
+        "the projection must name the path that closed it: {result}"
+    );
+    assert_eq!(
+        outcome["task_id"].as_str(),
+        Some("t-code-review-2760"),
+        "the closed task must be identified, not guessed: {result}"
+    );
+    // The locator is the receipt's OWN validated evidence identity, read back
+    // out of the delivered row — not a hand-written constant (CLAUDE.md §Test
+    // fidelity).
+    let delivered = crate::inbox::drain(&home, "fixup-lead");
+    let receipt = delivered
+        .first()
+        .and_then(|msg| msg.validated_code_review.as_ref())
+        .expect("typed receipt on the delivered row")
+        .summary()
+        .clone();
+    assert_eq!(
+        outcome["evidence_locator"]["assignment_id"].as_str(),
+        Some(receipt.assignment_id.to_string().as_str()),
+        "the assignment id must be the receipt's, read back from the producer: {result}"
+    );
+    assert_eq!(
+        outcome["evidence_locator"]["reviewed_head"].as_str(),
+        Some(receipt.reviewed_head.as_str()),
+        "{result}"
+    );
+    assert_eq!(
+        outcome["evidence_locator"]["verdict"].as_str(),
+        Some("verified"),
+        "{result}"
+    );
+
+    assert_eq!(
+        task_status_of(&home, "t-code-review-2760"),
+        Some(crate::task_events::TaskStatus::Done),
+        "the close itself is pre-existing behavior and must not change"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #8 step 2, control (green before and after): projecting the close must not
+/// cost the verdict anything. The full report body and the validated receipt
+/// still reach the lead, and the typed PR state still ingests the receipt — the
+/// projection only ADDS an answer to the sender's own question.
+#[test]
+fn validated_receipt_projection_does_not_lose_the_verdict_8() {
+    let home = tmp_home("8-verdict-survives");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    write_typed_review_fleet(&home, reviewer_id, crate::types::InstanceId::new());
+    let assignment = seed_typed_review_subject(&home, reviewer_id);
+    seed_review_task(&home, "t-code-review-2760", "typed-reviewer");
+
+    let ctx = test_ctx(&home);
+    let params = typed_review_params(assignment.assignment_id, "verified", "VERIFIED");
+    let body = params["text"].as_str().expect("report body").to_string();
+    let result = handle_send(&params, &ctx);
+    assert_eq!(result["ok"], true, "{result}");
+
+    let delivered = crate::inbox::drain(&home, "fixup-lead");
+    assert_eq!(delivered.len(), 1, "one durable report row");
+    assert_eq!(
+        delivered[0].text, body,
+        "the whole verdict body must still be delivered, unshortened by the projection"
+    );
+    let receipt = delivered[0]
+        .validated_code_review
+        .as_ref()
+        .expect("typed receipt still attached")
+        .summary();
+    assert_eq!(receipt.assignment_id, assignment.assignment_id);
+
+    let state = crate::daemon::pr_state::load(&home, "owner/repo", "fix/typed").unwrap();
+    assert_eq!(
+        state.validated_review_receipts.len(),
+        1,
+        "PR state must still ingest the receipt exactly once"
+    );
+    assert!(
+        crate::daemon::pr_state::is_merge_ready(&state),
+        "a single VERIFIED receipt must still satisfy the merge gate"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A verdict that closed nothing must not borrow the disclosure. REJECTED and
+/// UNVERIFIED receipts take the same `bridge_verdict_to_review_task` route but
+/// never auto-close, so the response must stay exactly as it is at this head.
+#[test]
+fn non_verified_receipt_carries_no_auto_close_projection_8() {
+    for verdict in ["rejected", "unverified"] {
+        let home = tmp_home(&format!("8-non-verified-{verdict}"));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let reviewer_id = crate::types::InstanceId::new();
+        write_typed_review_fleet(&home, reviewer_id, crate::types::InstanceId::new());
+        let assignment = seed_typed_review_subject(&home, reviewer_id);
+        seed_review_task(&home, "t-code-review-2760", "typed-reviewer");
+
+        let ctx = test_ctx(&home);
+        let result = handle_send(
+            &typed_review_params(assignment.assignment_id, verdict, &verdict.to_uppercase()),
+            &ctx,
+        );
+
+        assert_eq!(result["ok"], true, "{verdict}: {result}");
+        assert!(
+            result.get("auto_close").is_none(),
+            "{verdict}: nothing auto-closed, so nothing may be reported: {result}"
+        );
+        assert_eq!(
+            task_status_of(&home, "t-code-review-2760"),
+            Some(crate::task_events::TaskStatus::Claimed),
+            "{verdict}: a non-verified receipt must not close its task"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
+
+/// #8: the receipt's close is disclosed on BOTH outcomes, not only the happy
+/// one. A VERIFIED receipt whose task was never claimed by the reviewer cannot
+/// close it (`auto_close` skips a non-assignee), which used to be a silent
+/// no-op. The caller must now see `closed: false` WITH the evidence that proved
+/// the verdict, so it knows the board row did not move.
+#[test]
+fn validated_receipt_that_cannot_close_is_still_disclosed_8() {
+    let home = tmp_home("8-receipt-no-close");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    write_typed_review_fleet(&home, reviewer_id, crate::types::InstanceId::new());
+    let assignment = seed_typed_review_subject(&home, reviewer_id);
+    // Claimed by someone OTHER than the reviewer: the validated receipt is still
+    // delivered and ingested, but the close is skipped (non-assignee).
+    seed_review_task(&home, "t-code-review-2760", "someone-else");
+
+    let ctx = test_ctx(&home);
+    let result = handle_send(
+        &typed_review_params(assignment.assignment_id, "verified", "VERIFIED"),
+        &ctx,
+    );
+
+    assert_eq!(result["ok"], true, "the verdict still delivers: {result}");
+    let outcome = &result["auto_close"];
+    assert_eq!(
+        outcome["closed"], false,
+        "a non-assignee row must not close: {result}"
+    );
+    assert_eq!(
+        outcome["code"].as_str(),
+        Some("review_receipt_auto_close_skipped"),
+        "a skipped close must be distinguishable from a silent no-op: {result}"
+    );
+    assert_eq!(
+        outcome["task_id"].as_str(),
+        Some("t-code-review-2760"),
+        "{result}"
+    );
+    assert_eq!(
+        outcome["evidence_locator"]["assignment_id"].as_str(),
+        Some(assignment.assignment_id.to_string().as_str()),
+        "the locator is what makes this answer checkable: {result}"
+    );
+    assert!(
+        !outcome["reason"].as_str().unwrap_or_default().is_empty(),
+        "{result}"
+    );
+    // #8 r1 (F2): the reason must never assert the row's status. The code knows
+    // only that ITS close was skipped; whether the row is open is not
+    // available here, and on the terminal+receipt combination below it is
+    // demonstrably not open.
+    let reason = outcome["reason"].as_str().unwrap_or_default();
+    for forbidden in ["still open", "is open", "remains open", "task is still"] {
+        assert!(
+            !reason.contains(forbidden),
+            "a skipped close must not assert the row's status ({forbidden:?}): {reason:?}"
+        );
+    }
+    assert_eq!(
+        task_status_of(&home, "t-code-review-2760"),
+        Some(crate::task_events::TaskStatus::Claimed),
+        "the row must not have moved"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #8 r1 (F2), the exact combination the reviewer derived: a caller sends
+/// `terminal: true` ALONGSIDE a typed VERIFIED receipt. The terminal path closes
+/// the branchless review task first (a branchless task is a guard permit), then
+/// the receipt's own close is skipped because the row is now `Done` — a status
+/// outside the close whitelist.
+///
+/// Before this fix that combination answered `review_receipt_auto_close_skipped`
+/// with a reason claiming "the task is still open", while the row sat at `Done`:
+/// the response stated a falsehood, which is the one thing this ticket exists to
+/// prevent. Driven through the REAL send entry so the ordering is production's.
+#[test]
+fn skipped_receipt_reason_does_not_assert_status_when_terminal_closed_first_8() {
+    let home = tmp_home("8-terminal-plus-receipt");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    write_typed_review_fleet(&home, reviewer_id, crate::types::InstanceId::new());
+    let assignment = seed_typed_review_subject(&home, reviewer_id);
+    // Branchless + claimed by the reviewer: the ordinary shape of a review task,
+    // and the shape on which the terminal path is a permit.
+    seed_review_task(&home, "t-code-review-2760", "typed-reviewer");
+
+    let ctx = test_ctx(&home);
+    let mut params = typed_review_params(assignment.assignment_id, "verified", "VERIFIED");
+    params["terminal"] = json!(true);
+    let result = handle_send(&params, &ctx);
+
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(
+        task_status_of(&home, "t-code-review-2760"),
+        Some(crate::task_events::TaskStatus::Done),
+        "precondition: the terminal path closes a branchless row before the bridge reads it"
+    );
+
+    let reason = result["auto_close"]["reason"]
+        .as_str()
+        .unwrap_or_else(|| panic!("skipped outcome must carry a reason: {result}"));
+    for forbidden in ["still open", "is open", "remains open", "task is still"] {
+        assert!(
+            !reason.contains(forbidden),
+            "the row is Done here, so a skipped receipt must not claim it is open \
+             ({forbidden:?}): {reason:?}"
+        );
+    }
+    assert_eq!(
+        result["auto_close"]["closed"], false,
+        "the RECEIPT's own close is what is being reported, and it did not run: {result}"
+    );
+    assert_eq!(
+        result["auto_close"]["task_id"].as_str(),
+        Some("t-code-review-2760"),
+        "{result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Control (green before and after): the ordinary `terminal: true` report path
+/// keeps its #3293 shape exactly. The new receipt path must not add its code,
+/// task id, or evidence locator onto the settlement projection.
+#[test]
+fn ordinary_terminal_settlement_projection_is_unchanged_by_the_receipt_path_8() {
+    let home = tmp_home("8-terminal-control");
+    fleet_with_pair_3293(&home);
+    let task_id = "t-8-terminal-control";
+    seed_claimed_task_3293(&home, task_id, "dev-agent", None);
+
+    let ctx = test_ctx(&home);
+    let result = handle_send(
+        &json!({
+            "from": "dev-agent",
+            "target": "lead",
+            "text": "analysis delivered",
+            "kind": "report",
+            "terminal": true,
+            "correlation_id": task_id,
+        }),
+        &ctx,
+    );
+
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(result["auto_close"]["closed"], true, "{result}");
+    assert!(
+        result["auto_close"].get("code").is_none(),
+        "the #3293 success shape carries no code and must keep carrying none: {result}"
+    );
+    assert!(
+        result["auto_close"].get("evidence_locator").is_none(),
+        "the receipt path must not leak onto an ordinary report: {result}"
+    );
+    assert_eq!(
+        task_status_of(&home, task_id),
+        Some(crate::task_events::TaskStatus::Done)
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
