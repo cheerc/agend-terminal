@@ -645,6 +645,10 @@ pub(crate) enum RetirementCause {
     /// A validated receipt settled the reviewer's own review task, so the
     /// assignment is retired as a CONSEQUENCE of a successful review — not because
     /// anything went wrong.
+    ///
+    /// #9 (F1): never assert this directly. It is reachable only through
+    /// [`RetirementCause::settled_only_if`], so a settled claim always rests on a
+    /// checked receipt rather than on a shared emitter identity.
     TaskSettled,
     /// The assignment was retired by an explicit CAS (`retire_if_id_matches`) that
     /// had no terminal event to attribute: the task was terminal, but WHETHER that
@@ -654,6 +658,11 @@ pub(crate) enum RetirementCause {
     /// a settled review would be projecting a guess as fact — the exact failure
     /// mode this enum exists to remove. The reviewer is told the assignment is
     /// gone, not why.
+    ///
+    /// #9 (F1): this is also the landing value when a terminal close is checked
+    /// against PR state and NO receipt is found — including the branch-merge
+    /// scanner's close, which is a real terminal transition that simply has no
+    /// review behind it.
     TaskTerminalUnattributed,
     /// A different assignment on the same branch replaced this one.
     Replaced,
@@ -666,6 +675,31 @@ pub(crate) enum RetirementCause {
 }
 
 impl RetirementCause {
+    /// #9 (F1): gate every settled claim on proof that a receipt exists.
+    ///
+    /// F1 showed that attributing a close to `system:auto_close` cannot
+    /// distinguish a validated receipt from an ordinary `terminal: true` report
+    /// or the branch-merge scanner, because all three share that emitter — so a
+    /// reviewer with no receipt was told their review had been recorded. The
+    /// terminal event answers only "who performed some close", never "was a
+    /// review recorded", which is why the check lives here against PR state
+    /// rather than in the caller.
+    ///
+    /// Fail-closed by construction: without a verified receipt the reviewer gets
+    /// the plain retired wording, which is true in every case. A false negative
+    /// costs one sentence of warmth; a false positive fabricates a success.
+    fn settled_only_if(self, receipt_exists: bool) -> Self {
+        match (self, receipt_exists) {
+            (_, true) => RetirementCause::TaskSettled,
+            (RetirementCause::ExplicitlyRevoked, false)
+            | (RetirementCause::Replaced, false)
+            | (RetirementCause::Retired, false) => self,
+            (RetirementCause::TaskSettled | RetirementCause::TaskTerminalUnattributed, false) => {
+                RetirementCause::TaskTerminalUnattributed
+            }
+        }
+    }
+
     /// The notice `kind`, `from`, and wording for this cause.
     ///
     /// #9: `from` is the CAUSE's actor, not always the dispatcher. A
@@ -713,6 +747,50 @@ impl RetirementCause {
             ),
         }
     }
+}
+
+/// #9 (F1 fix, decision d-20261009192240078726-6): is there a REAL validated
+/// review receipt proving the review this task was created for actually landed?
+///
+/// F1: the first implementation asked "was the terminal event emitted by
+/// `system:auto_close`?", which is the wrong question. That identity is shared by
+/// three production paths — the validated-receipt close, an ordinary
+/// `terminal: true` report, and the branch-merge scanner (whose candidate filter
+/// admits any active status on a linked branch, `Verified` included) — so the
+/// emitter proved only WHO performed SOME close, never WHETHER a review was
+/// recorded. Asking a shared identity to carry that distinction is the shape of
+/// the defect, not a gap in the enumeration; a new emitter would have the same
+/// problem tomorrow.
+///
+/// Receipts are per `(repo, branch, pr_number)`, not per task, and a review
+/// assignment IS generation-bound to its PR number — so the assignment's own
+/// `(repo, branch, pr_number)` is exactly the scope in which a receipt could
+/// exist. Answering with PR state therefore tests an EXCLUSIVE fact: the receipt
+/// exists or it does not.
+///
+/// Fail-closed throughout: an unreadable or absent PR state yields `false`,
+/// because claiming "your review settled" on missing evidence is the exact
+/// failure this whole change exists to remove.
+fn validated_receipt_exists(home: &Path, record: &ActiveAssignment) -> bool {
+    let state = match crate::daemon::pr_state::load(home, &record.repo, &record.branch) {
+        Some(state) => state,
+        None => {
+            // An absent or unreadable PR state is not proof of a review, so the
+            // claim is declined rather than assumed.
+            tracing::warn!(repo = %record.repo, branch = %record.branch,
+                "#9 retirement attribution: PR state absent; declining to claim a settled review");
+            return false;
+        }
+    };
+    // A receipt for a different generation says nothing about this one, so it
+    // must not be borrowed as a success claim.
+    if state.pr_number != record.pr_number {
+        return false;
+    }
+    state
+        .validated_review_receipts
+        .iter()
+        .any(|receipt| receipt.task_id == record.task_id)
 }
 
 fn build_retirement_notice(
@@ -1293,7 +1371,12 @@ fn retire_delivery_under_lock(
             crate::inbox::storage::enqueue(
                 home,
                 target,
-                build_retirement_notice(record, cause, now, &nonce),
+                build_retirement_notice(
+                    record,
+                    cause.settled_only_if(validated_receipt_exists(home, record)),
+                    now,
+                    &nonce,
+                ),
             )?;
         }
     }
@@ -1452,18 +1535,15 @@ pub(crate) fn retire_for_terminal_event(
                 &branch,
                 &record.target,
                 record.assignment_id,
-                // #9: the verified terminal event carries its EMITTER, so the
-                // settled-vs-cancelled question has a real answer here rather
-                // than a guess. `auto_close` is the emitter a validated VERIFIED
-                // receipt produces; any other emitter that closed the task gets
-                // the unattributed wording instead of being told its review
-                // settled.
                 Retirement {
-                    cause: if instance == crate::tasks::AUTO_CLOSE_INSTANCE {
-                        RetirementCause::TaskSettled
-                    } else {
-                        RetirementCause::TaskTerminalUnattributed
-                    },
+                    // #9 (F1): the terminal event's EMITTER cannot answer "did a
+                    // review settle?" — it records who performed SOME close, and
+                    // `system:auto_close` is shared by the receipt close, ordinary
+                    // `terminal: true` reports, and the branch-merge scanner. The
+                    // caller already established that the task is terminal; the
+                    // settled CLAIM is decided against PR state at the single point
+                    // where the notice is built.
+                    cause: RetirementCause::TaskTerminalUnattributed,
                     now,
                     cleanup_tasks: &mut cleanup_tasks,
                 },
@@ -1568,11 +1648,10 @@ fn retire_operator_settlement_after_preflight(
                         retired += usize::from(retire_delivery_under_lock(
                             home,
                             &record,
-                            if instance == crate::tasks::AUTO_CLOSE_INSTANCE {
-                                RetirementCause::TaskSettled
-                            } else {
-                                RetirementCause::TaskTerminalUnattributed
-                            },
+                            // #9 (F1): see the sibling site — the emitter is not
+                            // consulted; the settled claim is decided against PR
+                            // state where the notice is built.
+                            RetirementCause::TaskTerminalUnattributed,
                             now,
                         )?);
                     }

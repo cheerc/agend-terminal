@@ -317,6 +317,8 @@ Drain 或管理 caller 的 durable inbox。
 
 `review-assignment-revoked` 是唯一代表「撤銷」的 kind，也是唯一歸屬於人而非 system identity 的。背後的 nonce 去重與 supersede 行為不變。
 
+**settled 這個成因由 receipt 授予，不由「關閉者身分」授予。** task 可能在背後完全沒有審查的情況下到達終態——branch merge 會關掉該 branch 上的 task，普通 `terminal: true` report 也會關掉它自己的。這些路徑寫入 terminal event 時用的身分，與 receipt 關閉所用的 `system:auto_close` **完全相同**，所以 emitter 無法回答「是否真有審查被記錄」。因此 `review-assignment-settled` 只在 PR state 中確實存在該 task 的已驗證 receipt 時才發出；其他所有終態關閉一律回報 `review-assignment-retired`。`review-assignment-settled` 的意思是「你的審查已被記錄」，不是「有東西關掉了你的 task」。
+
 ### `usage_limit_takeover`
 
 針對持久化 usage-limit takeover episode 的 operator-only PREPARE 步驟。它會寫入 durable prepared journal，但不執行 takeover。

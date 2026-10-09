@@ -288,6 +288,38 @@ fn mk_record(
     )
 }
 
+/// A receipt-capable assignment (`is_receipt_capable`: stable instance id, exact
+/// full-hex reviewed head, a review slot, a resolved review class). The positive
+/// control needs one because `record_validated_receipt` refuses any receipt whose
+/// assignment does not still authorize it — a hand-rolled legacy record would make
+/// the control pass for the wrong reason.
+fn mk_record_typed(
+    repo: &str,
+    branch: &str,
+    target: &str,
+    target_id: crate::types::InstanceId,
+    pr: u64,
+    created_at: &str,
+) -> ActiveAssignment {
+    ActiveAssignment::new_pending_typed(
+        repo,
+        branch,
+        target,
+        target_id,
+        pr,
+        "a".repeat(40),
+        crate::review_receipt::ReviewSlot::Primary,
+        "lead",
+        "t-gate-positive",
+        ReviewClass::Single,
+        ReviewAuthor::External("octocat".into()),
+        "Please review PR",
+        None,
+        None,
+        created_at,
+    )
+}
+
 fn seed_open_task(home: &Path, task_id: &str) {
     seed_open_task_as(home, task_id, "reviewer");
 }
@@ -1722,4 +1754,331 @@ fn cause_projection_preserves_nonce_dedup_and_supersede_9() {
         "supersede must never reset read_at in place"
     );
     std::fs::remove_dir_all(&home).ok();
+}
+
+// ── #9 r1 (F1 regression): only a REAL validated receipt may say "settled" ──
+//
+// F1: the attribution predicate tested `emitter == system:auto_close`, but that
+// identity is shared by three production paths — only one of which is a
+// validated receipt. The merge-close scanner (path 3) closes `Verified` tasks on
+// a merged branch under the SAME emitter, so a reviewer with no receipt in PR
+// state was told "your review was recorded and its task closed". Both tests
+// below drive those other two paths for real, so the predicate cannot pass by
+// mistaking a shared identity for a receipt.
+
+/// Path 2: an ordinary `terminal: true` report (no receipt anywhere) closing a
+/// review task. Must NOT be projected as a settled review.
+#[test]
+fn terminal_report_close_is_not_attributed_to_a_settled_review_9() {
+    let home = tmp_home("9-path2-terminal-report");
+    let task_id = "t-path2-review";
+    let mut assignment = mk_record("o/r", "feat/path2", "reviewer", 42, "2026-10-09T00:00:00Z");
+    assignment.task_id = task_id.into();
+    persist(&home, &assignment).unwrap();
+    durable_enqueue(
+        &home,
+        "o/r",
+        "feat/path2",
+        "reviewer",
+        "2026-10-09T00:00:05Z",
+    )
+    .unwrap();
+    mark_row_read(
+        &home,
+        "reviewer",
+        &assignment.delivery_nonce,
+        "2026-10-09T00:00:07Z",
+    );
+
+    // The strict path needs an EXACT LIVE BINDING, and that is the production
+    // shape here too: a reviewer holding a disposable review binding. Dropping
+    // the task's branch instead would make the guard permit this close through
+    // the branchless path, but it would also make the fixture diverge from the
+    // reviewer flow this test exists to cover (#44's shape — tuning the input to
+    // make a test pass moves the test away from production, not closer).
+    // A BRANCHLESS review task is an ordinary shape for a reviewer-owned review
+    // row, and `assignee_completion_guard` returns `NotApplicable(Branchless)` —
+    // a permit that consults no binding at all — so the ordinary-report close
+    // really runs here without inventing a worktree fixture.
+    seed_branchless_task(&home, task_id, "reviewer");
+
+    // The REAL ordinary-report close — the same producer F1 flagged as path 2.
+    assert!(
+        crate::tasks::auto_close::auto_close_on_report(
+            &home,
+            "report",
+            task_id,
+            "reviewer",
+            "still working on it",
+            true,
+        )
+        .unwrap(),
+        "precondition: an ordinary terminal report closes its task"
+    );
+
+    let notices = retirement_notices(&home, "reviewer", assignment.assignment_id);
+    let kinds: Vec<String> = notices
+        .iter()
+        .map(|m| m.kind.clone().unwrap_or_default())
+        .collect();
+    assert!(
+        !kinds.iter().any(|k| k == "review-assignment-settled"),
+        "F1 regression: no receipt was ingested, so a terminal-report close must not \
+         claim the review settled — got {kinds:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #9 r1: the settled claim must be reachable at all.
+///
+/// F1's fix gates every `TaskSettled` on a receipt that exists. A gate nobody can
+/// satisfy is not a fix, it is the same fabrication with extra steps: the notice
+/// would silently degrade to "retired" on the ONE path where the reviewer really
+/// did settle a review, and the reviewer would lose the "your review was
+/// recorded" signal entirely. This drives the real close and pins the receipt in
+/// PR state, so it fails if the gate can never grant `TaskSettled` — the failure
+/// mode a removal probe cannot catch (removing the gate makes both tests pass,
+/// which is why it needed a positive control, not just two negative ones).
+#[test]
+fn a_real_receipt_grants_the_settled_cause_9() {
+    let home = tmp_home("9-gate-positive");
+    let task_id = "t-gate-positive";
+    seed_branchless_task(&home, task_id, "reviewer");
+    let reviewer_id = crate::types::InstanceId::new();
+    let mut assignment = mk_record_typed(
+        "o/r",
+        "feat/gate",
+        "reviewer",
+        reviewer_id,
+        42,
+        "2026-10-09T00:00:00Z",
+    );
+    assignment.task_id = task_id.into();
+    persist(&home, &assignment).unwrap();
+    durable_enqueue(
+        &home,
+        "o/r",
+        "feat/gate",
+        "reviewer",
+        "2026-10-09T00:00:05Z",
+    )
+    .unwrap();
+    mark_row_read(
+        &home,
+        "reviewer",
+        &assignment.delivery_nonce,
+        "2026-10-09T00:00:07Z",
+    );
+    pin_receipt_in_pr_state(&home, &assignment, reviewer_id);
+
+    assert!(
+        crate::tasks::auto_close::auto_close_on_validated_review(
+            &home,
+            task_id,
+            "reviewer",
+            "VERIFIED\n\n### Evidence\nran: cargo test → passed",
+        )
+        .unwrap(),
+        "precondition: the validated receipt closes its review task"
+    );
+
+    let notices = retirement_notices(&home, "reviewer", assignment.assignment_id);
+    let kinds: Vec<String> = notices
+        .iter()
+        .map(|m| m.kind.clone().unwrap_or_default())
+        .collect();
+    assert!(
+        kinds.iter().any(|k| k == "review-assignment-settled"),
+        "a real validated receipt MUST still produce the settled notice — the F1 gate \
+         exists to exclude non-receipts, not to suppress the settled cause: {kinds:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Pin a REAL validated receipt into PR state for `assignment`'s subject, so the
+/// settled attribution has a genuine receipt behind it.
+///
+/// Uses the production [`crate::daemon::pr_state::record_validated_receipt`] entry
+/// with a server-shaped receipt (the private constructor is test-only), rather than
+/// hand-writing PR state JSON — a hand-written one would make the positive control
+/// pass for the wrong reason, which is the #9 r0 mistake this rework is fixing.
+fn pin_receipt_in_pr_state(
+    home: &Path,
+    assignment: &ActiveAssignment,
+    reviewer_id: crate::types::InstanceId,
+) {
+    let head_for_state = assignment
+        .reviewed_head
+        .clone()
+        .unwrap_or_else(|| "b".repeat(40));
+    crate::daemon::pr_state::record_ci_result(
+        home,
+        &assignment.repo,
+        &assignment.branch,
+        &head_for_state,
+        crate::daemon::pr_state::CiConclusion::Green,
+        vec![assignment.sender.clone()],
+        assignment.review_class,
+    );
+    // record_ci_result never writes pr_number (the PR number arrives from the
+    // provider), and matches_state compares it — so a receipt would be rejected as
+    // belonging to a different generation. Seed it explicitly, as the other
+    // typed-receipt fixtures do.
+    crate::daemon::pr_state::with_pr_state(home, &assignment.repo, &assignment.branch, |state| {
+        state.pr_number = assignment.pr_number;
+    })
+    .expect("seed pr_number");
+    let head = assignment
+        .reviewed_head
+        .clone()
+        .expect("the typed fixture carries an exact reviewed head");
+    let receipt = crate::review_receipt::ValidatedCodeReviewReceipt::for_test(
+        crate::review_receipt::ReviewReceiptSummary {
+            receipt_id: "review-receipt:m-gate-positive".into(),
+            source_id: "m-gate-positive".into(),
+            evidence_digest: "c".repeat(64),
+            assignment_id: assignment.assignment_id,
+            reviewer_instance_id: reviewer_id,
+            reviewer_name: assignment.target.clone(),
+            repo: assignment.repo.clone(),
+            pr_number: assignment.pr_number,
+            branch: assignment.branch.clone(),
+            task_id: assignment.task_id.clone(),
+            reviewed_head: head,
+            review_class: assignment.review_class,
+            slot: crate::review_receipt::ReviewSlot::Primary,
+            verdict: crate::review_receipt::ReviewVerdict::Verified,
+        },
+    );
+    assert!(
+        crate::daemon::pr_state::record_validated_receipt(home, &receipt, None),
+        "precondition: the receipt must be recorded into PR state"
+    );
+}
+
+/// Path 3: the scheduled merge-close scanner closing a `Verified` review task on
+/// a merged branch. Its candidate filter admits `Verified`, so this is the exact
+/// shape F1 describes — and no receipt exists in PR state for this task.
+#[test]
+fn merged_branch_scan_close_is_not_attributed_to_a_settled_review_9() {
+    let home = tmp_home("9-path3-merge-scan");
+    let task_id = "t-path3-review";
+    // A review task LINKED to the branch, sitting in `Verified` — the state the
+    // merge scanner's `active` filter admits.
+    seed_review_task_linked(&home, task_id, "reviewer", "feat/path3");
+    let mut assignment = mk_record("o/r", "feat/path3", "reviewer", 42, "2026-10-09T00:00:00Z");
+    assignment.task_id = task_id.into();
+    persist(&home, &assignment).unwrap();
+    durable_enqueue(
+        &home,
+        "o/r",
+        "feat/path3",
+        "reviewer",
+        "2026-10-09T00:00:05Z",
+    )
+    .unwrap();
+    mark_row_read(
+        &home,
+        "reviewer",
+        &assignment.delivery_nonce,
+        "2026-10-09T00:00:07Z",
+    );
+
+    // Drive the REAL scheduled path, exactly as the poller/scanner do.
+    crate::status_summary::auto_close_merged_tasks(&home, "feat/path3");
+
+    assert_eq!(
+        task_status(&home, task_id),
+        crate::task_events::TaskStatus::Done,
+        "precondition: the merge scanner closes a linked Verified task"
+    );
+    assert!(
+        crate::daemon::pr_state::load(&home, "o/r", "feat/path3")
+            .map(|state| state.validated_review_receipts.is_empty())
+            .unwrap_or(true),
+        "precondition: NO receipt exists for this task — the close came from a merge"
+    );
+
+    let notices = retirement_notices(&home, "reviewer", assignment.assignment_id);
+    let kinds: Vec<String> = notices
+        .iter()
+        .map(|m| m.kind.clone().unwrap_or_default())
+        .collect();
+    assert!(
+        !kinds.iter().any(|k| k == "review-assignment-settled"),
+        "F1 regression: a merge-scanner close is not a settled review — got {kinds:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Seed a review task with NO branch. The completion guard treats branchless as
+/// an unconditional permit (`GateInapplicable::Branchless`), which is why this is
+/// the shape that exercises the ordinary `terminal: true` close end-to-end.
+fn seed_branchless_task(home: &Path, task_id: &str, owner: &str) {
+    crate::task_events::append_batch(
+        home,
+        &crate::task_events::InstanceName::from("system:test"),
+        vec![
+            crate::task_events::TaskEvent::Created {
+                task_id: crate::task_events::TaskId::from(task_id),
+                title: "review task".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: Vec::new(),
+                parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
+            },
+            crate::task_events::TaskEvent::Claimed {
+                task_id: crate::task_events::TaskId::from(task_id),
+                by: crate::task_events::InstanceName::from(owner),
+            },
+        ],
+    )
+    .unwrap();
+}
+
+/// Seed a review task whose `branch` is set, which is what the merge scanner's
+/// structured arm matches on.
+fn seed_review_task_linked(home: &Path, task_id: &str, reviewer: &str, branch: &str) {
+    crate::task_events::append_batch(
+        home,
+        &crate::task_events::InstanceName::from("system:test"),
+        vec![
+            crate::task_events::TaskEvent::Created {
+                task_id: crate::task_events::TaskId::from(task_id),
+                title: "review task".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: Some(branch.into()),
+                bind: None,
+                eta_secs: None,
+                tags: Vec::new(),
+                parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
+            },
+            crate::task_events::TaskEvent::Claimed {
+                task_id: crate::task_events::TaskId::from(task_id),
+                by: crate::task_events::InstanceName::from(reviewer),
+            },
+            crate::task_events::TaskEvent::Verified {
+                task_id: crate::task_events::TaskId::from(task_id),
+                by_reviewer: crate::task_events::InstanceName::from(reviewer),
+                verdict: "VERIFIED".into(),
+            },
+        ],
+    )
+    .unwrap();
 }

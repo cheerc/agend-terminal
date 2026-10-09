@@ -317,6 +317,8 @@ Revoke a reviewer assignment by exact CAS identity. Authorized for the owning te
 
 `review-assignment-revoked` is the only kind that means a revocation, and it is the only one attributed to a person rather than a system identity. The nonce dedup and supersede behaviour behind these notices is unchanged.
 
+**The settled cause is granted by a receipt, never by the closing identity.** A task can reach a terminal state without any review behind it — a branch merge closes tasks on its branch, and an ordinary `terminal: true` report closes its own. All of those write terminal events under the same `system:auto_close` identity the receipt close uses, so the emitter cannot answer "was a review recorded". The `review-assignment-settled` notice is therefore emitted only when a validated receipt for that exact task exists in PR state; every other terminal close reports `review-assignment-retired` instead. `review-assignment-settled` means "your review was recorded", not "something closed your task".
+
 ### `usage_limit_takeover`
 
 Operator-only PREPARE step for a persisted usage-limit takeover episode. It writes the durable prepared journal but does not execute the takeover.
