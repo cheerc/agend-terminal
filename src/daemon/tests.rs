@@ -1112,6 +1112,8 @@ fn tick_wake_runs_maintenance_2935() {
 /// engineered from the log text alone.
 ///
 /// The journal path is asserted as a CONCRETE `<home>/deletion-recovery/<name>.json`
+/// — but by its two invariant COMPONENTS, never as a joined literal: the log
+/// carries `Path::display()`, which emits `\` on Windows.
 /// so it is directly actionable, and the two escape routes (read the binding with
 /// `binding_state`, finish/inspect with `admin recover-worktree`) are named so an
 /// operator knows both without reading the source.
@@ -1196,7 +1198,7 @@ fn boot_spawn_skip_names_the_journal_path_and_recovery_routes_39() {
         "the skip must still be reported: {logs}"
     );
     assert!(
-        logs.contains("deletion-recovery/victim.json"),
+        logs.contains("deletion-recovery") && logs.contains("victim.json"),
         "#39: the skip line must name the exact journal file. logs:\n{logs}"
     );
     assert!(

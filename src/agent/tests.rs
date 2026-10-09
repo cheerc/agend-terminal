@@ -7008,9 +7008,13 @@ fn spawn_refusal_names_the_journal_path_and_recovery_routes_39() {
         err.contains("mid-delete") || err.contains("#1915"),
         "refusal should still name the chokepoint, got: {err}"
     );
+    // Assert the two path components, NOT a joined literal: `path().display()`
+    // emits `\` on Windows, so a `deletion-recovery/victim.json` literal passes
+    // on macOS and fails on windows-latest. The components themselves are
+    // platform-invariant; the separator is not.
     assert!(
-        err.contains("deletion-recovery/victim.json"),
-        "#39: the refusal must name the exact journal file: {err}"
+        err.contains("deletion-recovery") && err.contains("victim.json"),
+        "#39: the refusal must name the journal's directory and file: {err}"
     );
     assert!(
         err.contains("binding_state") && err.contains("recover-worktree"),

@@ -2172,7 +2172,9 @@ fn delete_refusal_over_pending_tombstone_names_journal_and_routes_39() {
         "#39: the refusal condition must still be stated: {error}"
     );
     assert!(
-        error.contains(&format!("deletion-recovery/{instance}.json")),
+        // Components, not a joined literal: `fence_guidance` interpolates
+        // `Path::display()`, which emits `\` on Windows.
+        error.contains("deletion-recovery") && error.contains(&format!("{instance}.json")),
         "#39: the refusal must name the exact journal file: {error}"
     );
     assert!(
