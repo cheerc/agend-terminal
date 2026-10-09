@@ -67,6 +67,43 @@ pub(crate) fn path(home: &Path, instance: &str) -> PathBuf {
         .join(format!("{instance}.json"))
 }
 
+/// #39: the operator-facing guidance for a name this journal currently fences.
+///
+/// Every site that refuses on a pending fence reports this same dead end, and
+/// each one used to name only the condition — so an operator had to already know
+/// that `deletion-recovery/<name>.json` exists, that `binding_state` explains its
+/// state, and that `admin recover-worktree` can finish or inspect the release.
+/// None of that appeared anywhere the refusal was reported. The message lives
+/// here, next to [`path`] and [`State`], so all three sites stay in lockstep and
+/// `lifecycle.rs` does not grow a third copy of the same prose.
+pub(crate) fn fence_guidance(home: &Path, instance: &str) -> String {
+    format!(
+        "#39 journal path: {}. Inspect with `binding_state`; finish or inspect the \
+         release with `agend-terminal admin recover-worktree`",
+        path(home, instance).display()
+    )
+}
+
+/// #39: the delete-entry refusal for a name this journal already fences.
+///
+/// It also reports the tombstone's `state`, because this refusal is the
+/// operator's dead end — `recover-worktree` ALSO refuses while the managed
+/// marker survives — so it is the only place that can distinguish "a delete is
+/// in progress" from "a removal was interrupted and needs archiving".
+pub(crate) fn describe_pending_delete(
+    home: &Path,
+    instance: &str,
+    tombstone: &Tombstone,
+) -> String {
+    format!(
+        "recovery_required: instance '{instance}' already has a pending delete tombstone \
+         (state={:?}, worktree={}). {}",
+        tombstone.state,
+        tombstone.worktree,
+        fence_guidance(home, instance)
+    )
+}
+
 pub(crate) fn read(home: &Path, instance: &str) -> Result<Option<Tombstone>, String> {
     let path = path(home, instance);
     let bytes = match std::fs::read(&path) {

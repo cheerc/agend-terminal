@@ -1105,3 +1105,111 @@ fn tick_wake_runs_maintenance_2935() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// #39 (a): when boot skips an instance because a deletion fence is up, the
+/// refusal line is the ONLY thing an operator sees — it never named where the
+/// fence lives or how to clear it, so the whole diagnosis had to be reverse-
+/// engineered from the log text alone.
+///
+/// The journal path is asserted as a CONCRETE `<home>/deletion-recovery/<name>.json`
+/// — but by its two invariant COMPONENTS, never as a joined literal: the log
+/// carries `Path::display()`, which emits `\` on Windows.
+/// so it is directly actionable, and the two escape routes (read the binding with
+/// `binding_state`, finish/inspect with `admin recover-worktree`) are named so an
+/// operator knows both without reading the source.
+#[cfg(unix)]
+#[test]
+fn boot_spawn_skip_names_the_journal_path_and_recovery_routes_39() {
+    use std::sync::Arc as StdArc;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Clone)]
+    struct Buf(StdArc<StdMutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capture buf mutex")
+                .extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+        type Writer = Buf;
+        fn make_writer(&'a self) -> Buf {
+            self.clone()
+        }
+    }
+
+    let home = tmp_home("mid-delete-guidance-39");
+    let run_dir = setup_run_dir_with_cookie(&home);
+    seed_fleet_ids(&home, &["victim"]);
+    let (registry, configs, crash_tx, _crash_rx, shutdown) = make_test_registry();
+    let def = make_shell_agent_def("victim");
+
+    // Drive the DURABLE half of the fence (the surviving-across-restart half),
+    // not the in-memory guard: a journal left by a previous daemon generation is
+    // exactly the incident, and it is the half that has no log of its own.
+    std::fs::create_dir_all(home.join("deletion-recovery")).expect("create journal dir");
+    let journal = home.join("deletion-recovery").join("victim.json");
+    std::fs::write(
+        &journal,
+        serde_json::json!({
+            "schema_version": 1,
+            "state": "deleting",
+            "instance": "victim",
+            "branch": "feat/victim",
+            "worktree": home.join("worktrees").join("victim").display().to_string(),
+            "source_repo": home.join("src").display().to_string(),
+            "binding_sha256": "0".repeat(64),
+            "binding_signature_sha256": "0".repeat(64),
+            "archive": null,
+        })
+        .to_string(),
+    )
+    .expect("seed durable deletion journal");
+
+    assert!(
+        crate::agent::deleting::is_deleting(&home, "victim"),
+        "precondition: a Deleting journal must fence same-name boot spawn"
+    );
+
+    let buf = StdArc::new(StdMutex::new(Vec::new()));
+    let sub = tracing_subscriber::fmt()
+        .with_writer(Buf(buf.clone()))
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    let logs = {
+        tracing::subscriber::with_default(sub, || {
+            spawn_and_register_agent(&home, &def, &registry, &configs, &crash_tx, &shutdown)
+                .expect("returns Ok (clean skip, not Err)");
+        });
+        String::from_utf8(buf.lock().expect("capture buf mutex").clone())
+            .expect("capture buf is utf8")
+    };
+
+    assert!(
+        logs.contains("mid-delete"),
+        "the skip must still be reported: {logs}"
+    );
+    assert!(
+        logs.contains("deletion-recovery") && logs.contains("victim.json"),
+        "#39: the skip line must name the exact journal file. logs:\n{logs}"
+    );
+    assert!(
+        logs.contains("binding_state") && logs.contains("recover-worktree"),
+        "#39: the skip line must name both recovery routes. logs:\n{logs}"
+    );
+    assert!(
+        registry.lock().is_empty(),
+        "#39: guidance text must not change the chokepoint's zero-side-effect verdict"
+    );
+
+    let _ = std::fs::remove_dir_all(&run_dir);
+    std::fs::remove_dir_all(&home).ok();
+}

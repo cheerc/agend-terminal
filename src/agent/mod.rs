@@ -1368,7 +1368,9 @@ pub(crate) fn spawn_agent_with_capture_home(
     if let Some(home_path) = *home {
         if deleting::is_deleting(home_path, name) {
             anyhow::bail!(
-                "#1915: refusing to spawn '{name}' — instance is mid-delete (deleting-set chokepoint)"
+                "#1915: refusing to spawn '{name}' — instance is mid-delete (deleting-set \
+                 chokepoint). {}",
+                crate::agent::deletion_recovery::fence_guidance(home_path, name)
             );
         }
     }
@@ -1388,7 +1390,9 @@ pub(crate) fn spawn_agent_with_capture_home(
         if deleting::is_deleting(home_path, name) {
             drop(transport_generation_guard);
             anyhow::bail!(
-                "#1915: refusing to spawn '{name}' — instance entered deletion after lane admission"
+                "#1915: refusing to spawn '{name}' — instance entered deletion after lane \
+                 admission. {}",
+                crate::agent::deletion_recovery::fence_guidance(home_path, name)
             );
         }
     }

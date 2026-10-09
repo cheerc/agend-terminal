@@ -231,8 +231,8 @@ pub(crate) fn full_delete_instance_with_precondition(
     // also prevents every spawn/reconcile chokepoint from reusing the name.
     if let Some(existing) = crate::agent::deletion_recovery::read(home, name)? {
         if existing.state != crate::agent::deletion_recovery::State::Recovered {
-            return Err(format!(
-                "recovery_required: instance '{name}' already has a pending delete tombstone"
+            return Err(crate::agent::deletion_recovery::describe_pending_delete(
+                home, name, &existing,
             ));
         }
     }
