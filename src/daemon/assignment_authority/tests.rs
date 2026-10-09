@@ -1448,3 +1448,217 @@ fn duplicate_terminal_event_key_is_a_durable_no_op() {
     assert_eq!(list_active(&home, "o/r", "feat/p3").len(), 1);
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── #9: a retirement notice must say WHY, and a settled review must not ─────
+//
+// #9: every retirement notice was spelled `has been revoked`, from
+// `record.sender`, under kind `review-assignment-revoked` — regardless of why
+// the assignment went away. A typed VERIFIED receipt closes its own review task
+// (auto_close → task_terminal_cleanup → terminal event →
+// retire_for_terminal_event), so every SUCCESSFUL review also emitted a notice
+// claiming the reviewer's assignment had been revoked. The reviewer's first
+// reaction is "did my VERIFIED expire?", and it took four tool calls to rule
+// out. Changing `from` alone cannot fix it: the TEXT and the KIND still say
+// revoked.
+//
+// These drive the REAL retirement entry points (`retire_for_terminal_event` /
+// `revoke`) over a REAL persisted assignment with a REAL read inbox row, because
+// the notice only exists when the delivery had already been handed over.
+
+/// Notices currently present in `target`'s inbox that are retirement notices
+/// (i.e. carrying the retirement nonce), whatever their kind.
+fn retirement_notices(home: &Path, target: &str, assignment_id: uuid::Uuid) -> Vec<crate::inbox::InboxMessage> {
+    rows_with_nonce(home, target, &format!("revoked-{assignment_id}"))
+}
+
+/// The core guarantee: a VERIFIED receipt's own successful settlement must NOT
+/// produce a notice that reads as a revocation.
+#[test]
+fn settled_review_emits_no_revocation_semantics_9() {
+    let home = tmp_home("9-settled");
+    let task_id = "t-settled-review";
+    seed_open_task(&home, task_id);
+    let mut assignment = mk_record("o/r", "feat/settled", "reviewer", 42, "2026-10-09T00:00:00Z");
+    assignment.task_id = task_id.into();
+    persist(&home, &assignment).unwrap();
+    durable_enqueue(&home, "o/r", "feat/settled", "reviewer", "2026-10-09T00:00:05Z").unwrap();
+    mark_row_read(&home, "reviewer", &assignment.delivery_nonce, "2026-10-09T00:00:07Z");
+
+    assert!(
+        list_active(&home, "o/r", "feat/settled").len() == 1,
+        "precondition: the assignment is still live when the receipt lands"
+    );
+    // Drive the REAL close: a validated VERIFIED receipt auto-closes its review
+    // task, whose terminal event is what retires the assignment. Constructing the
+    // Done event by hand would skip the guard that makes this the production
+    // shape — with the row already `Done`, `cancel_review_assignment_task`
+    // refuses `Done → Cancelled` and the notice never appears, so a
+    // hand-built event tests a path production never takes (#9's actual bug).
+    assert!(
+        crate::tasks::auto_close::auto_close_on_validated_review(
+            &home,
+            task_id,
+            "reviewer",
+            "VERIFIED\n\n### Evidence\nran: cargo test → passed",
+        )
+        .unwrap(),
+        "precondition: the validated receipt closes its exact review task"
+    );
+    assert_eq!(
+        task_status(&home, task_id),
+        crate::task_events::TaskStatus::Done
+    );
+
+    let notices = retirement_notices(&home, "reviewer", assignment.assignment_id);
+    let kinds: Vec<String> = notices
+        .iter()
+        .map(|m| m.kind.clone().unwrap_or_default())
+        .collect();
+    let texts: Vec<String> = notices.iter().map(|m| m.text.clone()).collect();
+    let froms: Vec<String> = notices.iter().map(|m| m.from.clone()).collect();
+
+    // The retirement is still SURFACED — #9 is about saying WHY, not about
+    // going quiet. Silently dropping the notice would satisfy the "no revoked
+    // semantics" assertions below while removing the reviewer's only signal
+    // that its assignment is gone, so pin its presence explicitly.
+    assert_eq!(
+        notices.len(),
+        1,
+        "the retirement must still be surfaced once, got {kinds:?} / {texts:?}"
+    );
+    assert!(
+        !kinds.iter().any(|k| k == "review-assignment-revoked"),
+        "#9: a settled review must not emit a revoked-kind notice, got {kinds:?} / {texts:?}"
+    );
+    for text in &texts {
+        assert!(
+            !text.contains("has been revoked"),
+            "#9: a settled review must not tell the reviewer it was revoked: {text:?}"
+        );
+    }
+    for from in &froms {
+        assert_ne!(
+            from, "lead",
+            "#9: a system-driven retirement must not be attributed to the dispatching lead: {from:?}"
+        );
+    }
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// An explicit revoke IS a revocation, and it must still be attributable to the
+/// real actor (`record.sender`) — the notice is the only signal that the
+/// reviewer's outstanding work was withdrawn.
+#[test]
+fn explicit_revoke_keeps_revocation_shape_and_names_the_actor_9() {
+    let home = tmp_home("9-explicit");
+    let assignment = mk_record("o/r", "feat/explicit", "reviewer", 42, "2026-10-09T00:00:00Z");
+    persist(&home, &assignment).unwrap();
+    durable_enqueue(&home, "o/r", "feat/explicit", "reviewer", "2026-10-09T00:00:05Z").unwrap();
+    mark_row_read(&home, "reviewer", &assignment.delivery_nonce, "2026-10-09T00:00:07Z");
+
+    assert!(revoke(&home, "o/r", "feat/explicit", "reviewer", "2026-10-09T00:00:10Z").unwrap());
+
+    let notices = retirement_notices(&home, "reviewer", assignment.assignment_id);
+    assert_eq!(
+        notices.len(),
+        1,
+        "an already-read explicit revoke must still surface exactly one notice"
+    );
+    let notice = &notices[0];
+    assert_eq!(
+        notice.kind.as_deref(),
+        Some("review-assignment-revoked"),
+        "an explicit revoke keeps the revocation shape: {:?}",
+        notice.text
+    );
+    assert!(
+        notice.text.contains("has been revoked"),
+        "the wording must still say revoked: {:?}",
+        notice.text
+    );
+    assert_eq!(
+        notice.from, "lead",
+        "the notice must name the REAL actor who revoked it, not a system identity"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Nonce dedup and the supersede relationship are load-bearing and must be
+/// untouched by the cause projection: a second retirement pass must not emit a
+/// second notice, and the original delivery row must still be superseded rather
+/// than reset.
+#[test]
+fn cause_projection_preserves_nonce_dedup_and_supersede_9() {
+    let home = tmp_home("9-dedup");
+    let task_id = "t-dedup-review";
+    seed_open_task(&home, task_id);
+    let mut assignment = mk_record("o/r", "feat/dedup", "reviewer", 42, "2026-10-09T00:00:00Z");
+    assignment.task_id = task_id.into();
+    persist(&home, &assignment).unwrap();
+    durable_enqueue(&home, "o/r", "feat/dedup", "reviewer", "2026-10-09T00:00:05Z").unwrap();
+    mark_row_read(&home, "reviewer", &assignment.delivery_nonce, "2026-10-09T00:00:07Z");
+
+    assert!(
+        crate::tasks::auto_close::auto_close_on_validated_review(
+            &home,
+            task_id,
+            "reviewer",
+            "VERIFIED",
+        )
+        .unwrap()
+    );
+    assert!(
+        list_active(&home, "o/r", "feat/dedup").is_empty(),
+        "precondition: the terminal event retired the authority record"
+    );
+    let first = retirement_notices(&home, "reviewer", assignment.assignment_id).len();
+    assert!(
+        first <= 1,
+        "one retirement must never emit more than one notice, got {first}"
+    );
+
+    // Replay: the authority record is gone, so nothing may be enqueued again.
+    let key_seq = crate::task_events::catalog::for_home(&home)
+        .statuses(&[crate::task_events::TaskId::from(task_id)])
+        .unwrap()
+        .into_iter()
+        .find_map(|snapshot| snapshot.terminal_event.map(|(_, seq)| seq))
+        .expect("the close recorded a terminal event");
+    retire_for_terminal_event(
+        &home,
+        "default",
+        task_id,
+        "system:auto_close",
+        key_seq,
+        "2026-10-09T00:00:11Z",
+    )
+    .unwrap();
+    let after_replay = retirement_notices(&home, "reviewer", assignment.assignment_id).len();
+
+    assert_eq!(after_replay, first, "a replayed retirement must not duplicate");
+    assert!(
+        !crate::inbox::storage::nonce_present_actionable(
+            &home,
+            "reviewer",
+            &assignment.delivery_nonce
+        ),
+        "the original actionable delivery must stay superseded"
+    );
+    let original = rows_with_nonce(&home, "reviewer", &assignment.delivery_nonce);
+    assert_eq!(original.len(), 1, "the original row is superseded, not removed");
+    // supersede_by_nonce_strict stamps `superseded_by` only on an UNREAD row; a
+    // row the reviewer already read is retired by its read_at staying set and
+    // the row never becoming actionable again. Either spelling is a supersede —
+    // what must NOT change is that the row is neither reset nor re-delivered.
+    assert!(
+        original[0].superseded_by.is_some() || original[0].read_at.is_some(),
+        "the original row must remain retired: {:?}",
+        original[0]
+    );
+    assert_eq!(
+        original[0].read_at.as_deref(),
+        Some("2026-10-09T00:00:07Z"),
+        "supersede must never reset read_at in place"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
