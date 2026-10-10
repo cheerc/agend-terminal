@@ -778,6 +778,20 @@ fn release_known_locked(
                         was_dirty: false,
                     };
                 }
+                BaselineDecision::DiversionFailed { error } => {
+                    // Fail closed: the remnant stays on disk with its binding.
+                    let mut out = ReleaseOutcome::default();
+                    mark_release_incomplete(&mut out, "worktree_diversion", wt_path, error);
+                    return LockedRelease {
+                        out,
+                        notices: Vec::new(),
+                        clear_refusal_marker: None,
+                        finish_full_release: false,
+                        managed_verified: false,
+                        worktree_absent: false,
+                        was_dirty: false,
+                    };
+                }
             };
             if is_daemon_managed(wt_path) {
                 permit.set_stage("preserve_wip");
@@ -1518,6 +1532,12 @@ fn release_bound_target_exact_impl(
             drop(_agent_lock);
             return partial_removal::diverted_release_outcome(&archive, || drop(branch_lock));
         }
+        BaselineDecision::DiversionFailed { error } => {
+            drop(_binding_lock);
+            drop(_agent_lock);
+            drop(branch_lock);
+            return partial_removal::diversion_failed_outcome(&error, target);
+        }
     };
     #[cfg(test)]
     release_test_seam::hit(ReleaseTestPhase::BeforeWorktreeRemove);
@@ -2046,6 +2066,11 @@ fn release_absent_target_impl(
             drop(_binding_lock);
             drop(_agent_lock);
             return partial_removal::diverted_release_outcome(&archive, || ());
+        }
+        BaselineDecision::DiversionFailed { error } => {
+            drop(_binding_lock);
+            drop(_agent_lock);
+            return partial_removal::diversion_failed_outcome(&error, target);
         }
     };
     if matches!(target_state, crate::mcp::handlers::TargetState::Present) {

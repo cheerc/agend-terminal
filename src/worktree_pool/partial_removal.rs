@@ -393,6 +393,19 @@ pub(super) fn remove_worktree(
 /// So the shared part lives here and the caller supplies only what genuinely
 /// differs: `release_extra` drops whatever guards this particular route holds
 /// beyond the binding and agent locks, which are common to all three.
+///
+/// The outcome for a release whose required diversion could not complete.
+///
+/// Fails closed on both counts that matter: `released` stays false so no caller
+/// reports success, and the worktree path is carried so the operator is told
+/// which directory is still sitting there. The binding is untouched because the
+/// route returns before reaching any binding-removal step.
+pub(super) fn diversion_failed_outcome(error: &str, worktree: &Path) -> super::ReleaseOutcome {
+    let mut out = super::ReleaseOutcome::default();
+    mark_release_incomplete(&mut out, "worktree_diversion", worktree, error.to_string());
+    out
+}
+
 pub(super) fn diverted_release_outcome(
     archive: &Path,
     release_extra: impl FnOnce(),
@@ -412,6 +425,17 @@ pub(super) enum BaselineDecision {
     /// The remnant was archived instead of released. `archive` is where the
     /// payload — including everything still on disk — now lives.
     Diverted { archive: PathBuf },
+    /// A diversion was required and could NOT be completed: the archive could
+    /// not be written, or the rename failed.
+    ///
+    /// Deliberately distinct from `Proceed(None)`. `Proceed(None)` is not
+    /// "stop" — `remove_worktree` treats a `None` baseline by snapshotting the
+    /// tree itself and then removing it, so returning it after a failed
+    /// diversion would delete the one remaining copy of a damaged worktree.
+    /// That is the exact behaviour #39 exists to prevent, so the failure needs
+    /// its own arm: the route must report an error and keep both the directory
+    /// and the binding.
+    DiversionFailed { error: String },
 }
 
 /// #39: divert a `WorktreeUnusable` remnant to an archive, else return the
@@ -431,7 +455,7 @@ pub(super) enum BaselineDecision {
 ///
 /// An unreadable journal, a schema this daemon does not understand, a binding
 /// that will not resolve to a known digest, or a journal belonging to an
-/// earlier generation of a reused name — all mean "do not divert", and the
+/// earlier incarnation of a reused name — all mean "do not divert", and the
 /// release proceeds exactly as if no journal existed. A corrupt journal is not
 /// evidence of damage, and refusing to release on the strength of one would be a
 /// worse failure than releasing.
@@ -450,24 +474,25 @@ pub(super) fn unusable_divert_before_snapshot(
     match divert_to_archive(home, agent, worktree) {
         Ok(archive) => BaselineDecision::Diverted { archive },
         Err(error) => {
-            // The archive is the only safe destination for a damaged remnant —
-            // falling through would let the release destroy it. Surface the
-            // failure and take no baseline, so the route cannot proceed to a
-            // removal it has no record of.
+            // The archive is the only safe destination for a damaged remnant.
+            // Failing closed here is the whole point: `Proceed(None)` would NOT
+            // stop the release, it would hand `remove_worktree` a `None` baseline
+            // that function resolves by snapshotting — and then deleting — the
+            // surviving directory.
             tracing::error!(
                 agent,
                 path = %worktree.display(),
                 error = %error,
                 "#39: diverting the unusable remnant to an archive failed; the release \
-                 will not remove the surviving directory"
+                 is refusing to remove the surviving directory"
             );
-            BaselineDecision::Proceed(None)
+            BaselineDecision::DiversionFailed { error }
         }
     }
 }
 
 /// True when this release must divert because a `WorktreeUnusable` journal
-/// belongs to the binding generation that is live right now.
+/// belongs to the binding whose digest is live right now.
 fn must_divert_unusable(home: &Path, agent: &str) -> bool {
     let tombstone = match crate::agent::deletion_recovery::read(home, agent) {
         Ok(Some(tombstone)) => tombstone,
@@ -511,8 +536,14 @@ fn divert_to_archive(home: &Path, agent: &str, worktree: &Path) -> Result<PathBu
             ))
         }
     };
+    // The first argument is WHERE THE MANIFEST IS WRITTEN, not where the archive
+    // will be. It must be the SOURCE, so the rename carries the evidence into the
+    // archive with the payload — the same order the admin lane uses
+    // (`write_archive_metadata(&target, …)` then rename). Writing it to
+    // `&archive` instead makes that directory non-empty, and renaming a
+    // directory onto a non-empty one fails with ENOTEMPTY.
     crate::admin::archive_mechanics::write_preservation_manifest(
-        &archive,
+        worktree,
         agent,
         "",
         worktree,

@@ -8224,29 +8224,26 @@ fn unusable_state_then_retry_reaches_which_removal_arm_39() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
-/// #39: the case where the guard is actually load-bearing.
+/// #39 PR-3 (2): when a diversion is required but the archive cannot be
+/// written, the release must FAIL CLOSED — the damaged directory and its
+/// binding both survive.
 ///
-/// The reachability probe showed a retry that succeeds clears the journal on the
-/// success path, so it cannot distinguish guarded from unguarded. This drives the
-/// scenario that does: the `Removed` arm is reached, the recovery state is
-/// written, and then the release is interrupted BEFORE the journal is cleared.
+/// The bug this pins: `Proceed(None)` looks like "stop", but `remove_worktree`
+/// resolves a `None` baseline by snapshotting the tree itself and then removing
+/// it. So returning `Proceed(None)` after a failed archive deleted the only
+/// remaining copy — precisely what #39 exists to prevent.
 ///
-/// Without the guard, `mark_recovery_required` downgrades `WorktreeUnusable` to
-/// `RecoveryRequired` and erases `cause` — and because the journal then SURVIVES
-/// (the clear never ran), that downgrade is permanent. `binding_state` reports
-/// the operator's only view of the damage source through `worktree_unusable`,
-/// so from then on the damage is invisible. That is the #39 failure this guard
-/// exists to prevent.
-///
-/// Uses the existing `AfterWorktreeRemoveBeforeBindingClear` phase — no new seam.
+/// The fault is injected by making the preservation root a regular file, so
+/// `preservation_directory`'s `create_dir_all` fails and `divert_to_archive`
+/// cannot complete.
 #[test]
-fn interruption_after_removed_arm_keeps_the_damage_source_visible_39() {
-    let home = tmp_home("39-guard-loadbearing");
-    let repo = tmp_repo("39-guard-loadbearing-repo");
-    let lease = lease_bound(&home, &repo, "agent-39", "feat/guard");
+fn failed_diversion_keeps_the_remnant_and_reports_error_39() {
+    let home = tmp_home("39-failed-diversion");
+    let repo = tmp_repo("39-failed-diversion-repo");
+    let lease = lease_bound(&home, &repo, "agent-39fd", "feat/faildiv");
 
     let tracked = lease.path.join("tracked.txt");
-    std::fs::write(&tracked, b"committed\n").expect("seed tracked file");
+    std::fs::write(&tracked, b"the only remaining copy\n").expect("seed tracked file");
     git_in(&lease.path, &["add", "tracked.txt"]);
     git_in(
         &lease.path,
@@ -8261,7 +8258,7 @@ fn interruption_after_removed_arm_keeps_the_damage_source_visible_39() {
         ],
     );
 
-    // Attempt 1: partial removal → Unusable, which is the state at risk.
+    // Attempt 1: partial removal → WorktreeUnusable.
     let doomed = tracked.clone();
     let hook1 = release_test_seam::install(move |phase| {
         if phase == ReleaseTestPhase::BeforeWorktreeRemove {
@@ -8269,53 +8266,180 @@ fn interruption_after_removed_arm_keeps_the_damage_source_visible_39() {
             release_test_seam::fail_next_remove(std::io::ErrorKind::TimedOut);
         }
     });
-    release_full(&home, "agent-39", false);
+    let first = release_full(&home, "agent-39fd", false);
+    drop(hook1);
+    assert_eq!(
+        first.stage,
+        Some("worktree_remove"),
+        "precondition: attempt 1 must be the damaged removal"
+    );
+    assert!(
+        crate::agent::deletion_recovery::read(&home, "agent-39fd")
+            .expect("readable")
+            .is_some_and(|t| matches!(
+                t.state,
+                crate::agent::deletion_recovery::State::WorktreeUnusable { .. }
+            )),
+        "precondition: attempt 1 must leave Unusable"
+    );
+
+    // Block the archive: the preservation root becomes a regular file, so
+    // creating the directory under it cannot succeed.
+    let root = crate::admin::archive_mechanics::preservation_root(&home);
+    std::fs::create_dir_all(root.parent().expect("root has a parent")).expect("create parent");
+    std::fs::write(&root, b"not a directory").expect("block the preservation root");
+
+    // Attempt 2: the gate fires, the diversion is required, and it fails.
+    let second = release_full(&home, "agent-39fd", false);
+
+    // Fail closed: no success, an error naming the failed stage.
+    assert!(
+        !second.released,
+        "#39: a failed diversion must never report success: {second:?}"
+    );
+    assert_eq!(
+        second.stage,
+        Some("worktree_diversion"),
+        "#39: the failure must be attributed to the diversion stage: {second:?}"
+    );
+    let reported = second.error.clone().unwrap_or_default();
+    assert!(
+        reported.contains("preservation") || reported.contains("archive"),
+        "#39: the error must say the archive could not be written: {reported:?}"
+    );
+
+    // The remnant is still on disk, and the binding still points at it.
+    assert!(
+        lease.path.exists(),
+        "#39: a failed diversion must NOT delete the surviving directory"
+    );
+    assert!(
+        crate::binding::read(&home, "agent-39fd").is_some(),
+        "#39: a failed diversion must keep the binding so the remnant stays attributable"
+    );
+
+    std::fs::remove_file(&root).ok();
+    drop(lease);
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// #39 PR-3: re-entering a `WorktreeUnusable` release must divert to a
+/// preservation archive, and the journal must come out the far side still
+/// `Unusable` with its `cause` intact.
+///
+/// This is the end-to-end evidence that the diversion holds. The two tests it
+/// replaces each proved one primitive in isolation — one that the gate picks
+/// up, one that a failed archive fails closed — and neither drove the sequence
+/// that actually matters: partial removal, then re-release, then check that the
+/// payload survived AND that the damage source is still readable.
+///
+/// The mutation probe that matters here is therefore "remove the gate", not
+/// "make the archive fail". Without the gate the retry reaches the
+/// `Removed` arm, `mark_recovery_required` runs, and the journal is
+/// downgraded — that is the one thing #39 PR-1 exists to prevent, and this
+/// test is what now holds it in place.
+#[test]
+fn re_entering_release_archives_the_remnant_and_keeps_the_cause_39() {
+    let home = tmp_home("39-diversion-e2e");
+    let repo = tmp_repo("39-diversion-e2e-repo");
+    let lease = lease_bound(&home, &repo, "agent-39e2e", "feat/diversion");
+
+    let tracked = lease.path.join("tracked.txt");
+    std::fs::write(&tracked, b"work nobody has looked at yet\n").expect("seed tracked");
+    git_in(&lease.path, &["add", "tracked.txt"]);
+    git_in(
+        &lease.path,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "seed",
+        ],
+    );
+
+    // Attempt 1: the removal is killed after unlinking the tracked file.
+    let doomed = tracked.clone();
+    let hook1 = release_test_seam::install(move |phase| {
+        if phase == ReleaseTestPhase::BeforeWorktreeRemove {
+            std::fs::remove_file(&doomed).expect("simulate partial git walk");
+            release_test_seam::fail_next_remove(std::io::ErrorKind::TimedOut);
+        }
+    });
+    release_full(&home, "agent-39e2e", false);
     drop(hook1);
 
-    let after_first = crate::agent::deletion_recovery::read(&home, "agent-39")
+    let after_first = crate::agent::deletion_recovery::read(&home, "agent-39e2e")
         .expect("readable")
         .expect("journal present");
-    let crate::agent::deletion_recovery::State::WorktreeUnusable { cause } =
-        after_first.state.clone()
-    else {
-        panic!(
-            "precondition: attempt 1 must leave Unusable, got {:?}",
-            after_first.state
-        );
+    let original_cause = match &after_first.state {
+        crate::agent::deletion_recovery::State::WorktreeUnusable { cause } => cause.clone(),
+        other => panic!("precondition: attempt 1 must leave Unusable, got {other:?}"),
     };
 
-    // Attempt 2: the removal completes (Removed arm), the recovery state is
-    // written, and the daemon dies before the journal is cleared.
-    let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _hook = release_test_seam::install(|phase| {
-            if phase == ReleaseTestPhase::AfterWorktreeRemoveBeforeBindingClear {
-                panic!("simulate daemon interruption before the journal is cleared");
-            }
-        });
-        release_full(&home, "agent-39", false);
-    }));
+    // Attempt 2: the gate diverts before the snapshot.
+    let second = release_full(&home, "agent-39e2e", false);
     assert!(
-        interrupted.is_err(),
-        "the seam must simulate an interruption"
+        second.released,
+        "#39: a successful diversion must report success: {second:?}"
+    );
+    let archive = PathBuf::from(
+        second
+            .path
+            .clone()
+            .expect("a diverted release must report the archive path"),
     );
 
-    // The journal must SURVIVE the interruption — that is what makes the
-    // difference between guarded and unguarded observable at all.
-    let after_second = crate::agent::deletion_recovery::read(&home, "agent-39")
-        .expect("readable after interruption")
-        .expect("#39: journal must survive — it is only cleared on the success path");
-
-    assert_eq!(
-        after_second.state,
-        crate::agent::deletion_recovery::State::WorktreeUnusable {
-            cause: cause.clone()
-        },
-        "#39: the guard must keep the damage source intact when the release is \
-         interrupted after the Removed arm. Unguarded, this transition erases the \
-         cause AND leaves the downgraded journal behind permanently, so \
-         binding_state stops reporting worktree_unusable."
+    // The payload is preserved, not deleted.
+    assert!(
+        archive.exists(),
+        "#39: the archive must exist after a diversion: {}",
+        archive.display()
+    );
+    assert!(
+        !lease.path.exists(),
+        "#39: the damaged directory must have MOVED into the archive, not been deleted"
     );
 
+    // And it landed under the preservation root, not under a sweepable one.
+    let preserved_root = crate::admin::archive_mechanics::preservation_root(&home);
+    assert!(
+        archive.starts_with(&preserved_root),
+        "#39: archives must live under {} — purge_trash read_dirs its own root \
+         with no namespace selector",
+        preserved_root.display()
+    );
+
+    // The manifest travelled with the payload and names the damage.
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(archive.join(".agend-preservation-manifest.json"))
+            .expect("manifest travelled with the payload"),
+    )
+    .expect("manifest parses");
+    assert_eq!(manifest["damage_cause"], original_cause);
+    assert_eq!(manifest["instance"], "agent-39e2e");
+
+    // The journal is GONE after a diversion, and that is the accepted
+    // consequence of decision (甲) — not a defect. `release_full` clears it on
+    // the success path, and the diversion reports success because it genuinely
+    // succeeded. So the damage source moves from the journal to the archive's
+    // manifest (`damage_cause`, asserted above): diagnosability is preserved,
+    // it just lives somewhere else now. Changing `clear` to keep the journal is
+    // #39 PR-5's scope, not this ticket's.
+    //
+    // Asserting "if the journal survived it would be intact" would pin a branch
+    // that cannot be reached, which would claim a protection that does not
+    // exist. The reachable facts are asserted above instead.
+    assert!(
+        crate::agent::deletion_recovery::read(&home, "agent-39e2e")
+            .expect("readable")
+            .is_none(),
+        "#39 (a): a completed diversion clears the journal by design — the damage \
+         source lives in the archive manifest, not here"
+    );
     drop(lease);
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&repo).ok();
