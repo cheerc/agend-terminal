@@ -1,101 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn canonicalize_with_missing_tail(path: &Path) -> Result<PathBuf, String> {
-    let mut missing = Vec::new();
-    let mut existing = path.to_path_buf();
-    while !existing.exists() {
-        let component = existing
-            .file_name()
-            .ok_or_else(|| format!("path has no canonicalizable parent: {}", path.display()))?;
-        missing.push(component.to_os_string());
-        existing = existing
-            .parent()
-            .ok_or_else(|| format!("path has no canonicalizable parent: {}", path.display()))?
-            .to_path_buf();
-    }
-    let mut canonical = existing
-        .canonicalize()
-        .map_err(|e| format!("canonicalize {}: {e}", existing.display()))?;
-    for component in missing.iter().rev() {
-        canonical.push(component);
-    }
-    Ok(canonical)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn write_archive_metadata(
-    directory: &Path,
-    actor: &str,
-    audit_reason: &str,
-    instance: &str,
-    branch: &str,
-    source_repo: &Path,
-    original_worktree: &Path,
-    archived_worktree: &Path,
-    binding_body: &[u8],
-    binding_signature: &[u8],
-) -> Result<(), String> {
-    let binding_path = directory.join(".agend-recovery-binding.json");
-    if let Ok(existing) = std::fs::read(&binding_path) {
-        if existing != binding_body {
-            return Err(format!(
-                "recovery metadata collision at {}",
-                binding_path.display()
-            ));
-        }
-    }
-    let signature_path = directory.join(".agend-recovery-binding.json.sig");
-    if let Ok(existing) = std::fs::read(&signature_path) {
-        if existing != binding_signature {
-            return Err(format!(
-                "recovery signature metadata collision at {}",
-                signature_path.display()
-            ));
-        }
-    }
-    let manifest_path = directory.join(".agend-recovery-manifest.json");
-    let manifest = serde_json::json!({
-        "schema_version": 1,
-        "actor": actor,
-        "audit_reason": audit_reason,
-        "instance": instance,
-        "branch": branch,
-        "source_repo": source_repo,
-        "original_worktree": original_worktree,
-        "archived_worktree": archived_worktree,
-        "binding_sha256": crate::daemon::utils::sha256_hex(binding_body),
-    });
-    if let Ok(existing) = std::fs::read(&manifest_path) {
-        let existing: serde_json::Value = serde_json::from_slice(&existing)
-            .map_err(|e| format!("parse existing recovery manifest: {e}"))?;
-        if existing["instance"] != instance
-            || existing["archived_worktree"] != archived_worktree.to_string_lossy().as_ref()
-        {
-            return Err(format!(
-                "recovery manifest metadata collision at {}",
-                manifest_path.display()
-            ));
-        }
-    }
-    if !binding_path.is_file() {
-        crate::store::atomic_write(&binding_path, binding_body).map_err(|e| e.to_string())?;
-    }
-    if !signature_path.is_file() {
-        crate::store::atomic_write(&signature_path, binding_signature)
-            .map_err(|e| e.to_string())?;
-    }
-    if !manifest_path.is_file() {
-        crate::store::atomic_write(
-            &manifest_path,
-            serde_json::to_string_pretty(&manifest)
-                .map_err(|e| e.to_string())?
-                .as_bytes(),
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
+// #39: these two moved to `admin::archive_mechanics`; the imports keep every
+// call site below byte-identical, which is what makes this a refactor rather
+// than a change. `SystemTime`/`UNIX_EPOCH` stay here — the archive-path stamp
+// in `recover_absent_worktree` is still constructed inline at its call site.
+use crate::admin::archive_mechanics::{canonicalize_with_missing_tail, write_archive_metadata};
 
 /// Finish recovery when the release already removed the physical worktree but
 /// crashed before clearing its signed binding. The archive is a durable

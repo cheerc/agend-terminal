@@ -1,5 +1,7 @@
 //! Admin utilities — manual maintenance commands.
 
+/// #39: the mechanical half of archiving a worktree, shared by the recovery lane.
+pub(crate) mod archive_mechanics;
 pub mod cleanup_zombies;
 pub mod worktree_recovery;
 // #3273 V1. Dead-code analysis is per-crate: the binary uses only the subset
