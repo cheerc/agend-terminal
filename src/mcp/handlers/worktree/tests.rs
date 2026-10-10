@@ -1889,7 +1889,12 @@ fn bind_self_then_release_worktree_clean_state() {
 /// creates the worktree, and the disclosure is read on the SECOND (idempotent)
 /// bind. That is deliberate — it proves the payload is derived from the
 /// worktree on disk at response time, not cached from bind #1.
-fn bind_twice_with_claude_md(home: &std::path::Path, agent: &str, branch: &str, contents: &[u8]) -> (Value, std::path::PathBuf) {
+fn bind_twice_with_claude_md(
+    home: &std::path::Path,
+    agent: &str,
+    branch: &str,
+    contents: &[u8],
+) -> (Value, std::path::PathBuf) {
     let repo = p17_setup_repo(home, agent);
     let first = handle_bind_self(
         home,
@@ -1909,7 +1914,11 @@ fn bind_twice_with_claude_md(home: &std::path::Path, agent: &str, branch: &str, 
         &json!({"repository_path": repo.to_str().unwrap(), "branch": branch}),
         &sender_for(agent),
     );
-    assert_eq!(second["bound"].as_bool(), Some(true), "second bind: {second}");
+    assert_eq!(
+        second["bound"].as_bool(),
+        Some(true),
+        "second bind: {second}"
+    );
     (second, worktree)
 }
 
@@ -1957,7 +1966,10 @@ fn bind_self_discloses_both_spec_files_without_precedence_35() {
     );
     assert_eq!(first["bound"].as_bool(), Some(true), "{first}");
     let worktree = std::path::PathBuf::from(
-        first["worktree_path"].as_str().expect("worktree_path").to_string(),
+        first["worktree_path"]
+            .as_str()
+            .expect("worktree_path")
+            .to_string(),
     );
     std::fs::write(worktree.join("CLAUDE.md"), b"claude").unwrap();
     std::fs::write(worktree.join("AGENTS.md"), b"agents").unwrap();
@@ -1987,7 +1999,12 @@ fn bind_self_discloses_both_spec_files_without_precedence_35() {
     );
     assert_eq!(names.len(), 2, "no other files may be listed: {names:?}");
     for doc in docs {
-        let keys: Vec<&str> = doc.as_object().unwrap().keys().map(String::as_str).collect();
+        let keys: Vec<&str> = doc
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         assert_eq!(
             keys,
             vec!["bytes", "path"],
@@ -2012,7 +2029,10 @@ fn bind_self_omits_subdirectory_project_docs_35() {
     );
     assert_eq!(first["bound"].as_bool(), Some(true), "{first}");
     let worktree = std::path::PathBuf::from(
-        first["worktree_path"].as_str().expect("worktree_path").to_string(),
+        first["worktree_path"]
+            .as_str()
+            .expect("worktree_path")
+            .to_string(),
     );
     std::fs::write(worktree.join("CLAUDE.md"), b"root").unwrap();
     std::fs::create_dir_all(worktree.join("sub")).unwrap();
@@ -2056,7 +2076,10 @@ fn bind_self_skips_non_utf8_and_non_regular_project_docs_silently_35() {
     );
     assert_eq!(first["bound"].as_bool(), Some(true), "{first}");
     let worktree = std::path::PathBuf::from(
-        first["worktree_path"].as_str().expect("worktree_path").to_string(),
+        first["worktree_path"]
+            .as_str()
+            .expect("worktree_path")
+            .to_string(),
     );
     // Three files at the root, deliberately in different states:
     //  - `CLAUDE.md`  GOOD (control: skipping is per-file, not a blanket bail)
