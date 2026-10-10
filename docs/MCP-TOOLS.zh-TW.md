@@ -282,6 +282,7 @@ Drain 或管理 caller 的 durable inbox。
 
 - 必填：`branch`；可選 `repository_path`、`rebase_mode` 與 `task_id`。
 - 受保護分支與跨 agent lease conflict 會被拒絕；它不會默默建立 CI continuation。
+- 成功時，`project_docs` 會以 `{path, bytes}` 條目列出 **worktree root** 的規範檔。`CLAUDE.md` 與 `AGENTS.md` 若存在會同時列出，兩者之間不排優先序；也不掃描子目錄。這是路徑索引，不是預載——檔案內容一律不包含在內，由 agent 自己決定何時讀取。找不到、非 UTF-8 或不是一般檔案的規範檔會靜略過（不會新增任何 warning 欄位）。
 
 ### `release_worktree`
 
