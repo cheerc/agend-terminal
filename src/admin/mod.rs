@@ -1,6 +1,10 @@
 //! Admin utilities — manual maintenance commands.
 
-/// #39: the mechanical half of archiving a worktree, shared by the recovery lane.
+/// #39: the mechanical half of archiving a worktree, shared by the recovery
+/// lane. The preservation primitives at the end of this module have no
+/// production caller until #39 PR-3 lands the release-lane diversion, so
+/// non-test builds allow dead code here and say so.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod archive_mechanics;
 pub mod cleanup_zombies;
 pub mod worktree_recovery;
