@@ -2361,23 +2361,30 @@ fn a_terminal_close_keeps_the_receipt_7() {
 /// A withdrawal drops only the NAMED assignment.
 ///
 /// Discrimination is proven directly on the filter rather than through a
-/// retirement path, for two independent reasons:
+/// retirement path, because the scenario an end-to-end witness would need is
+/// UNREPRESENTABLE in the only store this guard touches:
 ///
-/// 1. `revoke` never reaches `retire_delivery_under_lock` at all, so it carries
-///    no drop (a separate residual, tracked in t-20261010090202361507-72575-42).
-/// 2. The only guard arm a retirement can currently supply is `Retired`, from
-///    `retire_for_review_class_correction` — whose raw cause for every OTHER
-///    assignment on the branch is `TaskTerminalUnattributed`, which the narrowed
-///    guard deliberately leaves alone. So no retirement path drops exactly one
-///    assignment while sparing a sibling, and an end-to-end witness is not
-///    reachable at this head.
+/// A receipt's head must satisfy BOTH conditions to be admitted to
+/// `PrState.validated_review_receipts` — `matches_state` requires
+/// `summary.reviewed_head == state.head_sha` (`review_receipt.rs:123`), and
+/// `assignment_still_authorizes` requires
+/// `assignment.reviewed_head == summary.reviewed_head` (`review_receipt.rs:526`).
+/// Two sibling assignments with different heads therefore cannot BOTH hold a
+/// receipt there, and that store is exactly what `drop_receipts_for_assignment`
+/// writes and `receipt_ids` reads. So "drop one, spare a sibling" cannot be
+/// staged, and no test could witness it without fabricating state.
 ///
-/// (Correction, r1 review F1: an earlier version of this doc claimed the
-/// correction path clears the whole subject's receipts after retiring. It does
-/// not — `invalidate_validated_for_subject` deletes files under
-/// `pr_state/validated-verdict-buffer/`, a separate store from
-/// `PrState.validated_review_receipts`, which is what this guard writes and what
-/// `receipt_ids` reads. The real reason the old end-to-end test went red is (2).)
+/// Correction history — three revisions of this rationale, the first two WRONG.
+/// Kept because their value is not that they were wrong but that they show how
+/// easily this argument looks sound without being executed:
+/// 1. claimed the correction path clears the whole subject's receipts — FALSE;
+///    `invalidate_validated_for_subject` clears a separate verdict buffer.
+/// 2. claimed no retirement path can drop one assignment and spare a sibling —
+///    FALSE; the two-condition filter (`pr_number` AND `reviewed_head`) does allow
+///    exactly that. The blocker is receipt ADMISSION, not assignment coexistence.
+/// 3. current: admission requires a single head, so the scenario is
+///    unrepresentable — established by attempting the fixture, which cannot get a
+///    second sibling receipt admitted.
 #[test]
 fn the_drop_filter_matches_assignment_id_and_spares_siblings_7() {
     let home = tmp_home("7-b2-filter-precision");
