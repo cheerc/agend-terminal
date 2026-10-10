@@ -2219,3 +2219,198 @@ fn same_branch_replacement_stays_replaced_even_with_a_receipt_9() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── #7: retiring an assignment must retire its receipt ─────────────────────
+//
+// A non-VERIFIED receipt is a per-ASSIGNMENT record (`assignment_id` is the
+// discriminating column `apply_receipt_to_state` already dedupes on), but it
+// outlived the assignment: `retire_delivery_under_lock` removed the record file
+// and left `validated_review_receipts` untouched, while `merge_readiness` scans
+// those receipts without ever asking whether the assignment still exists. The
+// production incident (2026-10-04, `student-billing` PR #85) is the visible
+// shape — a revoked reviewer's REJECTED receipt kept blocking a merge after a
+// replacement reviewer had already delivered a valid VERIFIED one.
+
+/// #7 (B2): the root-cause guard. Retiring an assignment must drop the receipts
+/// that assignment produced, so no NEW stale receipt can be created.
+#[test]
+fn retiring_an_assignment_invalidates_its_receipts_7() {
+    for (label, verdict) in [
+        ("rejected", crate::review_receipt::ReviewVerdict::Rejected),
+        ("unverified", crate::review_receipt::ReviewVerdict::Unverified),
+    ] {
+        let home = tmp_home(&format!("7-b2-{label}"));
+        let task_id = format!("t-7-b2-{label}");
+        seed_branchless_task(&home, &task_id, "reviewer");
+        let head = "a".repeat(40);
+        let reviewer_id = crate::types::InstanceId::new();
+        let mut assignment = mk_record_typed(
+            "o/r",
+            &format!("feat/7-b2-{label}"),
+            "reviewer",
+            reviewer_id,
+            42,
+            "2026-10-10T00:00:00Z",
+        );
+        assignment.task_id = task_id.clone();
+        persist(&home, &assignment).unwrap();
+        pin_receipt_of_verdict(&home, &assignment, reviewer_id, &head, verdict);
+
+        let receipts_before = receipt_ids(&home, &assignment);
+        assert_eq!(
+            receipts_before.len(),
+            1,
+            "{label}: precondition: the receipt must exist before the retire"
+        );
+
+        assert!(
+            retire_if_id_matches(
+                &home,
+                &assignment.repo,
+                &assignment.branch,
+                &assignment.target,
+                assignment.assignment_id,
+                "2026-10-10T00:00:10Z",
+            )
+            .unwrap(),
+            "{label}: precondition: the assignment must be retired"
+        );
+
+        assert!(
+            receipt_ids(&home, &assignment).is_empty(),
+            "#7: retiring the assignment must drop ITS OWN receipts (judged by \
+             assignment_id, never reviewer name) — {label} still holds {}",
+            receipt_ids(&home, &assignment).len(),
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
+
+/// A receipt belonging to a DIFFERENT live assignment on the same branch must
+/// survive: the guard discriminates on `assignment_id`, so one reviewer holding
+/// two assignments (or a replacement reviewer on the same subject) is unaffected.
+#[test]
+fn retiring_one_assignment_keeps_another_live_assignments_receipt_7() {
+    let home = tmp_home("7-b2-survivor");
+    let head = "a".repeat(40);
+    let reviewer_id = crate::types::InstanceId::new();
+    let mut retiring = mk_record_typed(
+        "o/r",
+        "feat/7-b2-survivor",
+        "reviewer-a",
+        reviewer_id,
+        42,
+        "2026-10-10T00:00:00Z",
+    );
+    retiring.task_id = "t-7-survivor-retiring".into();
+    persist(&home, &retiring).unwrap();
+    pin_receipt_of_verdict(
+        &home,
+        &retiring,
+        reviewer_id,
+        &head,
+        crate::review_receipt::ReviewVerdict::Rejected,
+    );
+
+    // Same branch + same reviewer NAME is not enough to make two assignments;
+    // they carry distinct assignment_ids, which is what the guard matches on.
+    let mut surviving = mk_record_typed(
+        "o/r",
+        "feat/7-b2-survivor",
+        "reviewer-b",
+        reviewer_id,
+        42,
+        "2026-10-10T00:00:05Z",
+    );
+    surviving.task_id = "t-7-survivor-live".into();
+    persist(&home, &surviving).unwrap();
+    pin_receipt_of_verdict(
+        &home,
+        &surviving,
+        reviewer_id,
+        &head,
+        crate::review_receipt::ReviewVerdict::Rejected,
+    );
+
+    assert!(
+        retire_if_id_matches(
+            &home,
+            &retiring.repo,
+            &retiring.branch,
+            &retiring.target,
+            retiring.assignment_id,
+            "2026-10-10T00:00:10Z",
+        )
+        .unwrap()
+    );
+
+    let survivors = receipt_ids(&home, &surviving);
+    assert_eq!(
+        survivors.len(),
+        1,
+        "#7: a DIFFERENT assignment's receipt must survive the retire — it is \
+         still live authority"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Pin a validated receipt of an arbitrary verdict through the production
+/// `record_validated_receipt` entry (never hand-written PR state — a
+/// hand-written row makes a guard test pass for the wrong reason).
+fn pin_receipt_of_verdict(
+    home: &Path,
+    assignment: &ActiveAssignment,
+    reviewer_id: crate::types::InstanceId,
+    head: &str,
+    verdict: crate::review_receipt::ReviewVerdict,
+) {
+    crate::daemon::pr_state::record_ci_result(
+        home,
+        &assignment.repo,
+        &assignment.branch,
+        head,
+        crate::daemon::pr_state::CiConclusion::Green,
+        vec![assignment.sender.clone()],
+        assignment.review_class,
+    );
+    crate::daemon::pr_state::with_pr_state(home, &assignment.repo, &assignment.branch, |state| {
+        state.pr_number = assignment.pr_number;
+    })
+    .expect("seed pr_number");
+    let receipt = crate::review_receipt::ValidatedCodeReviewReceipt::for_test(
+        crate::review_receipt::ReviewReceiptSummary {
+            receipt_id: format!("review-receipt:m-7-{}", assignment.assignment_id),
+            source_id: format!("m-7-{}", assignment.assignment_id),
+            evidence_digest: "d".repeat(64),
+            assignment_id: assignment.assignment_id,
+            reviewer_instance_id: reviewer_id,
+            reviewer_name: assignment.target.clone(),
+            repo: assignment.repo.clone(),
+            pr_number: assignment.pr_number,
+            branch: assignment.branch.clone(),
+            task_id: assignment.task_id.clone(),
+            reviewed_head: head.to_string(),
+            review_class: assignment.review_class,
+            slot: crate::review_receipt::ReviewSlot::Primary,
+            verdict,
+        },
+    );
+    assert!(
+        crate::daemon::pr_state::record_validated_receipt(home, &receipt, None),
+        "precondition: the receipt must be recorded into PR state"
+    );
+}
+
+/// Assignment ids of the receipts currently held in PR state for `assignment`'s
+/// subject. Read from the persisted state, not from a producer's return value.
+fn receipt_ids(home: &Path, assignment: &ActiveAssignment) -> Vec<uuid::Uuid> {
+    crate::daemon::pr_state::load(home, &assignment.repo, &assignment.branch)
+        .map(|state| {
+            state
+                .validated_review_receipts
+                .iter()
+                .map(|receipt| receipt.assignment_id)
+                .collect()
+        })
+        .unwrap_or_default()
+}
