@@ -1397,18 +1397,35 @@ fn retire_delivery_under_lock(
         }
     }
 
-    // #7: the assignment is going away, so the receipts IT produced must go with
-    // it. Leaving them behind lets a stale non-VERIFIED receipt keep blocking
-    // `merge_readiness` after the reviewer was revoked or replaced — the
-    // 2026-10-04 `student-billing` PR #85 shape. Runs after the delivery is
-    // superseded and before the record is removed, so a failure here preserves
-    // the authority (the caller can retry) rather than orphaning the receipt.
-    crate::daemon::pr_state::drop_receipts_for_assignment(
-        home,
-        &record.repo,
-        &record.branch,
-        expected_id,
-    )?;
+    // #7: when an assignment is WITHDRAWN — revoked, replaced, or invalidated by
+    // a review-class correction — the receipts it produced must go with it, or a
+    // stale non-VERIFIED receipt keeps blocking `merge_readiness` forever.
+    //
+    // Terminal causes are deliberately EXCLUDED, and that exclusion is load-bearing
+    // rather than cautious: `TaskSettled` has no construction site outside
+    // `settled_only_if`, and every caller on the successful-settlement path
+    // (:1439, :1575, :1608, :1677) passes `TaskTerminalUnattributed`, because
+    // "this review settled" is INFERRED at :1392 from the receipt's presence — it
+    // never reaches this call. So a receipt that arrives with a terminal close IS
+    // the merge gate's authority, not residue: dropping it on that path deleted the
+    // VERIFIED receipt a settled review had just produced and broke
+    // `validated_receipt_projection_does_not_lose_the_verdict_8`. Terminal closes
+    // are left alone; only a genuine withdrawal drops.
+    //
+    // Runs after the delivery is superseded and before the record is removed, so a
+    // failure here preserves the authority (the caller can retry) rather than
+    // orphaning the receipt.
+    if matches!(
+        cause,
+        RetirementCause::ExplicitlyRevoked | RetirementCause::Replaced | RetirementCause::Retired
+    ) {
+        crate::daemon::pr_state::drop_receipts_for_assignment(
+            home,
+            &record.repo,
+            &record.branch,
+            expected_id,
+        )?;
+    }
 
     remove_if_assignment_matches_strict(&path, expected_id)
 }

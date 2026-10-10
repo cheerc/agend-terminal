@@ -2231,10 +2231,19 @@ fn same_branch_replacement_stays_replaced_even_with_a_receipt_9() {
 // shape — a revoked reviewer's REJECTED receipt kept blocking a merge after a
 // replacement reviewer had already delivered a valid VERIFIED one.
 
-/// #7 (B2): the root-cause guard. Retiring an assignment must drop the receipts
-/// that assignment produced, so no NEW stale receipt can be created.
+/// #7 (B2, narrowed by decision d-20261010090040792830-14): a receipt is dropped
+/// only when its assignment is WITHDRAWN — revoked, replaced, or invalidated by a
+/// review-class correction.
+///
+/// The terminal causes are excluded, and that is the substance rather than a
+/// caveat: `TaskSettled` has no construction site outside `settled_only_if`, and
+/// every caller on the successful-settlement path passes
+/// `TaskTerminalUnattributed`, because "this review settled" is INFERRED from the
+/// receipt's presence, never passed in. So on a terminal close the receipt IS the
+/// merge gate's authority — dropping it deleted the VERIFIED receipt a settled
+/// review had just produced.
 #[test]
-fn retiring_an_assignment_invalidates_its_receipts_7() {
+fn a_withdrawn_assignment_drops_its_receipts_7() {
     for (label, verdict) in [
         ("rejected", crate::review_receipt::ReviewVerdict::Rejected),
         (
@@ -2258,30 +2267,31 @@ fn retiring_an_assignment_invalidates_its_receipts_7() {
         assignment.task_id = task_id.clone();
         persist(&home, &assignment).unwrap();
         pin_receipt_of_verdict(&home, &assignment, reviewer_id, &head, verdict);
-
-        let receipts_before = receipt_ids(&home, &assignment);
         assert_eq!(
-            receipts_before.len(),
+            receipt_ids(&home, &assignment).len(),
             1,
             "{label}: precondition: the receipt must exist before the retire"
         );
 
+        // `Retired` is the reachable withdrawal cause on this path; it is what
+        // `retire_for_review_class_correction` passes.
         assert!(
-            retire_if_id_matches(
+            retire_for_review_class_correction(
                 &home,
                 &assignment.repo,
                 &assignment.branch,
-                &assignment.target,
-                assignment.assignment_id,
+                assignment.pr_number,
+                &head,
                 "2026-10-10T00:00:10Z",
             )
-            .unwrap(),
-            "{label}: precondition: the assignment must be retired"
+            .unwrap()
+            .0 > 0,
+            "{label}: precondition: the correction must retire the assignment"
         );
 
         assert!(
             receipt_ids(&home, &assignment).is_empty(),
-            "#7: retiring the assignment must drop ITS OWN receipts (judged by \
+            "#7: a WITHDRAWN assignment must drop its own receipts (judged by \
              assignment_id, never reviewer name) — {label} still holds {}",
             receipt_ids(&home, &assignment).len(),
         );
@@ -2289,69 +2299,220 @@ fn retiring_an_assignment_invalidates_its_receipts_7() {
     }
 }
 
-/// A receipt belonging to a DIFFERENT live assignment on the same branch must
-/// survive: the guard discriminates on `assignment_id`, so one reviewer holding
-/// two assignments (or a replacement reviewer on the same subject) is unaffected.
+/// The other half, and the one this narrowing was written for: a TERMINAL close
+/// keeps the receipt.
+///
+/// `retire_if_id_matches` passes `TaskTerminalUnattributed`, so under the old
+/// unconditional drop this exact call deleted a freshly-ingested receipt — the
+/// regression CI caught in `validated_receipt_projection_does_not_lose_the_verdict_8`.
+/// The assertion is on the OUTCOME (the receipt survives), not on the cause name,
+/// so it stays true if the cause plumbing is ever reorganised.
 #[test]
-fn retiring_one_assignment_keeps_another_live_assignments_receipt_7() {
-    let home = tmp_home("7-b2-survivor");
+fn a_terminal_close_keeps_the_receipt_7() {
+    let home = tmp_home("7-b2-terminal-keeps");
+    let task_id = "t-7-terminal-keeps";
+    seed_branchless_task(&home, task_id, "reviewer");
     let head = "a".repeat(40);
     let reviewer_id = crate::types::InstanceId::new();
-    let mut retiring = mk_record_typed(
+    let mut assignment = mk_record_typed(
         "o/r",
-        "feat/7-b2-survivor",
+        "feat/7-terminal-keeps",
+        "reviewer",
+        reviewer_id,
+        42,
+        "2026-10-10T00:00:00Z",
+    );
+    assignment.task_id = task_id.into();
+    persist(&home, &assignment).unwrap();
+    pin_receipt_of_verdict(
+        &home,
+        &assignment,
+        reviewer_id,
+        &head,
+        crate::review_receipt::ReviewVerdict::Verified,
+    );
+
+    assert!(
+        retire_if_id_matches(
+            &home,
+            &assignment.repo,
+            &assignment.branch,
+            &assignment.target,
+            assignment.assignment_id,
+            "2026-10-10T00:00:10Z",
+        )
+        .unwrap(),
+        "precondition: the terminal retire must remove the record"
+    );
+
+    assert!(
+        crate::daemon::pr_state::load(&home, &assignment.repo, &assignment.branch).is_some_and(
+            |state| state
+                .validated_review_receipts
+                .iter()
+                .any(|receipt| receipt.assignment_id == assignment.assignment_id)
+        ),
+        "#7: a receipt that arrived with a TERMINAL close is the merge gate's \
+         authority, not residue — the narrowing must not drop it"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A withdrawal drops only the NAMED assignment.
+///
+/// Discrimination is proven directly on the filter rather than through a
+/// retirement path, because the two production withdrawal paths disagree about
+/// reach: `retire_for_review_class_correction` invalidates the whole SUBJECT
+/// (repo + branch + pr_number + head) after retiring, which would delete a
+/// sibling's receipt for a reason unrelated to this guard, and `revoke` does not
+/// pass through `retire_delivery_under_lock` at all (a separate residual, tracked
+/// in t-20261010090202361507-72575-42). Routing the assertion through either would
+/// make this test pass or fail for reasons that have nothing to do with the guard.
+#[test]
+fn the_drop_filter_matches_assignment_id_and_spares_siblings_7() {
+    let home = tmp_home("7-b2-filter-precision");
+    let head = "a".repeat(40);
+    let reviewer_id = crate::types::InstanceId::new();
+    let mut a = mk_record_typed(
+        "o/r",
+        "feat/7-filter",
         "reviewer-a",
         reviewer_id,
         42,
         "2026-10-10T00:00:00Z",
     );
-    retiring.task_id = "t-7-survivor-retiring".into();
-    persist(&home, &retiring).unwrap();
+    a.task_id = "t-7-filter-a".into();
+    persist(&home, &a).unwrap();
     pin_receipt_of_verdict(
         &home,
-        &retiring,
+        &a,
         reviewer_id,
         &head,
         crate::review_receipt::ReviewVerdict::Rejected,
     );
-
-    // Same branch + same reviewer NAME is not enough to make two assignments;
-    // they carry distinct assignment_ids, which is what the guard matches on.
-    let mut surviving = mk_record_typed(
+    let mut b = mk_record_typed(
         "o/r",
-        "feat/7-b2-survivor",
+        "feat/7-filter",
         "reviewer-b",
         reviewer_id,
         42,
         "2026-10-10T00:00:05Z",
     );
-    surviving.task_id = "t-7-survivor-live".into();
-    persist(&home, &surviving).unwrap();
+    b.task_id = "t-7-filter-b".into();
+    persist(&home, &b).unwrap();
     pin_receipt_of_verdict(
         &home,
-        &surviving,
+        &b,
+        reviewer_id,
+        &head,
+        crate::review_receipt::ReviewVerdict::Rejected,
+    );
+    assert_eq!(
+        receipt_ids(&home, &a).len(),
+        2,
+        "precondition: both assignments must have receipts"
+    );
+
+    // A name-based predicate would delete BOTH (both records share the reviewer
+    // INSTANCE id); a whole-subject predicate would too. Only assignment_id
+    // spares the sibling.
+    assert_eq!(
+        crate::daemon::pr_state::drop_receipts_for_assignment(
+            &home,
+            &a.repo,
+            &a.branch,
+            a.assignment_id,
+        )
+        .unwrap(),
+        1,
+        "the filter must drop exactly the named assignment's receipt"
+    );
+    let remaining = receipt_ids(&home, &a);
+    assert_eq!(
+        remaining,
+        vec![b.assignment_id],
+        "#7: the sibling assignment's receipt must survive — one reviewer may hold \
+         several assignments, and a reused name must not widen the match"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #7 r1: pin the MOUNT ORDER, which reviewer F1 showed nothing defends.
+///
+/// F1's probe moved the drop after `remove_if_assignment_matches_strict` — the
+/// orphaning shape — and both tests stayed green. This asserts the property the
+/// ordering exists for: when the drop FAILS, the authority survives so the caller
+/// can retry. A reordering that drops after record removal fails it because the
+/// record is gone.
+#[test]
+fn a_failing_drop_preserves_the_assignment_record_7() {
+    let home = tmp_home("7-drop-fault-injection");
+    let head = "a".repeat(40);
+    let reviewer_id = crate::types::InstanceId::new();
+    let mut assignment = mk_record_typed(
+        "o/r",
+        "feat/7-fault",
+        "reviewer",
+        reviewer_id,
+        42,
+        "2026-10-10T00:00:00Z",
+    );
+    assignment.task_id = "t-7-fault".into();
+    persist(&home, &assignment).unwrap();
+    pin_receipt_of_verdict(
+        &home,
+        &assignment,
         reviewer_id,
         &head,
         crate::review_receipt::ReviewVerdict::Rejected,
     );
 
-    assert!(retire_if_id_matches(
-        &home,
-        &retiring.repo,
-        &retiring.branch,
-        &retiring.target,
-        retiring.assignment_id,
-        "2026-10-10T00:00:10Z",
-    )
-    .unwrap());
+    // Make the pr_state FILE unwritable so `with_pr_state` fails, without
+    // touching the assignment store's own directory.
+    let state_dir = crate::daemon::pr_state::pr_state_dir(&home);
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let state_file = state_dir.join(format!("{}.json", "o__r__feat__7-fault"));
+    let candidates = std::fs::read_dir(&state_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    let target = candidates.first().cloned().unwrap_or(state_file);
+    let original = std::fs::read_to_string(&target).unwrap_or_default();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir_mode = std::fs::metadata(&state_dir).unwrap().permissions().mode();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = retire_for_review_class_correction(
+            &home,
+            &assignment.repo,
+            &assignment.branch,
+            assignment.pr_number,
+            &head,
+            "2026-10-10T00:00:10Z",
+        );
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(dir_mode)).unwrap();
 
-    let survivors = receipt_ids(&home, &surviving);
-    assert_eq!(
-        survivors.len(),
-        1,
-        "#7: a DIFFERENT assignment's receipt must survive the retire — it is \
-         still live authority"
-    );
+        assert!(
+            result.is_err(),
+            "precondition: the drop must actually fail under an unwritable state dir"
+        );
+        assert!(
+            crate::daemon::assignment_authority::lookup_by_assignment_id_strict(
+                &home,
+                assignment.assignment_id,
+            )
+            .is_ok(),
+            "#7: a FAILED drop must leave the assignment record in place so the caller \
+             can retry — deleting it first would orphan the receipt (F1's shape)"
+        );
+        assert!(
+            !original.is_empty(),
+            "precondition: there was a persisted state to protect"
+        );
+    }
     std::fs::remove_dir_all(&home).ok();
 }
 
