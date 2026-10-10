@@ -8,7 +8,7 @@
 
 use super::ReleaseOutcome;
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// #40: the deadline for the RELEASE removal's `git worktree remove
@@ -379,6 +379,150 @@ pub(super) fn remove_worktree(
             WorktreeRemoval::Failed(format!("git command failed: {error}"))
         }
     }
+}
+
+/// The outcome a release route returns after a successful diversion.
+///
+/// Three routes reach a diversion point and they do NOT share a lock shape:
+/// `release_known_locked` returns a `LockedRelease`, while the two exact-target
+/// routes return `ReleaseOutcome` and release a different set of guards on the
+/// way out — one of them holds a branch lease the other does not. Hand-written,
+/// those release sequences drift apart, and lock-order is the one thing on this
+/// path that must not drift.
+///
+/// So the shared part lives here and the caller supplies only what genuinely
+/// differs: `release_extra` drops whatever guards this particular route holds
+/// beyond the binding and agent locks, which are common to all three.
+pub(super) fn diverted_release_outcome(
+    archive: &Path,
+    release_extra: impl FnOnce(),
+) -> super::ReleaseOutcome {
+    release_extra();
+    super::ReleaseOutcome {
+        released: true,
+        worktree_removed: true,
+        path: Some(archive.display().to_string()),
+        ..Default::default()
+    }
+}
+
+pub(super) enum BaselineDecision {
+    /// No Unusable journal applies. The route proceeds exactly as before.
+    Proceed(Option<BTreeSet<String>>),
+    /// The remnant was archived instead of released. `archive` is where the
+    /// payload — including everything still on disk — now lives.
+    Diverted { archive: PathBuf },
+}
+
+/// #39: divert a `WorktreeUnusable` remnant to an archive, else return the
+/// tracked-path baseline.
+///
+/// ## Why the name says "before_snapshot"
+///
+/// A release route that re-enters with a `WorktreeUnusable` journal must divert
+/// **before** anything snapshots or deletes the damaged tree. If the baseline
+/// were captured first, the ignored-cache sweep that follows would delete
+/// payload and the archive would record a tree that no longer matches what the
+/// operator left behind. The ordering is the whole point, so it is in the name:
+/// a caller reading this at the call site sees the gate position without
+/// opening this file.
+///
+/// ## Fail-closed
+///
+/// An unreadable journal, a schema this daemon does not understand, a binding
+/// that will not resolve to a known digest, or a journal belonging to an
+/// earlier generation of a reused name — all mean "do not divert", and the
+/// release proceeds exactly as if no journal existed. A corrupt journal is not
+/// evidence of damage, and refusing to release on the strength of one would be a
+/// worse failure than releasing.
+///
+/// Note: the sibling helper `clear_if_matches_generation` compares the same
+/// digest despite its name; the comparison is
+/// `tombstone.binding_sha256 == BindingFingerprint.digest`.
+pub(super) fn unusable_divert_before_snapshot(
+    home: &Path,
+    agent: &str,
+    worktree: &Path,
+) -> BaselineDecision {
+    if !must_divert_unusable(home, agent) {
+        return BaselineDecision::Proceed(tracked_path_snapshot(worktree));
+    }
+    match divert_to_archive(home, agent, worktree) {
+        Ok(archive) => BaselineDecision::Diverted { archive },
+        Err(error) => {
+            // The archive is the only safe destination for a damaged remnant —
+            // falling through would let the release destroy it. Surface the
+            // failure and take no baseline, so the route cannot proceed to a
+            // removal it has no record of.
+            tracing::error!(
+                agent,
+                path = %worktree.display(),
+                error = %error,
+                "#39: diverting the unusable remnant to an archive failed; the release \
+                 will not remove the surviving directory"
+            );
+            BaselineDecision::Proceed(None)
+        }
+    }
+}
+
+/// True when this release must divert because a `WorktreeUnusable` journal
+/// belongs to the binding generation that is live right now.
+fn must_divert_unusable(home: &Path, agent: &str) -> bool {
+    let tombstone = match crate::agent::deletion_recovery::read(home, agent) {
+        Ok(Some(tombstone)) => tombstone,
+        // Absent, or unreadable/unparseable: not evidence of damage.
+        Ok(None) | Err(_) => return false,
+    };
+    if !matches!(
+        tombstone.state,
+        crate::agent::deletion_recovery::State::WorktreeUnusable { .. }
+    ) {
+        return false;
+    }
+    match crate::binding::preflight_guarded_binding(home, agent) {
+        crate::binding::GuardedBinding::Known { fingerprint, .. } => {
+            tombstone.binding_sha256 == fingerprint.digest
+        }
+        crate::binding::GuardedBinding::Absent | crate::binding::GuardedBinding::Opaque(_) => false,
+    }
+}
+
+/// Move the damaged directory into a preservation archive.
+///
+/// The order is the crash-safety contract and mirrors the admin recovery lane:
+/// publish the destination in the journal, write the self-describing metadata
+/// inside the source, then rename. A crash before the rename leaves the source
+/// intact and the retry re-runnable; after it, the journal already names the
+/// destination.
+fn divert_to_archive(home: &Path, agent: &str, worktree: &Path) -> Result<PathBuf, String> {
+    let archive = crate::admin::archive_mechanics::preservation_directory(home, agent, worktree)?;
+    let tombstone = crate::agent::deletion_recovery::read(home, agent)?;
+    let (cause, binding_sha256) = match tombstone {
+        Some(crate::agent::deletion_recovery::Tombstone {
+            state: crate::agent::deletion_recovery::State::WorktreeUnusable { cause },
+            binding_sha256,
+            ..
+        }) => (cause, binding_sha256),
+        _ => {
+            return Err(format!(
+                "diversion requires an unusable tombstone for '{agent}' — the gate condition \
+                 did not hold"
+            ))
+        }
+    };
+    crate::admin::archive_mechanics::write_preservation_manifest(
+        &archive,
+        agent,
+        "",
+        worktree,
+        worktree,
+        &archive,
+        &cause,
+        &binding_sha256,
+    )?;
+    crate::admin::archive_mechanics::rename_worktree_into(worktree, &archive)?;
+    Ok(archive)
 }
 
 #[cfg(test)]
