@@ -2361,13 +2361,23 @@ fn a_terminal_close_keeps_the_receipt_7() {
 /// A withdrawal drops only the NAMED assignment.
 ///
 /// Discrimination is proven directly on the filter rather than through a
-/// retirement path, because the two production withdrawal paths disagree about
-/// reach: `retire_for_review_class_correction` invalidates the whole SUBJECT
-/// (repo + branch + pr_number + head) after retiring, which would delete a
-/// sibling's receipt for a reason unrelated to this guard, and `revoke` does not
-/// pass through `retire_delivery_under_lock` at all (a separate residual, tracked
-/// in t-20261010090202361507-72575-42). Routing the assertion through either would
-/// make this test pass or fail for reasons that have nothing to do with the guard.
+/// retirement path, for two independent reasons:
+///
+/// 1. `revoke` never reaches `retire_delivery_under_lock` at all, so it carries
+///    no drop (a separate residual, tracked in t-20261010090202361507-72575-42).
+/// 2. The only guard arm a retirement can currently supply is `Retired`, from
+///    `retire_for_review_class_correction` — whose raw cause for every OTHER
+///    assignment on the branch is `TaskTerminalUnattributed`, which the narrowed
+///    guard deliberately leaves alone. So no retirement path drops exactly one
+///    assignment while sparing a sibling, and an end-to-end witness is not
+///    reachable at this head.
+///
+/// (Correction, r1 review F1: an earlier version of this doc claimed the
+/// correction path clears the whole subject's receipts after retiring. It does
+/// not — `invalidate_validated_for_subject` deletes files under
+/// `pr_state/validated-verdict-buffer/`, a separate store from
+/// `PrState.validated_review_receipts`, which is what this guard writes and what
+/// `receipt_ids` reads. The real reason the old end-to-end test went red is (2).)
 #[test]
 fn the_drop_filter_matches_assignment_id_and_spares_siblings_7() {
     let home = tmp_home("7-b2-filter-precision");
@@ -2467,22 +2477,30 @@ fn a_failing_drop_preserves_the_assignment_record_7() {
         crate::review_receipt::ReviewVerdict::Rejected,
     );
 
-    // Make the pr_state FILE unwritable so `with_pr_state` fails, without
-    // touching the assignment store's own directory.
-    let state_dir = crate::daemon::pr_state::pr_state_dir(&home);
-    std::fs::create_dir_all(&state_dir).unwrap();
-    let state_file = state_dir.join(format!("{}.json", "o__r__feat__7-fault"));
-    let candidates = std::fs::read_dir(&state_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
-        .collect::<Vec<_>>();
-    let target = candidates.first().cloned().unwrap_or(state_file);
-    let original = std::fs::read_to_string(&target).unwrap_or_default();
+    // POSIX permission bits are the only portable way to make this write fail, so
+    // the whole body is unix-gated. Everything it needs is INSIDE the gate:
+    // hoisting any of it out leaves Windows with dead bindings, which
+    // `-D warnings` turns into an error (this exact shape failed
+    // `Clippy (our targets, strict)` on windows-latest).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        // Make the pr_state DIRECTORY unwritable so `with_pr_state` fails,
+        // without touching the assignment store's own directory.
+        let state_dir = crate::daemon::pr_state::pr_state_dir(&home);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let original = std::fs::read_dir(&state_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
+            .map(|path| std::fs::read_to_string(&path).unwrap_or_default())
+            .unwrap_or_default();
+        assert!(
+            !original.is_empty(),
+            "precondition: there was a persisted state to protect"
+        );
+
         let dir_mode = std::fs::metadata(&state_dir).unwrap().permissions().mode();
         std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let result = retire_for_review_class_correction(
@@ -2507,10 +2525,6 @@ fn a_failing_drop_preserves_the_assignment_record_7() {
             .is_ok(),
             "#7: a FAILED drop must leave the assignment record in place so the caller \
              can retry — deleting it first would orphan the receipt (F1's shape)"
-        );
-        assert!(
-            !original.is_empty(),
-            "precondition: there was a persisted state to protect"
         );
     }
     std::fs::remove_dir_all(&home).ok();
