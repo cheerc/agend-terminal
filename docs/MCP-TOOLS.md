@@ -282,6 +282,7 @@ Recover or rebind the calling instance to a branch worktree. Prefer `repo action
 
 - Required: `branch`; optional `repository_path`, `rebase_mode`, and `task_id`.
 - Rejects protected branches and cross-agent lease conflicts. It does not silently create a CI continuation.
+- On success, `project_docs` lists the spec files at the **worktree root** as `{path, bytes}` entries. `CLAUDE.md` and `AGENTS.md` are both listed when present, with no precedence between them; subdirectories are not scanned. This is a path index, not a preloading step — file contents are never included, and the agent decides when to read them. A doc that is absent, non-UTF-8, or not a regular file is skipped in silence (no warning field is added).
 
 ### `release_worktree`
 
