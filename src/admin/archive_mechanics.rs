@@ -462,6 +462,16 @@ mod tests {
             !archive.join(".agend-recovery-binding.json").exists(),
             "#39: the admin replay credentials must not be written by a diversion"
         );
+        // #39 PR-3: the arbitration lists FOUR things a diversion must not
+        // write, and the assertion above only covered one filename — a `.sig`
+        // written alongside it would have passed unnoticed. This ticket is the
+        // first production caller of these primitives, and the moment someone
+        // reaches for the neighbouring admin credential shape is exactly when
+        // this needs to hold.
+        assert!(
+            !archive.join(".agend-recovery-binding.json.sig").exists(),
+            "#39: the admin replay SIGNATURE must not be written by a diversion either"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 

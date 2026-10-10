@@ -26,8 +26,8 @@ use build_cache::{apply_cache_cleanup, clean_ignored_build_cache};
 // of this lifecycle file so the source LOC ratchet stays armed.
 mod partial_removal;
 use partial_removal::{
-    mark_release_incomplete, record_damaged_remnant, remove_worktree, tracked_path_snapshot,
-    WorktreeRemoval,
+    mark_release_incomplete, record_damaged_remnant, remove_worktree,
+    unusable_divert_before_snapshot, BaselineDecision, WorktreeRemoval,
 };
 
 mod release_recovery;
@@ -756,7 +756,29 @@ fn release_known_locked(
             // read as an intact worktree. See the CONTRACT note at the third
             // baseline site — a new deletion step added after this line needs the
             // same review.
-            let tracked_baseline = tracked_path_snapshot(wt_path);
+            let tracked_baseline = match unusable_divert_before_snapshot(home, agent, wt_path) {
+                BaselineDecision::Proceed(baseline) => baseline,
+                BaselineDecision::Diverted { archive } => {
+                    // The damaged remnant was archived, not released. `out.path`
+                    // is where the operator finds it. `managed_verified` and
+                    // `worktree_absent` are both true because the marker was
+                    // verified and the directory is genuinely gone.
+                    return LockedRelease {
+                        out: ReleaseOutcome {
+                            released: true,
+                            worktree_removed: true,
+                            path: Some(archive.display().to_string()),
+                            ..ReleaseOutcome::default()
+                        },
+                        notices: Vec::new(),
+                        clear_refusal_marker: None,
+                        finish_full_release: true,
+                        managed_verified: true,
+                        worktree_absent: true,
+                        was_dirty: false,
+                    };
+                }
+            };
             if is_daemon_managed(wt_path) {
                 permit.set_stage("preserve_wip");
                 let branch = binding["branch"].as_str().unwrap_or("");
@@ -1489,7 +1511,14 @@ fn release_bound_target_exact_impl(
     // whatever it removes from the comparison — the damage still happens, the
     // report just stops seeing it. Review the baseline whenever a deletion is
     // added to a release route. Same applies at the other two call sites.
-    let tracked_baseline = tracked_path_snapshot(target);
+    let tracked_baseline = match unusable_divert_before_snapshot(home, agent, target) {
+        BaselineDecision::Proceed(baseline) => baseline,
+        BaselineDecision::Diverted { archive } => {
+            drop(_binding_lock);
+            drop(_agent_lock);
+            return partial_removal::diverted_release_outcome(&archive, || drop(branch_lock));
+        }
+    };
     #[cfg(test)]
     release_test_seam::hit(ReleaseTestPhase::BeforeWorktreeRemove);
     let mut notices = Vec::new();
@@ -2011,7 +2040,14 @@ fn release_absent_target_impl(
     // removes from the comparison — the damage still happens, the report just
     // stops seeing it. Review this line whenever a release route gains a
     // deletion. Same applies at the other two baseline sites.
-    let tracked_baseline = tracked_path_snapshot(target);
+    let tracked_baseline = match unusable_divert_before_snapshot(home, agent, target) {
+        BaselineDecision::Proceed(baseline) => baseline,
+        BaselineDecision::Diverted { archive } => {
+            drop(_binding_lock);
+            drop(_agent_lock);
+            return partial_removal::diverted_release_outcome(&archive, || ());
+        }
+    };
     if matches!(target_state, crate::mcp::handlers::TargetState::Present) {
         permit.set_stage("preserve_wip");
         let mk_branch = marker_branch(target);
