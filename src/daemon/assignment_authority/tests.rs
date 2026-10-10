@@ -1869,7 +1869,7 @@ fn a_real_receipt_grants_the_settled_cause_9() {
         &assignment.delivery_nonce,
         "2026-10-09T00:00:07Z",
     );
-    pin_receipt_in_pr_state(&home, &assignment, reviewer_id);
+    pin_receipt_in_pr_state(&home, &assignment, reviewer_id, &"a".repeat(40));
 
     assert!(
         crate::tasks::auto_close::auto_close_on_validated_review(
@@ -1906,16 +1906,13 @@ fn pin_receipt_in_pr_state(
     home: &Path,
     assignment: &ActiveAssignment,
     reviewer_id: crate::types::InstanceId,
+    head: &str,
 ) {
-    let head_for_state = assignment
-        .reviewed_head
-        .clone()
-        .unwrap_or_else(|| "b".repeat(40));
     crate::daemon::pr_state::record_ci_result(
         home,
         &assignment.repo,
         &assignment.branch,
-        &head_for_state,
+        head,
         crate::daemon::pr_state::CiConclusion::Green,
         vec![assignment.sender.clone()],
         assignment.review_class,
@@ -1928,10 +1925,6 @@ fn pin_receipt_in_pr_state(
         state.pr_number = assignment.pr_number;
     })
     .expect("seed pr_number");
-    let head = assignment
-        .reviewed_head
-        .clone()
-        .expect("the typed fixture carries an exact reviewed head");
     let receipt = crate::review_receipt::ValidatedCodeReviewReceipt::for_test(
         crate::review_receipt::ReviewReceiptSummary {
             receipt_id: "review-receipt:m-gate-positive".into(),
@@ -1944,7 +1937,7 @@ fn pin_receipt_in_pr_state(
             pr_number: assignment.pr_number,
             branch: assignment.branch.clone(),
             task_id: assignment.task_id.clone(),
-            reviewed_head: head,
+            reviewed_head: head.to_string(),
             review_class: assignment.review_class,
             slot: crate::review_receipt::ReviewSlot::Primary,
             verdict: crate::review_receipt::ReviewVerdict::Verified,
@@ -2081,4 +2074,148 @@ fn seed_review_task_linked(home: &Path, task_id: &str, reviewer: &str, branch: &
         ],
     )
     .unwrap();
+}
+
+/// #9 r2 (F1 follow-up): a review-class correction retires an assignment for a
+/// reason that has nothing to do with whether a receipt exists — and the
+/// predecessor's receipt routinely still exists when the notice is built,
+/// because `retire_for_review_class_correction` invalidates receipts AFTER its
+/// retire loop. So a catch-all that let any cause become `TaskSettled` would
+/// report "your review was recorded and its task closed" for a correction, which
+/// is exactly the imprecision #9 exists to remove.
+///
+/// Drives the real correction entry with a receipt present.
+#[test]
+fn review_class_correction_stays_retired_even_with_a_receipt_9() {
+    let home = tmp_home("9-correction-with-receipt");
+    let task_id = "t-correction-review";
+    seed_branchless_task(&home, task_id, "reviewer");
+    let head = "a".repeat(40);
+    let reviewer_id = crate::types::InstanceId::new();
+    let mut assignment = mk_record_typed(
+        "o/r",
+        "feat/correction",
+        "reviewer",
+        reviewer_id,
+        42,
+        "2026-10-09T00:00:00Z",
+    );
+    assignment.task_id = task_id.into();
+    persist(&home, &assignment).unwrap();
+    durable_enqueue(
+        &home,
+        "o/r",
+        "feat/correction",
+        "reviewer",
+        "2026-10-09T00:00:05Z",
+    )
+    .unwrap();
+    mark_row_read(
+        &home,
+        "reviewer",
+        &assignment.delivery_nonce,
+        "2026-10-09T00:00:07Z",
+    );
+    pin_receipt_in_pr_state(&home, &assignment, reviewer_id, &head);
+    assert!(
+        crate::daemon::pr_state::load(&home, "o/r", "feat/correction")
+            .map(|state| !state.validated_review_receipts.is_empty())
+            .unwrap_or(false),
+        "precondition: a validated receipt EXISTS for this task at notice time"
+    );
+
+    // The real correction entry, selected by the exact (pr_number, reviewed_head).
+    let (retired, _invalidated) = retire_for_review_class_correction(
+        &home,
+        "o/r",
+        "feat/correction",
+        42,
+        &head,
+        "2026-10-09T00:00:10Z",
+    )
+    .unwrap();
+    assert_eq!(retired, 1, "the correction must retire the assignment");
+
+    let notices = retirement_notices(&home, "reviewer", assignment.assignment_id);
+    let kinds: Vec<String> = notices
+        .iter()
+        .map(|m| m.kind.clone().unwrap_or_default())
+        .collect();
+    assert!(
+        !kinds.iter().any(|k| k == "review-assignment-settled"),
+        "F1 regression: a review-class correction is NOT a settled review, even though a \
+         receipt exists — got {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|k| k == "review-assignment-retired"),
+        "the correction must report the retired wording: {kinds:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A same-branch replacement keeps its own cause even when the predecessor's
+/// receipt still exists.
+///
+/// #9 r2 — READ THIS BEFORE TRUSTING IT AS A NEGATIVE CONTROL: this path does
+/// **not** pass through `settled_only_if` at all. `persist`'s replacement branch
+/// builds its notice directly, so there is nothing to mutate and a mutation probe
+/// cannot turn this red. What it pins is the STRUCTURAL fact that the
+/// replacement path is already immune, which is the half reviewer r1 did not
+/// check for this cause. It is an acceptance assertion, not a mutation-proven
+/// control — do not read it as one.
+#[test]
+fn same_branch_replacement_stays_replaced_even_with_a_receipt_9() {
+    let home = tmp_home("9-replacement-with-receipt");
+    let reviewer_id = crate::types::InstanceId::new();
+    let head = "a".repeat(40);
+    let old = mk_record_typed(
+        "o/r",
+        "feat/replaced",
+        "reviewer",
+        reviewer_id,
+        42,
+        "2026-10-09T00:00:00Z",
+    );
+    persist(&home, &old).unwrap();
+    durable_enqueue(
+        &home,
+        "o/r",
+        "feat/replaced",
+        "reviewer",
+        "2026-10-09T00:00:05Z",
+    )
+    .unwrap();
+    mark_row_read(
+        &home,
+        "reviewer",
+        &old.delivery_nonce,
+        "2026-10-09T00:00:07Z",
+    );
+    pin_receipt_in_pr_state(&home, &old, reviewer_id, &head);
+
+    // The real persist-replacement path: a different assignment_id, same key.
+    let successor = mk_record_typed(
+        "o/r",
+        "feat/replaced",
+        "reviewer",
+        reviewer_id,
+        42,
+        "2026-10-09T00:00:20Z",
+    );
+    persist(&home, &successor).unwrap();
+
+    let notices = retirement_notices(&home, "reviewer", old.assignment_id);
+    let kinds: Vec<String> = notices
+        .iter()
+        .map(|m| m.kind.clone().unwrap_or_default())
+        .collect();
+    assert!(
+        !kinds.iter().any(|k| k == "review-assignment-settled"),
+        "F1 regression: a same-branch replacement is NOT a settled review — got {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|k| k == "review-assignment-replaced"),
+        "the replacement must report the replaced wording: {kinds:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
 }

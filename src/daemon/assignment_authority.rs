@@ -688,14 +688,30 @@ impl RetirementCause {
     /// Fail-closed by construction: without a verified receipt the reviewer gets
     /// the plain retired wording, which is true in every case. A false negative
     /// costs one sentence of warmth; a false positive fabricates a success.
+    ///
+    /// The catch-all is restricted to the two TASK-TERMINAL causes on purpose.
+    /// A receipt may only refine what the terminal event already established —
+    /// "the task closed, and it closed because a review was recorded". It must
+    /// never overwrite a cause the CALLER knows exactly: a review-class
+    /// correction or a same-branch replacement retire an assignment for a
+    /// reason unrelated to whether a receipt exists, and a predecessor's receipt
+    /// routinely outlives both (the correction invalidates receipts AFTER the
+    /// retire loop). Reporting those as "your review settled" would be the same
+    /// imprecision #9 removes, one level down.
     fn settled_only_if(self, receipt_exists: bool) -> Self {
-        match (self, receipt_exists) {
-            (_, true) => RetirementCause::TaskSettled,
-            (RetirementCause::ExplicitlyRevoked, false)
-            | (RetirementCause::Replaced, false)
-            | (RetirementCause::Retired, false) => self,
-            (RetirementCause::TaskSettled | RetirementCause::TaskTerminalUnattributed, false) => {
-                RetirementCause::TaskTerminalUnattributed
+        match self {
+            // An exact, caller-established cause stands on its own. (For
+            // ExplicitlyRevoked this arm is defensive — `revoke` builds its
+            // notice without passing through the gate.)
+            RetirementCause::ExplicitlyRevoked
+            | RetirementCause::Replaced
+            | RetirementCause::Retired => self,
+            RetirementCause::TaskSettled | RetirementCause::TaskTerminalUnattributed => {
+                if receipt_exists {
+                    RetirementCause::TaskSettled
+                } else {
+                    RetirementCause::TaskTerminalUnattributed
+                }
             }
         }
     }
