@@ -305,6 +305,20 @@ Revoke a reviewer assignment by exact CAS identity. Authorized for the owning te
 
 - Required: `assignment_id`.
 
+**#9 — a retirement notice says WHY.** Once an assignment's delivery has been handed to the reviewer, retiring it also leaves a durable notice in the reviewer's inbox. That notice is projected from the retirement's cause, so it never claims a revocation that did not happen — most importantly, a reviewer's own `VERIFIED` receipt settles its review task, which retires the assignment as a *consequence of success*.
+
+| Cause | `kind` | `from` | Meaning |
+|---|---|---|---|
+| Settled by your own review | `review-assignment-settled` | `system:assignment_retirement` | your review was recorded and its task closed |
+| Task terminal, cause unattributable | `review-assignment-retired` | `system:assignment_retirement` | the task reached a terminal state; whether by settlement or cancellation is not knowable here |
+| Replaced on this branch | `review-assignment-replaced` | `system:assignment_retirement` | a newer assignment took over |
+| Retired (e.g. review-class correction) | `review-assignment-retired` | `system:assignment_retirement` | the assignment is no longer authoritative |
+| Explicitly revoked | `review-assignment-revoked` | the actor who revoked it | a real actor withdrew it |
+
+`review-assignment-revoked` is the only kind that means a revocation, and it is the only one attributed to a person rather than a system identity. The nonce dedup and supersede behaviour behind these notices is unchanged.
+
+**The settled cause is granted by a receipt, never by the closing identity.** A task can reach a terminal state without any review behind it — a branch merge closes tasks on its branch, and an ordinary `terminal: true` report closes its own. All of those write terminal events under the same `system:auto_close` identity the receipt close uses, so the emitter cannot answer "was a review recorded". The `review-assignment-settled` notice is therefore emitted only when a validated receipt for that exact task exists in PR state. A terminal close with no such receipt reports `review-assignment-retired`; the three causes that are not task-terminal closures — an explicit revocation, a same-branch replacement, and a review-class correction — keep their own wording and are never rewritten by a receipt, because the caller already knows exactly why the assignment went away. `review-assignment-settled` means "your review was recorded", not "something closed your task".
+
 ### `usage_limit_takeover`
 
 Operator-only PREPARE step for a persisted usage-limit takeover episode. It writes the durable prepared journal but does not execute the takeover.

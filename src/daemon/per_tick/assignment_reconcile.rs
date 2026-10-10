@@ -1817,12 +1817,12 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// D4: revocation notice is deterministic and idempotent. When the
-    /// assignment has already been delivered to the reviewer, a revocation
+    /// D4: retirement notice is deterministic and idempotent. When the
+    /// assignment has already been delivered to the reviewer, a retirement
     /// notice is enqueued exactly once per retire cycle. A second reconcile
     /// tick (after convergence deletes the authority) enqueues no duplicate.
     #[test]
-    fn d4_revocation_notice_idempotent() {
+    fn d4_retirement_notice_idempotent() {
         let home = tmp_home("d4-notice");
         let rec = mk_with_head(
             "o/r",
@@ -1857,11 +1857,11 @@ mod tests {
             std::fs::read_to_string(home.join("inbox").join("reviewer.jsonl")).unwrap_or_default();
         let notice_count = inbox_content
             .lines()
-            .filter(|l| l.contains("review-assignment-revoked"))
+            .filter(|l| l.contains(&format!("revoked-{}", rec.assignment_id)))
             .count();
         assert_eq!(
             notice_count, 1,
-            "exactly one revocation notice after first retire"
+            "exactly one retirement notice after first retire"
         );
 
         // Second reconcile: authority is gone, no duplicate notice.
@@ -1870,11 +1870,11 @@ mod tests {
             std::fs::read_to_string(home.join("inbox").join("reviewer.jsonl")).unwrap_or_default();
         let notice_count2 = inbox_content2
             .lines()
-            .filter(|l| l.contains("review-assignment-revoked"))
+            .filter(|l| l.contains(&format!("revoked-{}", rec.assignment_id)))
             .count();
         assert_eq!(
             notice_count2, 1,
-            "no duplicate revocation notice after second tick"
+            "no duplicate retirement notice after second tick"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1959,7 +1959,7 @@ mod tests {
             std::fs::read_to_string(home.join("inbox").join("reviewer.jsonl")).unwrap_or_default();
         let notice_count = inbox_content
             .lines()
-            .filter(|l| l.contains("review-assignment-revoked"))
+            .filter(|l| l.contains(&format!("revoked-{}", rec.assignment_id)))
             .count();
         assert_eq!(notice_count, 1, "exactly one notice after first attempt");
 
@@ -1973,7 +1973,7 @@ mod tests {
             std::fs::read_to_string(home.join("inbox").join("reviewer.jsonl")).unwrap_or_default();
         let notice_count2 = inbox_content2
             .lines()
-            .filter(|l| l.contains("review-assignment-revoked"))
+            .filter(|l| l.contains(&format!("revoked-{}", rec.assignment_id)))
             .count();
         assert_eq!(
             notice_count2, 1,
@@ -1988,7 +1988,7 @@ mod tests {
     /// atomic_write_json failed). A new persist replacement must see the
     /// existing nonce and skip the duplicate enqueue.
     #[test]
-    fn d7_persist_replacement_dedup_revocation_notice() {
+    fn d7_persist_replacement_dedup_retirement_notice() {
         let home = tmp_home("d7-persist-dedup");
         let instance_id = crate::types::InstanceId::new();
         let head = "a".repeat(40);
@@ -2024,7 +2024,10 @@ mod tests {
         let nonce = format!("revoked-{old_id}");
         let notice = crate::inbox::InboxMessage {
             text: "Reviewer assignment revoked.".to_string(),
-            kind: Some("review-assignment-revoked".to_string()),
+            // #9: the kind a same-branch replacement actually projects. The dedup
+            // below matches on the stable NONCE, so the seeded kind must be the
+            // real one or this test would pass on a notice production never sends.
+            kind: Some("review-assignment-replaced".to_string()),
             timestamp: "2026-07-13T00:01:00Z".to_string(),
             delivery_nonce: Some(nonce.clone()),
             ..Default::default()
@@ -2056,11 +2059,11 @@ mod tests {
             std::fs::read_to_string(home.join("inbox").join("reviewer.jsonl")).unwrap_or_default();
         let notice_count = inbox
             .lines()
-            .filter(|l| l.contains("review-assignment-revoked"))
+            .filter(|l| l.contains(&format!("revoked-{old_id}")))
             .count();
         assert_eq!(
             notice_count, 1,
-            "persist replacement must not duplicate revocation notice (stable nonce dedup)"
+            "persist replacement must not duplicate retirement notice (stable nonce dedup)"
         );
         std::fs::remove_dir_all(&home).ok();
     }

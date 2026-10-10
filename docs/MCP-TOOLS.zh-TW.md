@@ -305,6 +305,20 @@ Drain 或管理 caller 的 durable inbox。
 
 - 必填：`assignment_id`。
 
+**#9 — 退役通知會說明「為什麼」。** 當 assignment 的 delivery 已經交到 reviewer 手上，退役它時也會在該 reviewer 的 inbox 留下一則 durable 通知。該通知依退役的成因投影，因此絕不會宣稱一場沒有發生的撤銷——最重要的是，reviewer 自己的 `VERIFIED` receipt 會結案它的 review task，而那正是以「成功」為由退役該 assignment。
+
+| 成因 | `kind` | `from` | 意義 |
+|---|---|---|---|
+| 你的審查已結案 | `review-assignment-settled` | `system:assignment_retirement` | 你的審查已入帳，其 task 已關閉 |
+| task 已 terminal，成因無法歸屬 | `review-assignment-retired` | `system:assignment_retirement` | 該 task 進入終態；此處無從得知是結案還是取消 |
+| 此 branch 上已被取代 | `review-assignment-replaced` | `system:assignment_retirement` | 已有較新的 assignment 接替 |
+| 退役（例如 review-class 更正） | `review-assignment-retired` | `system:assignment_retirement` | 該 assignment 不再是權威 |
+| 明確撤銷 | `review-assignment-revoked` | 實際執行撤銷者 | 有人真的把它收回了 |
+
+`review-assignment-revoked` 是唯一代表「撤銷」的 kind，也是唯一歸屬於人而非 system identity 的。背後的 nonce 去重與 supersede 行為不變。
+
+**settled 這個成因由 receipt 授予，不由「關閉者身分」授予。** task 可能在背後完全沒有審查的情況下到達終態——branch merge 會關掉該 branch 上的 task，普通 `terminal: true` report 也會關掉它自己的。這些路徑寫入 terminal event 時用的身分，與 receipt 關閉所用的 `system:auto_close` **完全相同**，所以 emitter 無法回答「是否真有審查被記錄」。因此 `review-assignment-settled` 只在 PR state 中確實存在該 task 的已驗證 receipt 時才發出。沒有該 receipt 的終態關閉回報 `review-assignment-retired`；而三種並非 task 終態關閉的成因——明確撤銷、同 branch 取代、review-class 更正——保留各自的措辭，永遠不會被 receipt 改寫，因為 caller 已經確切知道該 assignment 為何而失效。`review-assignment-settled` 的意思是「你的審查已被記錄」，不是「有東西關掉了你的 task」。
+
 ### `usage_limit_takeover`
 
 針對持久化 usage-limit takeover episode 的 operator-only PREPARE 步驟。它會寫入 durable prepared journal，但不執行 takeover。

@@ -631,18 +631,195 @@ fn revocation_nonce(assignment_id: uuid::Uuid) -> String {
     format!("revoked-{assignment_id}")
 }
 
-fn build_revocation_notice(
+/// #9: WHY an assignment stopped being authoritative. The retirement notice used
+/// to be spelled `has been revoked` for every cause, so a reviewer whose VERIFIED
+/// receipt settled its own review task read a "revoked" notice and spent four tool
+/// calls ruling out that its verdict had expired. The cause is supplied by the
+/// CALLER — it knows which retirement path it took — and the notice projects it.
+///
+/// Each variant names the truth as the reviewer can act on it. Only
+/// [`RetirementCause::ExplicitlyRevoked`] is a revocation; a settled review is not
+/// one, and saying so is the whole point of this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetirementCause {
+    /// A validated receipt settled the reviewer's own review task, so the
+    /// assignment is retired as a CONSEQUENCE of a successful review — not because
+    /// anything went wrong.
+    ///
+    /// #9 (F1): never assert this directly. It is reachable only through
+    /// [`RetirementCause::settled_only_if`], so a settled claim always rests on a
+    /// checked receipt rather than on a shared emitter identity.
+    TaskSettled,
+    /// The assignment was retired by an explicit CAS (`retire_if_id_matches`) that
+    /// had no terminal event to attribute: the task was terminal, but WHETHER that
+    /// was this review settling or an operator cancelling is not knowable here.
+    ///
+    /// #9: deliberately makes no claim about the task's outcome. Attributing it to
+    /// a settled review would be projecting a guess as fact — the exact failure
+    /// mode this enum exists to remove. The reviewer is told the assignment is
+    /// gone, not why.
+    ///
+    /// #9 (F1): this is also the landing value when a terminal close is checked
+    /// against PR state and NO receipt is found — including the branch-merge
+    /// scanner's close, which is a real terminal transition that simply has no
+    /// review behind it.
+    TaskTerminalUnattributed,
+    /// A different assignment on the same branch replaced this one.
+    Replaced,
+    /// An explicit CAS retire (`retire_if_id_matches`) with a cause other than the
+    /// two above.
+    Retired,
+    /// A real actor withdrew the assignment — the MCP revoke tool, or instance
+    /// teardown. This is the ONLY cause that is a revocation.
+    ExplicitlyRevoked,
+}
+
+impl RetirementCause {
+    /// #9 (F1): gate every settled claim on proof that a receipt exists.
+    ///
+    /// F1 showed that attributing a close to `system:auto_close` cannot
+    /// distinguish a validated receipt from an ordinary `terminal: true` report
+    /// or the branch-merge scanner, because all three share that emitter — so a
+    /// reviewer with no receipt was told their review had been recorded. The
+    /// terminal event answers only "who performed some close", never "was a
+    /// review recorded", which is why the check lives here against PR state
+    /// rather than in the caller.
+    ///
+    /// Fail-closed by construction: without a verified receipt the reviewer gets
+    /// the plain retired wording, which is true in every case. A false negative
+    /// costs one sentence of warmth; a false positive fabricates a success.
+    ///
+    /// The catch-all is restricted to the two TASK-TERMINAL causes on purpose.
+    /// A receipt may only refine what the terminal event already established —
+    /// "the task closed, and it closed because a review was recorded". It must
+    /// never overwrite a cause the CALLER knows exactly: a review-class
+    /// correction or a same-branch replacement retire an assignment for a
+    /// reason unrelated to whether a receipt exists, and a predecessor's receipt
+    /// routinely outlives both (the correction invalidates receipts AFTER the
+    /// retire loop). Reporting those as "your review settled" would be the same
+    /// imprecision #9 removes, one level down.
+    fn settled_only_if(self, receipt_exists: bool) -> Self {
+        match self {
+            // An exact, caller-established cause stands on its own. (For
+            // ExplicitlyRevoked this arm is defensive — `revoke` builds its
+            // notice without passing through the gate.)
+            RetirementCause::ExplicitlyRevoked
+            | RetirementCause::Replaced
+            | RetirementCause::Retired => self,
+            RetirementCause::TaskSettled | RetirementCause::TaskTerminalUnattributed => {
+                if receipt_exists {
+                    RetirementCause::TaskSettled
+                } else {
+                    RetirementCause::TaskTerminalUnattributed
+                }
+            }
+        }
+    }
+
+    /// The notice `kind`, `from`, and wording for this cause.
+    ///
+    /// #9: `from` is the CAUSE's actor, not always the dispatcher. A
+    /// system-driven cause must not be attributed to the lead who dispatched the
+    /// review — that reads as "your lead revoked this". A real revocation is
+    /// attributed to `record.sender`, the actor who actually pulled it.
+    fn project(self, record: &ActiveAssignment) -> (String, &'static str, String) {
+        let subject = format!(
+            "Reviewer assignment for PR #{} ({}@{})",
+            record.pr_number, record.repo, record.branch
+        );
+        match self {
+            RetirementCause::TaskSettled => (
+                "system:assignment_retirement".to_string(),
+                "review-assignment-settled",
+                format!(
+                    "{subject} is complete: your review was recorded and its task closed, so the assignment no longer needs your attention."
+                ),
+            ),
+            RetirementCause::TaskTerminalUnattributed => (
+                "system:assignment_retirement".to_string(),
+                "review-assignment-retired",
+                format!(
+                    "{subject} has been retired: the task it belonged to reached a terminal state, so the assignment no longer needs your attention."
+                ),
+            ),
+            RetirementCause::Replaced => (
+                "system:assignment_retirement".to_string(),
+                "review-assignment-replaced",
+                format!(
+                    "{subject} was replaced by a newer assignment for this branch."
+                ),
+            ),
+            RetirementCause::Retired => (
+                "system:assignment_retirement".to_string(),
+                "review-assignment-retired",
+                format!(
+                    "{subject} has been retired and no longer needs your attention."
+                ),
+            ),
+            RetirementCause::ExplicitlyRevoked => (
+                record.sender.clone(),
+                "review-assignment-revoked",
+                format!("{subject} has been revoked."),
+            ),
+        }
+    }
+}
+
+/// #9 (F1 fix, decision d-20261009192240078726-6): is there a REAL validated
+/// review receipt proving the review this task was created for actually landed?
+///
+/// F1: the first implementation asked "was the terminal event emitted by
+/// `system:auto_close`?", which is the wrong question. That identity is shared by
+/// three production paths — the validated-receipt close, an ordinary
+/// `terminal: true` report, and the branch-merge scanner (whose candidate filter
+/// admits any active status on a linked branch, `Verified` included) — so the
+/// emitter proved only WHO performed SOME close, never WHETHER a review was
+/// recorded. Asking a shared identity to carry that distinction is the shape of
+/// the defect, not a gap in the enumeration; a new emitter would have the same
+/// problem tomorrow.
+///
+/// Receipts are per `(repo, branch, pr_number)`, not per task, and a review
+/// assignment IS generation-bound to its PR number — so the assignment's own
+/// `(repo, branch, pr_number)` is exactly the scope in which a receipt could
+/// exist. Answering with PR state therefore tests an EXCLUSIVE fact: the receipt
+/// exists or it does not.
+///
+/// Fail-closed throughout: an unreadable or absent PR state yields `false`,
+/// because claiming "your review settled" on missing evidence is the exact
+/// failure this whole change exists to remove.
+fn validated_receipt_exists(home: &Path, record: &ActiveAssignment) -> bool {
+    let state = match crate::daemon::pr_state::load(home, &record.repo, &record.branch) {
+        Some(state) => state,
+        None => {
+            // An absent or unreadable PR state is not proof of a review, so the
+            // claim is declined rather than assumed.
+            tracing::warn!(repo = %record.repo, branch = %record.branch,
+                "#9 retirement attribution: PR state absent; declining to claim a settled review");
+            return false;
+        }
+    };
+    // A receipt for a different generation says nothing about this one, so it
+    // must not be borrowed as a success claim.
+    if state.pr_number != record.pr_number {
+        return false;
+    }
+    state
+        .validated_review_receipts
+        .iter()
+        .any(|receipt| receipt.task_id == record.task_id)
+}
+
+fn build_retirement_notice(
     record: &ActiveAssignment,
+    cause: RetirementCause,
     now: &str,
     nonce: &str,
 ) -> crate::inbox::InboxMessage {
+    let (from, kind, text) = cause.project(record);
     crate::inbox::InboxMessage {
-        from: record.sender.clone(),
-        text: format!(
-            "Reviewer assignment for PR #{} ({}@{}) has been revoked.",
-            record.pr_number, record.repo, record.branch
-        ),
-        kind: Some("review-assignment-revoked".to_string()),
+        from,
+        text,
+        kind: Some(kind.to_string()),
         timestamp: now.to_string(),
         task_id: Some(record.task_id.clone()),
         correlation_id: Some(record.task_id.clone()),
@@ -964,7 +1141,12 @@ pub(crate) fn persist(home: &Path, record: &ActiveAssignment) -> anyhow::Result<
                         crate::inbox::storage::enqueue(
                             home,
                             &record.target,
-                            build_revocation_notice(&old, &record.created_at, &nonce),
+                            build_retirement_notice(
+                                &old,
+                                RetirementCause::Replaced,
+                                &record.created_at,
+                                &nonce,
+                            ),
                         )?;
                     }
                 }
@@ -1142,14 +1324,25 @@ pub(crate) fn revoke(
 /// failure at any point preserves the authority — fail closed. Retry after
 /// interruption converges: supersede is idempotent on an already-superseded
 /// row, so re-running after a crash between supersede and delete is safe.
+/// #9: everything a retirement needs to carry beyond the record it retires.
+///
+/// Bundled because `retire_under_lock` already takes the record coordinates; the
+/// cause, the clock, and the caller's cleanup accumulator are one decision, not
+/// three independent knobs, and passing them separately pushed the function past
+/// the argument ceiling where a mistaken pairing would be easy.
+struct Retirement<'a> {
+    cause: RetirementCause,
+    now: &'a str,
+    cleanup_tasks: &'a mut Vec<String>,
+}
+
 fn retire_under_lock(
     home: &Path,
     repo: &str,
     branch: &str,
     target: &str,
     expected_id: uuid::Uuid,
-    now: &str,
-    cleanup_tasks: &mut Vec<String>,
+    retirement: Retirement<'_>,
 ) -> anyhow::Result<bool> {
     let path = record_file(home, repo, branch, target);
     let record = match read_record(&path)? {
@@ -1164,15 +1357,16 @@ fn retire_under_lock(
         "review assignment authority retired",
     )?;
     if cancelled {
-        cleanup_tasks.push(record.task_id.clone());
+        retirement.cleanup_tasks.push(record.task_id.clone());
     }
 
-    retire_delivery_under_lock(home, &record, now)
+    retire_delivery_under_lock(home, &record, retirement.cause, retirement.now)
 }
 
 fn retire_delivery_under_lock(
     home: &Path,
     record: &ActiveAssignment,
+    cause: RetirementCause,
     now: &str,
 ) -> anyhow::Result<bool> {
     let expected_id = record.assignment_id;
@@ -1193,7 +1387,12 @@ fn retire_delivery_under_lock(
             crate::inbox::storage::enqueue(
                 home,
                 target,
-                build_revocation_notice(record, now, &nonce),
+                build_retirement_notice(
+                    record,
+                    cause.settled_only_if(validated_receipt_exists(home, record)),
+                    now,
+                    &nonce,
+                ),
             )?;
         }
     }
@@ -1212,14 +1411,22 @@ pub(crate) fn retire_if_id_matches(
     let mut cleanup_tasks = Vec::new();
     let result = {
         let _lock = lock_branch(home, repo, branch)?;
+        // #9: this entry has no terminal event to consult, so it must not claim
+        // the review settled. It is reached from the reconciler's cascade
+        // fallback, from PR-scanner cleanup, and from dispatch-time rollback —
+        // none of which can distinguish "the review settled" from "an operator
+        // cancelled". The notice says the assignment is retired and stops there.
         retire_under_lock(
             home,
             repo,
             branch,
             target,
             expected_id,
-            now,
-            &mut cleanup_tasks,
+            Retirement {
+                cause: RetirementCause::TaskTerminalUnattributed,
+                now,
+                cleanup_tasks: &mut cleanup_tasks,
+            },
         )
     };
     for task_id in cleanup_tasks {
@@ -1261,8 +1468,11 @@ pub(crate) fn retire_for_review_class_correction(
                 branch,
                 &record.target,
                 record.assignment_id,
-                now,
-                &mut cleanup_tasks,
+                Retirement {
+                    cause: RetirementCause::Retired,
+                    now,
+                    cleanup_tasks: &mut cleanup_tasks,
+                },
             )?);
         }
         let invalidated_receipts =
@@ -1341,8 +1551,18 @@ pub(crate) fn retire_for_terminal_event(
                 &branch,
                 &record.target,
                 record.assignment_id,
-                now,
-                &mut cleanup_tasks,
+                Retirement {
+                    // #9 (F1): the terminal event's EMITTER cannot answer "did a
+                    // review settle?" — it records who performed SOME close, and
+                    // `system:auto_close` is shared by the receipt close, ordinary
+                    // `terminal: true` reports, and the branch-merge scanner. The
+                    // caller already established that the task is terminal; the
+                    // settled CLAIM is decided against PR state at the single point
+                    // where the notice is built.
+                    cause: RetirementCause::TaskTerminalUnattributed,
+                    now,
+                    cleanup_tasks: &mut cleanup_tasks,
+                },
             )?);
         }
         ledger.insert(key.clone());
@@ -1372,7 +1592,12 @@ pub(crate) fn retire_current_terminal_task_checked(
             || {
                 for record in list_active_checked(home, &repo, &branch)? {
                     if record.task_id == task_id {
-                        retired += usize::from(retire_delivery_under_lock(home, &record, now)?);
+                        retired += usize::from(retire_delivery_under_lock(
+                            home,
+                            &record,
+                            RetirementCause::TaskTerminalUnattributed,
+                            now,
+                        )?);
                     }
                 }
                 Ok(())
@@ -1436,7 +1661,15 @@ fn retire_operator_settlement_after_preflight(
                     if record.task_id == task_id {
                         // The task is already terminal under its writer lock. Do not
                         // call cancellation, which would re-enter that same lock.
-                        retired += usize::from(retire_delivery_under_lock(home, &record, now)?);
+                        retired += usize::from(retire_delivery_under_lock(
+                            home,
+                            &record,
+                            // #9 (F1): see the sibling site — the emitter is not
+                            // consulted; the settled claim is decided against PR
+                            // state where the notice is built.
+                            RetirementCause::TaskTerminalUnattributed,
+                            now,
+                        )?);
                     }
                 }
                 ledger.insert(key.clone());
@@ -1495,7 +1728,12 @@ fn revoke_under_lock(
         crate::inbox::storage::enqueue(
             home,
             target,
-            build_revocation_notice(&record, now, &revocation_nonce(record.assignment_id)),
+            build_retirement_notice(
+                &record,
+                RetirementCause::ExplicitlyRevoked,
+                now,
+                &revocation_nonce(record.assignment_id),
+            ),
         )?;
     }
     remove_if_assignment_matches_strict(&path, record.assignment_id)

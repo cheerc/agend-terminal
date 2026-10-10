@@ -1,5 +1,17 @@
 //! Task board — fleet-wide task tracking via JSON file.
 
+/// #9: the identity a report-driven auto-close writes into its terminal event.
+/// Underscore form, matching `acl::SYSTEM_IDENTITIES`.
+///
+/// It is a TRUSTED CALLER IDENTITY, not a semantic label — `acl::SYSTEM_IDENTITIES`
+/// admits it for broad task mutation, and the branch-merge/sweep paths already
+/// write terminal events under it. Nothing about it distinguishes one close from
+/// another: an ordinary `terminal: true` report and the branch-merge scanner share
+/// it with the validated-receipt close. #9's first implementation read this
+/// emitter as "a settled review" and was wrong (F1); consumers that need that
+/// distinction must check for an actual validated receipt in PR state instead.
+pub(crate) const AUTO_CLOSE_INSTANCE: &str = "system:auto_close";
+
 mod acl;
 mod activity;
 pub mod auto_close;
