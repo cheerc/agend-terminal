@@ -2219,3 +2219,381 @@ fn same_branch_replacement_stays_replaced_even_with_a_receipt_9() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── #7: retiring an assignment must retire its receipt ─────────────────────
+//
+// A non-VERIFIED receipt is a per-ASSIGNMENT record (`assignment_id` is the
+// discriminating column `apply_receipt_to_state` already dedupes on), but it
+// outlived the assignment: `retire_delivery_under_lock` removed the record file
+// and left `validated_review_receipts` untouched, while `merge_readiness` scans
+// those receipts without ever asking whether the assignment still exists. The
+// production incident (2026-10-04, `student-billing` PR #85) is the visible
+// shape — a revoked reviewer's REJECTED receipt kept blocking a merge after a
+// replacement reviewer had already delivered a valid VERIFIED one.
+
+/// #7 (B2, narrowed by decision d-20261010090040792830-14): a receipt is dropped
+/// only when its assignment is WITHDRAWN — revoked, replaced, or invalidated by a
+/// review-class correction.
+///
+/// The terminal causes are excluded, and that is the substance rather than a
+/// caveat: `TaskSettled` has no construction site outside `settled_only_if`, and
+/// every caller on the successful-settlement path passes
+/// `TaskTerminalUnattributed`, because "this review settled" is INFERRED from the
+/// receipt's presence, never passed in. So on a terminal close the receipt IS the
+/// merge gate's authority — dropping it deleted the VERIFIED receipt a settled
+/// review had just produced.
+#[test]
+fn a_withdrawn_assignment_drops_its_receipts_7() {
+    for (label, verdict) in [
+        ("rejected", crate::review_receipt::ReviewVerdict::Rejected),
+        (
+            "unverified",
+            crate::review_receipt::ReviewVerdict::Unverified,
+        ),
+    ] {
+        let home = tmp_home(&format!("7-b2-{label}"));
+        let task_id = format!("t-7-b2-{label}");
+        seed_branchless_task(&home, &task_id, "reviewer");
+        let head = "a".repeat(40);
+        let reviewer_id = crate::types::InstanceId::new();
+        let mut assignment = mk_record_typed(
+            "o/r",
+            &format!("feat/7-b2-{label}"),
+            "reviewer",
+            reviewer_id,
+            42,
+            "2026-10-10T00:00:00Z",
+        );
+        assignment.task_id = task_id.clone();
+        persist(&home, &assignment).unwrap();
+        pin_receipt_of_verdict(&home, &assignment, reviewer_id, &head, verdict);
+        assert_eq!(
+            receipt_ids(&home, &assignment).len(),
+            1,
+            "{label}: precondition: the receipt must exist before the retire"
+        );
+
+        // `Retired` is the reachable withdrawal cause on this path; it is what
+        // `retire_for_review_class_correction` passes.
+        assert!(
+            retire_for_review_class_correction(
+                &home,
+                &assignment.repo,
+                &assignment.branch,
+                assignment.pr_number,
+                &head,
+                "2026-10-10T00:00:10Z",
+            )
+            .unwrap()
+            .0 > 0,
+            "{label}: precondition: the correction must retire the assignment"
+        );
+
+        assert!(
+            receipt_ids(&home, &assignment).is_empty(),
+            "#7: a WITHDRAWN assignment must drop its own receipts (judged by \
+             assignment_id, never reviewer name) — {label} still holds {}",
+            receipt_ids(&home, &assignment).len(),
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
+
+/// The other half, and the one this narrowing was written for: a TERMINAL close
+/// keeps the receipt.
+///
+/// `retire_if_id_matches` passes `TaskTerminalUnattributed`, so under the old
+/// unconditional drop this exact call deleted a freshly-ingested receipt — the
+/// regression CI caught in `validated_receipt_projection_does_not_lose_the_verdict_8`.
+/// The assertion is on the OUTCOME (the receipt survives), not on the cause name,
+/// so it stays true if the cause plumbing is ever reorganised.
+#[test]
+fn a_terminal_close_keeps_the_receipt_7() {
+    let home = tmp_home("7-b2-terminal-keeps");
+    let task_id = "t-7-terminal-keeps";
+    seed_branchless_task(&home, task_id, "reviewer");
+    let head = "a".repeat(40);
+    let reviewer_id = crate::types::InstanceId::new();
+    let mut assignment = mk_record_typed(
+        "o/r",
+        "feat/7-terminal-keeps",
+        "reviewer",
+        reviewer_id,
+        42,
+        "2026-10-10T00:00:00Z",
+    );
+    assignment.task_id = task_id.into();
+    persist(&home, &assignment).unwrap();
+    pin_receipt_of_verdict(
+        &home,
+        &assignment,
+        reviewer_id,
+        &head,
+        crate::review_receipt::ReviewVerdict::Verified,
+    );
+
+    assert!(
+        retire_if_id_matches(
+            &home,
+            &assignment.repo,
+            &assignment.branch,
+            &assignment.target,
+            assignment.assignment_id,
+            "2026-10-10T00:00:10Z",
+        )
+        .unwrap(),
+        "precondition: the terminal retire must remove the record"
+    );
+
+    assert!(
+        crate::daemon::pr_state::load(&home, &assignment.repo, &assignment.branch).is_some_and(
+            |state| state
+                .validated_review_receipts
+                .iter()
+                .any(|receipt| receipt.assignment_id == assignment.assignment_id)
+        ),
+        "#7: a receipt that arrived with a TERMINAL close is the merge gate's \
+         authority, not residue — the narrowing must not drop it"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A withdrawal drops only the NAMED assignment.
+///
+/// Discrimination is proven directly on the filter rather than through a
+/// retirement path, because the scenario an end-to-end witness would need is
+/// UNREPRESENTABLE in the only store this guard touches:
+///
+/// A receipt's head must satisfy BOTH conditions to be admitted to
+/// `PrState.validated_review_receipts` — `matches_state` requires
+/// `summary.reviewed_head == state.head_sha` (`review_receipt.rs:123`), and
+/// `assignment_still_authorizes` requires
+/// `assignment.reviewed_head == summary.reviewed_head` (`review_receipt.rs:526`).
+/// Two sibling assignments with different heads therefore cannot BOTH hold a
+/// receipt there, and that store is exactly what `drop_receipts_for_assignment`
+/// writes and `receipt_ids` reads. So "drop one, spare a sibling" cannot be
+/// staged, and no test could witness it without fabricating state.
+///
+/// Correction history — three revisions of this rationale, the first two WRONG.
+/// Kept because their value is not that they were wrong but that they show how
+/// easily this argument looks sound without being executed:
+/// 1. claimed the correction path clears the whole subject's receipts — FALSE;
+///    `invalidate_validated_for_subject` clears a separate verdict buffer.
+/// 2. claimed no retirement path can drop one assignment and spare a sibling —
+///    FALSE; the two-condition filter (`pr_number` AND `reviewed_head`) does allow
+///    exactly that. The blocker is receipt ADMISSION, not assignment coexistence.
+/// 3. current: admission requires a single head, so the scenario is
+///    unrepresentable — established by attempting the fixture, which cannot get a
+///    second sibling receipt admitted.
+#[test]
+fn the_drop_filter_matches_assignment_id_and_spares_siblings_7() {
+    let home = tmp_home("7-b2-filter-precision");
+    let head = "a".repeat(40);
+    let reviewer_id = crate::types::InstanceId::new();
+    let mut a = mk_record_typed(
+        "o/r",
+        "feat/7-filter",
+        "reviewer-a",
+        reviewer_id,
+        42,
+        "2026-10-10T00:00:00Z",
+    );
+    a.task_id = "t-7-filter-a".into();
+    persist(&home, &a).unwrap();
+    pin_receipt_of_verdict(
+        &home,
+        &a,
+        reviewer_id,
+        &head,
+        crate::review_receipt::ReviewVerdict::Rejected,
+    );
+    let mut b = mk_record_typed(
+        "o/r",
+        "feat/7-filter",
+        "reviewer-b",
+        reviewer_id,
+        42,
+        "2026-10-10T00:00:05Z",
+    );
+    b.task_id = "t-7-filter-b".into();
+    persist(&home, &b).unwrap();
+    pin_receipt_of_verdict(
+        &home,
+        &b,
+        reviewer_id,
+        &head,
+        crate::review_receipt::ReviewVerdict::Rejected,
+    );
+    assert_eq!(
+        receipt_ids(&home, &a).len(),
+        2,
+        "precondition: both assignments must have receipts"
+    );
+
+    // A name-based predicate would delete BOTH (both records share the reviewer
+    // INSTANCE id); a whole-subject predicate would too. Only assignment_id
+    // spares the sibling.
+    assert_eq!(
+        crate::daemon::pr_state::drop_receipts_for_assignment(
+            &home,
+            &a.repo,
+            &a.branch,
+            a.assignment_id,
+        )
+        .unwrap(),
+        1,
+        "the filter must drop exactly the named assignment's receipt"
+    );
+    let remaining = receipt_ids(&home, &a);
+    assert_eq!(
+        remaining,
+        vec![b.assignment_id],
+        "#7: the sibling assignment's receipt must survive — one reviewer may hold \
+         several assignments, and a reused name must not widen the match"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #7 r1: pin the MOUNT ORDER, which reviewer F1 showed nothing defends.
+///
+/// F1's probe moved the drop after `remove_if_assignment_matches_strict` — the
+/// orphaning shape — and both tests stayed green. This asserts the property the
+/// ordering exists for: when the drop FAILS, the authority survives so the caller
+/// can retry. A reordering that drops after record removal fails it because the
+/// record is gone.
+#[test]
+fn a_failing_drop_preserves_the_assignment_record_7() {
+    let home = tmp_home("7-drop-fault-injection");
+    let head = "a".repeat(40);
+    let reviewer_id = crate::types::InstanceId::new();
+    let mut assignment = mk_record_typed(
+        "o/r",
+        "feat/7-fault",
+        "reviewer",
+        reviewer_id,
+        42,
+        "2026-10-10T00:00:00Z",
+    );
+    assignment.task_id = "t-7-fault".into();
+    persist(&home, &assignment).unwrap();
+    pin_receipt_of_verdict(
+        &home,
+        &assignment,
+        reviewer_id,
+        &head,
+        crate::review_receipt::ReviewVerdict::Rejected,
+    );
+
+    // POSIX permission bits are the only portable way to make this write fail, so
+    // the whole body is unix-gated. Everything it needs is INSIDE the gate:
+    // hoisting any of it out leaves Windows with dead bindings, which
+    // `-D warnings` turns into an error (this exact shape failed
+    // `Clippy (our targets, strict)` on windows-latest).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Make the pr_state DIRECTORY unwritable so `with_pr_state` fails,
+        // without touching the assignment store's own directory.
+        let state_dir = crate::daemon::pr_state::pr_state_dir(&home);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let original = std::fs::read_dir(&state_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
+            .map(|path| std::fs::read_to_string(&path).unwrap_or_default())
+            .unwrap_or_default();
+        assert!(
+            !original.is_empty(),
+            "precondition: there was a persisted state to protect"
+        );
+
+        let dir_mode = std::fs::metadata(&state_dir).unwrap().permissions().mode();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = retire_for_review_class_correction(
+            &home,
+            &assignment.repo,
+            &assignment.branch,
+            assignment.pr_number,
+            &head,
+            "2026-10-10T00:00:10Z",
+        );
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(dir_mode)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "precondition: the drop must actually fail under an unwritable state dir"
+        );
+        assert!(
+            crate::daemon::assignment_authority::lookup_by_assignment_id_strict(
+                &home,
+                assignment.assignment_id,
+            )
+            .is_ok(),
+            "#7: a FAILED drop must leave the assignment record in place so the caller \
+             can retry — deleting it first would orphan the receipt (F1's shape)"
+        );
+    }
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Pin a validated receipt of an arbitrary verdict through the production
+/// `record_validated_receipt` entry (never hand-written PR state — a
+/// hand-written row makes a guard test pass for the wrong reason).
+fn pin_receipt_of_verdict(
+    home: &Path,
+    assignment: &ActiveAssignment,
+    reviewer_id: crate::types::InstanceId,
+    head: &str,
+    verdict: crate::review_receipt::ReviewVerdict,
+) {
+    crate::daemon::pr_state::record_ci_result(
+        home,
+        &assignment.repo,
+        &assignment.branch,
+        head,
+        crate::daemon::pr_state::CiConclusion::Green,
+        vec![assignment.sender.clone()],
+        assignment.review_class,
+    );
+    crate::daemon::pr_state::with_pr_state(home, &assignment.repo, &assignment.branch, |state| {
+        state.pr_number = assignment.pr_number;
+    })
+    .expect("seed pr_number");
+    let receipt = crate::review_receipt::ValidatedCodeReviewReceipt::for_test(
+        crate::review_receipt::ReviewReceiptSummary {
+            receipt_id: format!("review-receipt:m-7-{}", assignment.assignment_id),
+            source_id: format!("m-7-{}", assignment.assignment_id),
+            evidence_digest: "d".repeat(64),
+            assignment_id: assignment.assignment_id,
+            reviewer_instance_id: reviewer_id,
+            reviewer_name: assignment.target.clone(),
+            repo: assignment.repo.clone(),
+            pr_number: assignment.pr_number,
+            branch: assignment.branch.clone(),
+            task_id: assignment.task_id.clone(),
+            reviewed_head: head.to_string(),
+            review_class: assignment.review_class,
+            slot: crate::review_receipt::ReviewSlot::Primary,
+            verdict,
+        },
+    );
+    assert!(
+        crate::daemon::pr_state::record_validated_receipt(home, &receipt, None),
+        "precondition: the receipt must be recorded into PR state"
+    );
+}
+
+/// Assignment ids of the receipts currently held in PR state for `assignment`'s
+/// subject. Read from the persisted state, not from a producer's return value.
+fn receipt_ids(home: &Path, assignment: &ActiveAssignment) -> Vec<uuid::Uuid> {
+    crate::daemon::pr_state::load(home, &assignment.repo, &assignment.branch)
+        .map(|state| {
+            state
+                .validated_review_receipts
+                .iter()
+                .map(|receipt| receipt.assignment_id)
+                .collect()
+        })
+        .unwrap_or_default()
+}
