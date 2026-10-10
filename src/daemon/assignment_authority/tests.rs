@@ -2237,7 +2237,10 @@ fn same_branch_replacement_stays_replaced_even_with_a_receipt_9() {
 fn retiring_an_assignment_invalidates_its_receipts_7() {
     for (label, verdict) in [
         ("rejected", crate::review_receipt::ReviewVerdict::Rejected),
-        ("unverified", crate::review_receipt::ReviewVerdict::Unverified),
+        (
+            "unverified",
+            crate::review_receipt::ReviewVerdict::Unverified,
+        ),
     ] {
         let home = tmp_home(&format!("7-b2-{label}"));
         let task_id = format!("t-7-b2-{label}");
@@ -2332,17 +2335,15 @@ fn retiring_one_assignment_keeps_another_live_assignments_receipt_7() {
         crate::review_receipt::ReviewVerdict::Rejected,
     );
 
-    assert!(
-        retire_if_id_matches(
-            &home,
-            &retiring.repo,
-            &retiring.branch,
-            &retiring.target,
-            retiring.assignment_id,
-            "2026-10-10T00:00:10Z",
-        )
-        .unwrap()
-    );
+    assert!(retire_if_id_matches(
+        &home,
+        &retiring.repo,
+        &retiring.branch,
+        &retiring.target,
+        retiring.assignment_id,
+        "2026-10-10T00:00:10Z",
+    )
+    .unwrap());
 
     let survivors = receipt_ids(&home, &surviving);
     assert_eq!(

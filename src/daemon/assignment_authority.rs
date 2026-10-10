@@ -859,7 +859,7 @@ pub(crate) fn list_active(home: &Path, repo: &str, branch: &str) -> Vec<ActiveAs
 /// from [`read_record`] propagates instead of silently dropping the record. The
 /// SOLE reader for the merge-gate-affecting reserved derivation (B4) — a corrupt
 /// record must NEVER be read as "no reservation".
-fn list_active_checked(
+pub(crate) fn list_active_checked(
     home: &Path,
     repo: &str,
     branch: &str,
@@ -1396,6 +1396,19 @@ fn retire_delivery_under_lock(
             )?;
         }
     }
+
+    // #7: the assignment is going away, so the receipts IT produced must go with
+    // it. Leaving them behind lets a stale non-VERIFIED receipt keep blocking
+    // `merge_readiness` after the reviewer was revoked or replaced — the
+    // 2026-10-04 `student-billing` PR #85 shape. Runs after the delivery is
+    // superseded and before the record is removed, so a failure here preserves
+    // the authority (the caller can retry) rather than orphaning the receipt.
+    crate::daemon::pr_state::drop_receipts_for_assignment(
+        home,
+        &record.repo,
+        &record.branch,
+        expected_id,
+    )?;
 
     remove_if_assignment_matches_strict(&path, expected_id)
 }

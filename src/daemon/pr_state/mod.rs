@@ -769,6 +769,37 @@ pub fn merge_readiness(state: &PrState) -> Result<(), MergeDeficit> {
     Ok(())
 }
 
+/// #7: drop every validated receipt that the named assignment produced.
+///
+/// A receipt belongs to an ASSIGNMENT identity, not to a reviewer name: one
+/// reviewer may hold several assignments on one branch, and a name may be
+/// reused. `assignment_id` is already the discriminating column
+/// (`apply_receipt_to_state` dedupes on it), so it is what this matches.
+///
+/// This is the write half of #7; the read half is `merge_readiness`, which has
+/// no `home` and therefore cannot consult the assignment store itself. Callers
+/// already hold the assignment branch lock (this is invoked from inside
+/// `retire_delivery_under_lock`), so the lock order
+/// assignment-OUTER / pr_state-INNER is preserved.
+pub(crate) fn drop_receipts_for_assignment(
+    home: &std::path::Path,
+    repo: &str,
+    branch: &str,
+    assignment_id: uuid::Uuid,
+) -> anyhow::Result<usize> {
+    // `None` means the subject has no persisted state at all, so there is
+    // nothing to drop — that is absence, not failure, and must not stop the
+    // retire.
+    Ok(with_pr_state(home, repo, branch, |state| {
+        let before = state.validated_review_receipts.len();
+        state
+            .validated_review_receipts
+            .retain(|receipt| receipt.assignment_id != assignment_id);
+        before - state.validated_review_receipts.len()
+    })?
+    .unwrap_or(0))
+}
+
 /// Compatibility predicate retained for all scanner/reducer callers.
 pub fn is_merge_ready(state: &PrState) -> bool {
     merge_readiness(state).is_ok()
