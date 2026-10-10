@@ -28,8 +28,9 @@ use std::path::Path;
 /// dispatch path inherit automatically.
 ///
 /// Required args: `branch`. Optional: `repository_path`.
-/// Returns `{bound, worktree_path, branch}` on success or `{error, code}`
-/// on failure.
+/// Returns `{bound, worktree_path, branch, project_docs}` on success or
+/// `{error, code}` on failure. `project_docs` is the #35 path index — see
+/// [`bound_project_docs`] for what it does and deliberately does not disclose.
 pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender>) -> Value {
     let agent = match sender.as_ref().map(Sender::as_str) {
         Some(a) if !a.is_empty() => a,
@@ -145,6 +146,7 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
                 "bound": true,
                 "worktree_path": worktree_path,
                 "branch": branch,
+                "project_docs": bound_project_docs(&worktree_path),
             });
             // #2496: surface exactly what the safe repair did (or that it
             // wasn't invoked at all) — the acceptance criteria requires
@@ -195,6 +197,60 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
             response
         }
     }
+}
+
+/// #35: project-doc PATHS present at the bound worktree ROOT, as
+/// `{path, bytes}` entries.
+///
+/// An agent bound to a worktree is cd'd into its `working_directory`, not the
+/// worktree — so it never learns the spec files are there, and does not guess
+/// to look. This discloses WHERE they are; it does not read them into the
+/// payload. "Not preloading the project baseline at session start" is existing
+/// customization policy (see `instructions::generate_with_context`), and this
+/// leaves it intact: the agent still decides when to read.
+///
+/// The four frozen scope decisions, each load-bearing:
+///
+/// 1. **Both spec files, no precedence.** `CLAUDE.md` and `AGENTS.md` routinely
+///    coexist and can disagree; an agent that knows both are present can judge
+///    for itself. Inventing a priority here would be us deciding that.
+/// 2. **Root only, never subdirectories.** Which nested file is relevant is a
+///    repo convention, not a rule; listing them would guess on the agent's
+///    behalf.
+/// 3. **Absolute path + byte size, never content.** The only shape with no
+///    prompt-injection surface.
+/// 4. **Absent / non-UTF-8 / non-regular → skipped in silence.** The payload
+///    is a path index for the agent, not a health report; surfacing problems
+///    here would send it off to fix something unrelated to its task.
+fn bound_project_docs(worktree_root: &str) -> Vec<Value> {
+    // An empty/unreadable binding path discloses nothing — same silence as a
+    // doc that is not there.
+    let root = Path::new(worktree_root);
+    let mut docs = Vec::new();
+    for name in ["CLAUDE.md", "AGENTS.md"] {
+        let path = root.join(name);
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue; // decision 4: absent or unreadable — skip silently
+        };
+        // Guards FIFOs, sockets, and directories named `CLAUDE.md`; only a
+        // regular file is a spec file.
+        if !metadata.is_file() {
+            continue;
+        }
+        // Decision 4's "non-UTF-8" leg. Path and size need no decoding, so this
+        // read exists ONLY to classify readability, mirroring
+        // `paths::classify_identity_read` — the same fail-closed distinction
+        // `agents_md_identity` already draws for shared instruction files.
+        match std::fs::read(&path) {
+            Ok(bytes) if std::str::from_utf8(&bytes).is_ok() => {}
+            _ => continue,
+        }
+        docs.push(json!({
+            "path": path.to_string_lossy(),
+            "bytes": metadata.len(),
+        }));
+    }
+    docs
 }
 
 /// MCP tool: `release_worktree`. Required arg: `instance`. Returns
