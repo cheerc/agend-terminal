@@ -2,7 +2,6 @@
 //! pointer were lost during a timed-out release.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 fn remove_empty_dir_tree(dir: &Path) {
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -265,20 +264,7 @@ pub(crate) fn recover_markerless_bound_worktree(
         }
     }
 
-    let archive_root = home.join(".trash").join("worktrees");
-    std::fs::create_dir_all(&archive_root)
-        .map_err(|e| format!("create recovery archive root: {e}"))?;
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let archive = archive_root.join(format!(
-        "{instance}-recovery-{}-{}",
-        stamp.as_secs(),
-        stamp.subsec_nanos()
-    ));
-    if archive.exists() {
-        return Err(format!("recovery archive collision: {}", archive.display()));
-    }
+    let archive = crate::admin::archive_mechanics::archive_directory(home, instance, "recovery")?;
 
     // Publish the planned archive path before the rename.  A daemon crash at
     // either side of the filesystem rename leaves a durable next action: the
@@ -291,7 +277,7 @@ pub(crate) fn recover_markerless_bound_worktree(
     // Prepare self-describing metadata inside the source before rename.  The
     // rename then carries the signed evidence and manifest atomically with the
     // payload, while retries can safely complete any interrupted metadata write.
-    archive::write_archive_metadata(
+    crate::admin::archive_mechanics::write_archive_metadata(
         &target,
         actor,
         audit_reason,
@@ -307,13 +293,7 @@ pub(crate) fn recover_markerless_bound_worktree(
     // Rename is the safety boundary: it is atomic on the normal same-filesystem
     // layout. Cross-device copy is deliberately refused so recovery never turns
     // into a partially copied destructive cleanup.
-    std::fs::rename(&target, &archive).map_err(|e| {
-        format!(
-            "archive rename {} -> {} failed: {e}",
-            target.display(),
-            archive.display()
-        )
-    })?;
+    crate::admin::archive_mechanics::rename_worktree_into(&target, &archive)?;
 
     match crate::binding::unbind_with_permit(home, instance, &permit) {
         crate::binding::BindingRemoval::Removed => {
