@@ -336,60 +336,41 @@ pub fn migrate_existing_log(
     }
 }
 
-/// Check if a filename corresponds to a daemon log file that counts toward the byte cap.
+/// Shared producer/legacy naming predicate for daemon rotated logs.
 ///
-/// Matches:
-/// - Real producer output: `daemon.<YYYY-MM-DD>.log` (e.g. `daemon.2026-10-11.log`)
-/// - Legacy rotated format: `daemon.log.<date>`
-/// - Migration archives: `daemon.log.migration.<epoch>` or `daemon.migration.<epoch>`
+/// Matches the real rolling-appender output `daemon.<YYYY-MM-DD>.log` (UTC)
+/// and the legacy rotated form `daemon.log.<date>`. Both call sites share
+/// this predicate and then apply their own migration policy:
+/// - `cleanup_oversize_logs` additionally counts the
+///   `daemon.log.migration.<epoch>` archives produced by
+///   `migrate_existing_log` (`{filename}.migration.{epoch}` with filename
+///   `daemon.log`);
+/// - `update_daemon_log_symlink_unix` excludes them (static snapshots, never
+///   the active write target).
 ///
-///   Excludes:
-/// - Symlink itself: `daemon.log`
-/// - Application logs: `app.*`
-fn is_daemon_log_for_cleanup(name: &str) -> bool {
+/// A single shared predicate (rather than one helper per call site) keeps the
+/// matcher compiled-and-used on every platform: the symlink consumer is
+/// Unix-only, so a symlink-only helper is dead code on Windows and fails
+/// `-D warnings` there.
+///
+/// Boundary (honest): `daemon.migration.*` (without `.log`) is NOT matched —
+/// no producer or legacy authority emits that namespace; only
+/// `daemon.log.migration.<epoch>` has one (`migrate_existing_log`).
+/// Excludes the `daemon.log` symlink itself and `app.*` logs.
+fn is_daemon_rotated_log_name(name: &str) -> bool {
     if name == "daemon.log" {
         return false;
     }
-    // Real producer format: `daemon.<YYYY-MM-DD>.log` (exclude `daemon.log`)
+    // Real producer format: `daemon.<YYYY-MM-DD>.log` (exclude `daemon.log`).
     if name.starts_with("daemon.") && name.ends_with(".log") {
         let middle = &name["daemon.".len()..name.len() - ".log".len()];
         if !middle.is_empty() && middle.chars().all(|c| c.is_ascii_digit() || c == '-') {
             return true;
         }
     }
-    // Legacy rotated format: `daemon.log.<date>`
-    if name.starts_with("daemon.log.") && !name.contains(MIGRATION_SUFFIX_PREFIX) {
-        return true;
-    }
-    // Migration files: `daemon.log.migration.<epoch>` or `daemon.migration.<epoch>`
-    if name.starts_with("daemon.log.migration.") || name.starts_with("daemon.migration.") {
-        return true;
-    }
-    false
-}
-
-/// Check if a filename is an active rotated daemon log suitable as a symlink target.
-///
-/// Matches:
-/// - Real producer output: `daemon.<YYYY-MM-DD>.log`
-/// - Legacy rotated format: `daemon.log.<date>`
-///
-///   Excludes:
-/// - Migration archives (`daemon.log.migration.*` / `*migration*`)
-/// - Symlink itself: `daemon.log`
-/// - Application logs: `app.*`
-fn is_daemon_active_rotated_log(name: &str) -> bool {
-    if name == "daemon.log" || name.contains(MIGRATION_SUFFIX_PREFIX) {
-        return false;
-    }
-    // Real producer format: `daemon.<YYYY-MM-DD>.log`
-    if name.starts_with("daemon.") && name.ends_with(".log") {
-        let middle = &name["daemon.".len()..name.len() - ".log".len()];
-        if !middle.is_empty() && middle.chars().all(|c| c.is_ascii_digit() || c == '-') {
-            return true;
-        }
-    }
-    // Legacy rotated format: `daemon.log.<date>`
+    // Legacy rotated format: `daemon.log.<date>`. The date charset
+    // (digits/dashes only) structurally excludes migration archives
+    // (`daemon.log.migration.<epoch>` carries letters and dots).
     if let Some(suffix) = name.strip_prefix("daemon.log.") {
         if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit() || c == '-') {
             return true;
@@ -412,7 +393,16 @@ pub fn cleanup_oversize_logs(home: &Path, max_bytes: u64) -> usize {
         .filter_map(|entry| {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if !is_daemon_log_for_cleanup(&name_str) {
+            // Shared rotated-log naming plus the `daemon.log.migration.*`
+            // archives from `migrate_existing_log`. `is_daemon_rotated_log_name`
+            // structurally excludes migration (letters/dots fail the
+            // digits-dashes charset), so the migration arm carries the
+            // authority here — not a second naming helper.
+            let is_migration = name_str.starts_with("daemon.log.migration.")
+                && name_str["daemon.log.migration.".len()..]
+                    .chars()
+                    .all(|c| c.is_ascii_digit());
+            if !(is_daemon_rotated_log_name(&name_str) || is_migration) {
                 return None;
             }
             let meta = entry.metadata().ok()?;
@@ -455,15 +445,16 @@ pub fn update_daemon_log_symlink_unix(home: &Path) {
         Ok(d) => d,
         Err(_) => return,
     };
-    // Newest rotated file (real `daemon.<date>.log` or legacy `daemon.log.<date>`),
-    // excluding migration markers (static historic snapshots — never active write
-    // targets), app logs, and the symlink itself.
+    // Newest rotated file (shared naming predicate). Migration archives
+    // never match the predicate (digits-dashes charset), so they are
+    // excluded here by construction — static historic snapshots are never
+    // the active write target. App logs and the symlink itself excluded.
     let newest = entries_iter
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name();
             let name_str = name.to_string_lossy().to_string();
-            if !is_daemon_active_rotated_log(&name_str) {
+            if !is_daemon_rotated_log_name(&name_str) {
                 return None;
             }
             let ft = entry.file_type().ok()?;
