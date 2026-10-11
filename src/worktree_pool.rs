@@ -26,8 +26,8 @@ use build_cache::{apply_cache_cleanup, clean_ignored_build_cache};
 // of this lifecycle file so the source LOC ratchet stays armed.
 mod partial_removal;
 use partial_removal::{
-    mark_release_incomplete, record_damaged_remnant, remove_worktree, tracked_path_snapshot,
-    WorktreeRemoval,
+    mark_release_incomplete, record_damaged_remnant, remove_worktree,
+    unusable_divert_before_snapshot, BaselineDecision, WorktreeRemoval,
 };
 
 mod release_recovery;
@@ -756,7 +756,45 @@ fn release_known_locked(
             // read as an intact worktree. See the CONTRACT note at the third
             // baseline site — a new deletion step added after this line needs the
             // same review.
-            let tracked_baseline = tracked_path_snapshot(wt_path);
+            let tracked_baseline = match unusable_divert_before_snapshot(home, agent, wt_path) {
+                BaselineDecision::Proceed(baseline) => baseline,
+                BaselineDecision::Diverted {
+                    archive,
+                    managed_verified,
+                } => {
+                    // F6: `managed_verified` is the marker fact sampled inside
+                    // the gate, before the rename that would have destroyed the
+                    // only place it could be asked. `false` means the daemon no
+                    // longer claims this directory, so it has no authority to
+                    // release it — fail closed exactly as an unmanaged release
+                    // does, rather than reporting a success nobody authorised.
+                    let out = if managed_verified {
+                        ReleaseOutcome {
+                            released: true,
+                            worktree_removed: true,
+                            path: Some(archive.display().to_string()),
+                            ..ReleaseOutcome::default()
+                        }
+                    } else {
+                        partial_removal::unmanaged_diversion_outcome(wt_path)
+                    };
+                    return partial_removal::diverted_locked_release(out, managed_verified);
+                }
+                BaselineDecision::DiversionFailed { error } => {
+                    // Fail closed: the remnant stays on disk with its binding.
+                    let mut out = ReleaseOutcome::default();
+                    mark_release_incomplete(&mut out, "worktree_diversion", wt_path, error);
+                    return LockedRelease {
+                        out,
+                        notices: Vec::new(),
+                        clear_refusal_marker: None,
+                        finish_full_release: false,
+                        managed_verified: false,
+                        worktree_absent: false,
+                        was_dirty: false,
+                    };
+                }
+            };
             if is_daemon_managed(wt_path) {
                 permit.set_stage("preserve_wip");
                 let branch = binding["branch"].as_str().unwrap_or("");
@@ -1489,7 +1527,33 @@ fn release_bound_target_exact_impl(
     // whatever it removes from the comparison — the damage still happens, the
     // report just stops seeing it. Review the baseline whenever a deletion is
     // added to a release route. Same applies at the other two call sites.
-    let tracked_baseline = tracked_path_snapshot(target);
+    let tracked_baseline = match unusable_divert_before_snapshot(home, agent, target) {
+        BaselineDecision::Proceed(baseline) => baseline,
+        BaselineDecision::Diverted {
+            archive,
+            managed_verified,
+        } => {
+            // F6: same fact, same consequence, on the route that holds the
+            // branch lease — reporting success here clears the binding, so an
+            // unverified authority would be a released claim.
+            if !managed_verified {
+                let out = partial_removal::unmanaged_diversion_outcome(target);
+                drop(_binding_lock);
+                drop(_agent_lock);
+                drop(branch_lock);
+                return out;
+            }
+            drop(_binding_lock);
+            drop(_agent_lock);
+            return partial_removal::diverted_release_outcome(&archive, || drop(branch_lock));
+        }
+        BaselineDecision::DiversionFailed { error } => {
+            drop(_binding_lock);
+            drop(_agent_lock);
+            drop(branch_lock);
+            return partial_removal::diversion_failed_outcome(&error, target);
+        }
+    };
     #[cfg(test)]
     release_test_seam::hit(ReleaseTestPhase::BeforeWorktreeRemove);
     let mut notices = Vec::new();
@@ -2011,7 +2075,29 @@ fn release_absent_target_impl(
     // removes from the comparison — the damage still happens, the report just
     // stops seeing it. Review this line whenever a release route gains a
     // deletion. Same applies at the other two baseline sites.
-    let tracked_baseline = tracked_path_snapshot(target);
+    let tracked_baseline = match unusable_divert_before_snapshot(home, agent, target) {
+        BaselineDecision::Proceed(baseline) => baseline,
+        BaselineDecision::Diverted {
+            archive,
+            managed_verified,
+        } => {
+            // F6: same fact, same consequence as the other two arms.
+            if !managed_verified {
+                let out = partial_removal::unmanaged_diversion_outcome(target);
+                drop(_binding_lock);
+                drop(_agent_lock);
+                return out;
+            }
+            drop(_binding_lock);
+            drop(_agent_lock);
+            return partial_removal::diverted_release_outcome(&archive, || ());
+        }
+        BaselineDecision::DiversionFailed { error } => {
+            drop(_binding_lock);
+            drop(_agent_lock);
+            return partial_removal::diversion_failed_outcome(&error, target);
+        }
+    };
     if matches!(target_state, crate::mcp::handlers::TargetState::Present) {
         permit.set_stage("preserve_wip");
         let mk_branch = marker_branch(target);
