@@ -2615,8 +2615,34 @@ fn source_repo_for_worktree(wt_path: &Path) -> PathBuf {
         .to_path_buf()
 }
 
+/// Fixture home for a `discard_seam_*` test. It removes itself on drop so an
+/// assertion that panics cannot strand it in `$HOME`.
+///
+/// It lives under `$HOME` rather than `temp_dir()` because `discard_seam_*`
+/// exercises the production `repo action=release` handler (`handle_release_repo`),
+/// where `validate_release_path` deliberately refuses system paths (`/tmp`, `/var`,
+/// `/private`) to prevent dangerous recursive removals.
 #[cfg(unix)]
-fn release_tmp_home(name: &str) -> PathBuf {
+struct ReleaseHome(PathBuf);
+
+#[cfg(unix)]
+impl Drop for ReleaseHome {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+#[cfg(unix)]
+impl std::ops::Deref for ReleaseHome {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(unix)]
+fn release_tmp_home(name: &str) -> ReleaseHome {
     let root = PathBuf::from(std::env::var("HOME").expect("HOME for release fixture"));
     let dir = root.join(format!(
         ".agend-nested-release-{}-{name}-{}",
@@ -2624,7 +2650,42 @@ fn release_tmp_home(name: &str) -> PathBuf {
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).expect("release fixture home");
-    dir
+    ReleaseHome(dir)
+}
+
+/// Gives a directory its owner bits back on drop. A test that locks a
+/// directory with `0o000` must hold one of these, otherwise a panic leaves a
+/// directory the fixture's own removal cannot descend into.
+#[cfg(unix)]
+struct RestoreMode(PathBuf);
+
+#[cfg(unix)]
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755)).ok();
+    }
+}
+
+/// A `discard_seam_*` test that panics must not strand its fixture in `$HOME`.
+/// Before the fix the fixture was only removed on the success path, so every
+/// panicking run left a directory behind.
+#[cfg(unix)]
+#[test]
+fn release_tmp_home_is_removed_when_the_test_unwinds_25() {
+    let mut leaked = PathBuf::new();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let home = release_tmp_home("unwind");
+        leaked = home.to_path_buf();
+        assert!(leaked.exists(), "fixture must exist while alive");
+        panic!("forced unwind with the fixture alive");
+    }));
+    assert!(outcome.is_err(), "the forced panic must unwind");
+    assert!(
+        !leaked.exists(),
+        "a panicking test must not strand its fixture in HOME: {}",
+        leaked.display()
+    );
 }
 
 /// Invoke the actual path-addressed `repo action=release` route. The fixture
@@ -2733,7 +2794,6 @@ fn discard_seam_no_authorization_still_refuses() {
         "(a) absent binding must remain absent on refusal"
     );
 
-    std::fs::remove_dir_all(&home).ok();
     if let Some(root) = super_repo.parent() {
         std::fs::remove_dir_all(root).ok();
     }
@@ -2768,7 +2828,6 @@ fn discard_seam_force_without_digest_refuses() {
         "missing digest must preserve the absent binding"
     );
 
-    std::fs::remove_dir_all(&home).ok();
     if let Some(root) = super_repo.parent() {
         std::fs::remove_dir_all(root).ok();
     }
@@ -2806,7 +2865,6 @@ fn discard_seam_matching_digest_succeeds() {
         "(b) release must leave the already-absent binding absent"
     );
 
-    std::fs::remove_dir_all(&home).ok();
     if let Some(root) = super_repo.parent() {
         std::fs::remove_dir_all(root).ok();
     }
@@ -2886,7 +2944,6 @@ fn discard_seam_wrong_digest_refuses_toctou() {
         "(c) stale digest must not mint a recovery ref"
     );
 
-    std::fs::remove_dir_all(&home).ok();
     if let Some(root) = super_repo.parent() {
         std::fs::remove_dir_all(root).ok();
     }
@@ -2941,7 +2998,6 @@ fn discard_seam_residual_dirt_after_reset_refuses() {
         "(d) residual refusal must not mint a recovery ref"
     );
 
-    std::fs::remove_dir_all(&home).ok();
     if let Some(root) = super_repo.parent() {
         std::fs::remove_dir_all(root).ok();
     }
@@ -2991,7 +3047,6 @@ fn discard_seam_preserves_parent_wip() {
         "(e) recovery ref must retain parent WIP, got {tree}"
     );
 
-    std::fs::remove_dir_all(&home).ok();
     if let Some(root) = super_repo.parent() {
         std::fs::remove_dir_all(root).ok();
     }
@@ -3039,7 +3094,6 @@ fn discard_seam_records_audit_evidence() {
         "(f) discard must append agent/branch evidence to event-log.jsonl: {after}"
     );
 
-    std::fs::remove_dir_all(&home).ok();
     if let Some(root) = super_repo.parent() {
         std::fs::remove_dir_all(root).ok();
     }
@@ -3073,7 +3127,6 @@ fn discard_seam_empty_digest_refuses() {
         "trimmed-empty digest must preserve target"
     );
 
-    std::fs::remove_dir_all(&home).ok();
     if let Some(root) = super_repo.parent() {
         std::fs::remove_dir_all(root).ok();
     }
@@ -3109,7 +3162,6 @@ fn discard_seam_empty_audit_reason_refuses() {
         "trimmed-empty audit_reason must preserve target"
     );
 
-    std::fs::remove_dir_all(&home).ok();
     if let Some(root) = super_repo.parent() {
         std::fs::remove_dir_all(root).ok();
     }
@@ -3144,7 +3196,6 @@ fn discard_seam_refusal_returns_digest() {
     );
     assert!(info.path.exists(), "refusal must preserve target");
 
-    std::fs::remove_dir_all(&home).ok();
     if let Some(root) = super_repo.parent() {
         std::fs::remove_dir_all(root).ok();
     }
@@ -3168,7 +3219,6 @@ fn discard_seam_sha256_shape_and_stability() {
     );
     assert_eq!(d1, d2, "digest must be deterministic across calls");
 
-    std::fs::remove_dir_all(&home).ok();
     if let Some(root) = super_repo.parent() {
         std::fs::remove_dir_all(root).ok();
     }
@@ -3219,7 +3269,6 @@ fn discard_seam_audit_records_after_parent_preservation() {
         "success must NOT have an aborted audit: {new_lines:?}"
     );
 
-    std::fs::remove_dir_all(&home).ok();
     if let Some(root) = super_repo.parent() {
         std::fs::remove_dir_all(root).ok();
     }
@@ -3268,7 +3317,6 @@ fn discard_seam_refusal_digest_is_sha256_round_trippable() {
         "round-trip with refusal digest must succeed: {result}"
     );
 
-    std::fs::remove_dir_all(&home).ok();
     if let Some(root) = super_repo.parent() {
         std::fs::remove_dir_all(root).ok();
     }
@@ -3313,7 +3361,6 @@ fn discard_seam_deep_nested_preflight_refuses() {
         "deep-nested file must not be modified by preflight refusal"
     );
 
-    std::fs::remove_dir_all(&home).ok();
     if let Some(root) = super_repo.parent() {
         std::fs::remove_dir_all(root).ok();
     }
@@ -3408,7 +3455,6 @@ fn discard_seam_later_invalid_target_no_earlier_mutation() {
         "worktree must be preserved on preflight refusal"
     );
 
-    std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -3447,6 +3493,7 @@ fn discard_seam_removal_failure_no_success_audit() {
     std::fs::create_dir_all(&locked).unwrap();
     std::fs::write(locked.join("content.txt"), b"trapped\n").unwrap();
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let _restore_mode = RestoreMode(locked.clone());
 
     let digest = nested_dirt_digest(&info.path);
     let event_log = home.join("event-log.jsonl");
@@ -3559,9 +3606,6 @@ fn discard_seam_removal_failure_no_success_audit() {
         );
     }
 
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
-    std::fs::remove_dir_all(&info.path).ok();
-    std::fs::remove_dir_all(&home).ok();
     if let Some(root) = super_repo.parent() {
         std::fs::remove_dir_all(root).ok();
     }
@@ -3638,7 +3682,6 @@ fn discard_seam_missing_index_gitlink_object_no_mutation() {
     );
     assert!(info.path.exists(), "worktree must be preserved");
 
-    std::fs::remove_dir_all(&home).ok();
     if let Some(root) = super_repo.parent() {
         std::fs::remove_dir_all(root).ok();
     }
@@ -3687,7 +3730,6 @@ fn discard_seam_audit_targets_are_json_encoded() {
         "audit targets must be JSON-encoded array in detail, got: {detail}"
     );
 
-    std::fs::remove_dir_all(&home).ok();
     if let Some(root) = super_repo.parent() {
         std::fs::remove_dir_all(root).ok();
     }
@@ -3778,7 +3820,6 @@ fn discard_seam_cache_fatal_emits_abort_audit_48() {
         "#48: the abort audit must carry the already-authorized discard detail: {detail}"
     );
 
-    std::fs::remove_dir_all(&home).ok();
     if let Some(root) = super_repo.parent() {
         std::fs::remove_dir_all(root).ok();
     }
@@ -3835,7 +3876,6 @@ fn discard_seam_newline_path_no_mutation() {
         "no success audit must be emitted for refused release"
     );
 
-    std::fs::remove_dir_all(&home).ok();
     if let Some(root) = super_repo.parent() {
         std::fs::remove_dir_all(root).ok();
     }
