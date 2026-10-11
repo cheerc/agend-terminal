@@ -232,8 +232,17 @@ fn bound_project_docs(worktree_root: &str) -> Vec<Value> {
         let Ok(metadata) = std::fs::metadata(&path) else {
             continue; // decision 4: absent or unreadable — skip silently
         };
-        // Guards FIFOs, sockets, and directories named `CLAUDE.md`; only a
-        // regular file is a spec file.
+        // #35 r1 F1: this guard is LOAD-BEARING, not belt-and-braces. The
+        // UTF-8 leg below reads the file, and `fs::read` does not fail
+        // uniformly on non-regular types: a directory and a socket return an
+        // error, but a FIFO with no writer blocks forever and a symlink to a
+        // device reads unboundedly. `handle_bind_self` is dispatched
+        // synchronously with no thread offload, so reaching either hangs the
+        // request handler. Measured on macOS — see
+        // `is_file_is_what_keeps_a_fifo_from_hanging_bind_35`. Removing this
+        // guard is therefore NOT covered by the tests below: the directory
+        // fixture would still be skipped by the read's error, so no test
+        // turns red, while the FIFO case would hang instead.
         if !metadata.is_file() {
             continue;
         }
@@ -241,6 +250,7 @@ fn bound_project_docs(worktree_root: &str) -> Vec<Value> {
         // read exists ONLY to classify readability, mirroring
         // `paths::classify_identity_read` — the same fail-closed distinction
         // `agents_md_identity` already draws for shared instruction files.
+        // Reachable only for regular files, by the guard above.
         match std::fs::read(&path) {
             Ok(bytes) if std::str::from_utf8(&bytes).is_ok() => {}
             _ => continue,

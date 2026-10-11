@@ -1999,12 +1999,18 @@ fn bind_self_discloses_both_spec_files_without_precedence_35() {
     );
     assert_eq!(names.len(), 2, "no other files may be listed: {names:?}");
     for doc in docs {
-        let keys: Vec<&str> = doc
+        let mut keys: Vec<&str> = doc
             .as_object()
             .unwrap()
             .keys()
             .map(String::as_str)
             .collect();
+        // #35 r1: the sort is load-bearing. `serde_json::Map` is a `BTreeMap`
+        // without `preserve_order`, so key iteration happens to be sorted
+        // today — but that is a dependency feature, not a guarantee. Sorted
+        // explicitly, the assertion means "exactly these two keys" rather
+        // than "these two keys in whatever order serde_json yields".
+        keys.sort();
         assert_eq!(
             keys,
             vec!["bytes", "path"],
@@ -2062,11 +2068,12 @@ fn bind_self_omits_subdirectory_project_docs_35() {
 }
 
 #[test]
-fn bind_self_skips_non_utf8_and_non_regular_project_docs_silently_35() {
-    // Decision 4: a doc that is absent, non-UTF-8, or not a regular file is
-    // SILENTLY SKIPPED — the payload is a path index, not a health report, so
-    // it must not gain an error/warning field either. Defends both halves: the
-    // good sibling is still listed, and the payload carries no diagnostic key.
+fn bind_self_skips_a_non_utf8_project_doc_silently_35() {
+    // Decision 4, "non-UTF-8" leg: silently skipped — the payload is a path
+    // index, not a health report, so it must not gain an error/warning field
+    // either. Split from its non-regular sibling (#35 r1 F1): only two names
+    // are ever scanned, so the two cases cannot share one fixture set without
+    // one of them becoming unreachable.
     let home = tmp_home("35-nonutf8");
     let repo = p17_setup_repo(&home, "agent-35d");
     let first = handle_bind_self(
@@ -2081,13 +2088,12 @@ fn bind_self_skips_non_utf8_and_non_regular_project_docs_silently_35() {
             .expect("worktree_path")
             .to_string(),
     );
-    // Three files at the root, deliberately in different states:
-    //  - `CLAUDE.md`  GOOD (control: skipping is per-file, not a blanket bail)
+    // Both SCANNED names, in opposite states:
     //  - `AGENTS.md`  INVALID UTF-8 (0xFF 0xFE are never valid UTF-8)
-    //  - `GEMINI.md`  a DIRECTORY — present, but not a regular file
-    std::fs::write(worktree.join("CLAUDE.md"), b"good\n").unwrap();
+    //  - `CLAUDE.md`  GOOD — the half that must be KEPT. Without this the
+    //    test would also pass if the whole feature were broken.
     std::fs::write(worktree.join("AGENTS.md"), [0xffu8, 0xfe, 0x00]).unwrap();
-    std::fs::create_dir_all(worktree.join("GEMINI.md")).unwrap();
+    std::fs::write(worktree.join("CLAUDE.md"), b"good\n").unwrap();
 
     let resp = handle_bind_self(
         &home,
@@ -2102,7 +2108,7 @@ fn bind_self_skips_non_utf8_and_non_regular_project_docs_silently_35() {
     assert_eq!(
         docs.len(),
         1,
-        "only the good root doc may be listed: {resp}"
+        "only the readable root doc may be listed: {resp}"
     );
     assert_eq!(
         docs[0]["path"].as_str(),
@@ -2115,6 +2121,107 @@ fn bind_self_skips_non_utf8_and_non_regular_project_docs_silently_35() {
             "#35 must stay silent about skipped docs; payload gained '{forbidden}': {resp}"
         );
     }
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn bind_self_skips_a_non_regular_project_doc_silently_35() {
+    // Decision 4, "non-regular" leg. #35 r1 F1: the previous fixture was a
+    // directory named `GEMINI.md`, which the two-name scan loop can never
+    // reach — so this leg had NO test at all while the test's name and
+    // comment both promised one. The fixture must sit at a SCANNED name.
+    //
+    // A directory is used because it is the one non-regular type whose
+    // handling can be tested without a timeout. A FIFO at a scanned name is
+    // the case that actually matters (its `read` blocks forever and
+    // `handle_bind_self` dispatches synchronously), but staging one here
+    // would hang the harness rather than fail it — see
+    // `is_file_is_what_keeps_a_fifo_from_hanging_bind_35`.
+    let home = tmp_home("35-nonregular");
+    let repo = p17_setup_repo(&home, "agent-35e");
+    let first = handle_bind_self(
+        &home,
+        &json!({"repository_path": repo.to_str().unwrap(), "branch": "feat/doc-e"}),
+        &sender_for("agent-35e"),
+    );
+    assert_eq!(first["bound"].as_bool(), Some(true), "{first}");
+    let worktree = std::path::PathBuf::from(
+        first["worktree_path"]
+            .as_str()
+            .expect("worktree_path")
+            .to_string(),
+    );
+    // `AGENTS.md` is a DIRECTORY — present at a scanned name, not a regular
+    // file. `CLAUDE.md` is the readable control.
+    std::fs::create_dir_all(worktree.join("AGENTS.md")).unwrap();
+    std::fs::write(worktree.join("CLAUDE.md"), b"good\n").unwrap();
+
+    let resp = handle_bind_self(
+        &home,
+        &json!({"repository_path": repo.to_str().unwrap(), "branch": "feat/doc-e"}),
+        &sender_for("agent-35e"),
+    );
+
+    let docs = resp["project_docs"].as_array().expect("project_docs");
+    assert_eq!(
+        docs.len(),
+        1,
+        "a directory at a scanned name must be skipped: {resp}"
+    );
+    assert_eq!(
+        docs[0]["path"].as_str(),
+        worktree.join("CLAUDE.md").to_str(),
+        "the readable sibling must survive: {resp}"
+    );
+    for forbidden in ["error", "warning", "warnings", "errors", "skipped", "notes"] {
+        assert!(
+            resp.get(forbidden).is_none(),
+            "#35 must stay silent about skipped docs; payload gained '{forbidden}': {resp}"
+        );
+    }
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn is_file_is_what_keeps_a_fifo_from_hanging_bind_35() {
+    // #35 r1 F1: this is the load-bearing half of decision 4. `fs::read` on a
+    // FIFO blocks FOREVER — it neither returns nor errors — and
+    // `handle_bind_self` is dispatched synchronously with no thread offload,
+    // so without the `is_file()` guard a repository holding a FIFO named
+    // `CLAUDE.md` hangs the request handler.
+    //
+    // This asserts the guard's CLASSIFICATION rather than staging the hang:
+    // a real blocking read would hang the test harness instead of failing it,
+    // so the read is never exercised here. What is pinned is that a FIFO is
+    // not a regular file — the exact predicate `bound_project_docs` consults
+    // before it reads. (git cannot track a FIFO, so this fixture is not
+    // checkout-reachable; a symlink to a device is, and `is_file()` rejects
+    // it by this same check.)
+    let home = tmp_home("35-fifo-guard");
+    std::fs::create_dir_all(&home).ok();
+    let fifo = home.join("CLAUDE.md");
+    // Shell out rather than take a new dependency; `mkfifo` is not guaranteed
+    // on every CI image, so skip there rather than fail.
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !made {
+        eprintln!("skipping: mkfifo unavailable on this host");
+        std::fs::remove_dir_all(&home).ok();
+        return;
+    }
+
+    let metadata = std::fs::metadata(&fifo).expect("fifo metadata");
+    assert!(
+        !metadata.is_file(),
+        "a FIFO must fail the `is_file()` guard, or the blocking read beneath \
+         it becomes reachable: {fifo:?}"
+    );
 
     std::fs::remove_dir_all(&home).ok();
 }
