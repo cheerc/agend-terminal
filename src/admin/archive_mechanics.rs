@@ -300,8 +300,10 @@ pub(crate) fn write_preservation_manifest(
         "damage_cause": cause,
         "binding_sha256": binding_sha256,
         "note": "the worktree was damaged by an interrupted removal; this archive \
-                 preserves what remains. The deletion-recovery journal keeps \
-                 recording the damage — it does not point here.",
+                 preserves what remains. The damage is recorded HERE, not in the \
+                 deletion-recovery journal: a release that diverts reports success \
+                 and clears the journal, so this manifest is the only surviving \
+                 record of what was lost.",
     });
     crate::store::atomic_write(
         &manifest_path,
@@ -449,6 +451,25 @@ mod tests {
             "12 tracked files missing (e.g. src/main.rs)"
         );
         assert_eq!(m["binding_sha256"], "abc123");
+        // F3: the `note` is what an operator reading this file will follow. A
+        // diversion clears the deletion-recovery journal (that is what makes it a
+        // success), so a note pointing at the journal sends them to a file that no
+        // longer exists. This text predates the diversion caller — it was accurate
+        // when only the admin lane wrote these manifests, and PR-3's new caller is
+        // what made it false.
+        // F3: what an operator reading this file follows must not point them at a
+        // journal that a successful diversion has already cleared. Asserted
+        // semantically rather than by exact sentence, so a rephrasing that keeps
+        // the wrong guidance still fails.
+        let note = m["note"]
+            .as_str()
+            .expect("#39: the manifest note must be present and readable");
+        assert!(
+            note.contains("HERE") && !(note.contains("journal") && note.contains("keeps")),
+            "#39 F3: a diversion clears the journal, so the note must send an \
+             operator to THIS manifest and must not claim the journal still \
+             records the damage. note: {note}"
+        );
         assert!(
             m.get("actor").is_none(),
             "#39: a diversion is not operator-initiated; writing an actor would \

@@ -32,13 +32,15 @@ use std::path::{Path, PathBuf};
 /// sets, so the lines cannot be compressed without pushing route-specific
 /// knowledge into the gate.
 ///
-/// 2550 → 2600 (+14) is CORRECTNESS: three fail-closed arms for a diversion
-/// that could not complete. Reviewing the first change found the gate failing
-/// OPEN — returning `Proceed(None)` after a failed archive handed
-/// `remove_worktree` a `None` baseline, which it resolves by snapshotting the
-/// tree and then deleting it. That deleted the only remaining copy of a
-/// damaged worktree, which is the one outcome #39 exists to prevent. Holding a
-/// custom threshold while a fail-open stays in the code is the wrong direction.
+/// 2550 → 2600 is CORRECTNESS. The file measured 2534 when the ceiling moved
+/// and 2559 when that change landed (+25), paying for the three fail-closed
+/// arms and then for the three marker checks (F6). Reviewing the first change
+/// found the gate failing OPEN — returning `Proceed(None)` after a failed
+/// archive handed `remove_worktree` a `None` baseline, which it resolves by
+/// snapshotting the tree and then deleting it. That deleted the only remaining
+/// copy of a damaged worktree, which is the one outcome #39 exists to prevent.
+/// Holding a custom threshold while a fail-open stays in the code is the wrong
+/// direction.
 ///
 /// A future reader who sees `worktree_pool.rs` above the original limit should
 /// know both steps were chosen, not missed, and that revisiting either means

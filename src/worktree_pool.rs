@@ -758,25 +758,27 @@ fn release_known_locked(
             // same review.
             let tracked_baseline = match unusable_divert_before_snapshot(home, agent, wt_path) {
                 BaselineDecision::Proceed(baseline) => baseline,
-                BaselineDecision::Diverted { archive } => {
-                    // The damaged remnant was archived, not released. `out.path`
-                    // is where the operator finds it. `managed_verified` and
-                    // `worktree_absent` are both true because the marker was
-                    // verified and the directory is genuinely gone.
-                    return LockedRelease {
-                        out: ReleaseOutcome {
+                BaselineDecision::Diverted {
+                    archive,
+                    managed_verified,
+                } => {
+                    // F6: `managed_verified` is the marker fact sampled inside
+                    // the gate, before the rename that would have destroyed the
+                    // only place it could be asked. `false` means the daemon no
+                    // longer claims this directory, so it has no authority to
+                    // release it — fail closed exactly as an unmanaged release
+                    // does, rather than reporting a success nobody authorised.
+                    let out = if managed_verified {
+                        ReleaseOutcome {
                             released: true,
                             worktree_removed: true,
                             path: Some(archive.display().to_string()),
                             ..ReleaseOutcome::default()
-                        },
-                        notices: Vec::new(),
-                        clear_refusal_marker: None,
-                        finish_full_release: true,
-                        managed_verified: true,
-                        worktree_absent: true,
-                        was_dirty: false,
+                        }
+                    } else {
+                        partial_removal::unmanaged_diversion_outcome(wt_path)
                     };
+                    return partial_removal::diverted_locked_release(out, managed_verified);
                 }
                 BaselineDecision::DiversionFailed { error } => {
                     // Fail closed: the remnant stays on disk with its binding.
@@ -1527,7 +1529,20 @@ fn release_bound_target_exact_impl(
     // added to a release route. Same applies at the other two call sites.
     let tracked_baseline = match unusable_divert_before_snapshot(home, agent, target) {
         BaselineDecision::Proceed(baseline) => baseline,
-        BaselineDecision::Diverted { archive } => {
+        BaselineDecision::Diverted {
+            archive,
+            managed_verified,
+        } => {
+            // F6: same fact, same consequence, on the route that holds the
+            // branch lease — reporting success here clears the binding, so an
+            // unverified authority would be a released claim.
+            if !managed_verified {
+                let out = partial_removal::unmanaged_diversion_outcome(target);
+                drop(_binding_lock);
+                drop(_agent_lock);
+                drop(branch_lock);
+                return out;
+            }
             drop(_binding_lock);
             drop(_agent_lock);
             return partial_removal::diverted_release_outcome(&archive, || drop(branch_lock));
@@ -2062,7 +2077,17 @@ fn release_absent_target_impl(
     // deletion. Same applies at the other two baseline sites.
     let tracked_baseline = match unusable_divert_before_snapshot(home, agent, target) {
         BaselineDecision::Proceed(baseline) => baseline,
-        BaselineDecision::Diverted { archive } => {
+        BaselineDecision::Diverted {
+            archive,
+            managed_verified,
+        } => {
+            // F6: same fact, same consequence as the other two arms.
+            if !managed_verified {
+                let out = partial_removal::unmanaged_diversion_outcome(target);
+                drop(_binding_lock);
+                drop(_agent_lock);
+                return out;
+            }
             drop(_binding_lock);
             drop(_agent_lock);
             return partial_removal::diverted_release_outcome(&archive, || ());

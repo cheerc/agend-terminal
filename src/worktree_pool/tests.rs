@@ -8444,3 +8444,145 @@ fn re_entering_release_archives_the_remnant_and_keeps_the_cause_39() {
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&repo).ok();
 }
+
+/// Drive a lease to the `WorktreeUnusable` state a diversion exists to handle.
+///
+/// The state is reachable only through a genuinely interrupted removal, so it is
+/// produced by one: the seam unlinks a tracked file and fails the git walk out
+/// from under it. Nothing writes a `WorktreeUnusable` journal directly, and that
+/// is deliberate — a helper that fabricated one would also have to fabricate the
+/// binding digest the gate compares against.
+fn damage_worktree(home: &Path, agent: &str, lease: &WorktreeLease) {
+    let tracked = lease.path.join("tracked.txt");
+    std::fs::write(&tracked, b"the only remaining copy\n").expect("seed tracked file");
+    git_in(&lease.path, &["add", "tracked.txt"]);
+    git_in(
+        &lease.path,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "seed",
+        ],
+    );
+    let doomed = tracked.clone();
+    let hook = release_test_seam::install(move |phase| {
+        if phase == ReleaseTestPhase::BeforeWorktreeRemove {
+            std::fs::remove_file(&doomed).expect("simulate partial git walk");
+            release_test_seam::fail_next_remove(std::io::ErrorKind::TimedOut);
+        }
+    });
+    release_full(home, agent, false);
+    drop(hook);
+    assert!(
+        crate::agent::deletion_recovery::read(home, agent)
+            .expect("readable")
+            .is_some_and(|t| matches!(
+                t.state,
+                crate::agent::deletion_recovery::State::WorktreeUnusable { .. }
+            )),
+        "precondition: the interrupted removal must leave Unusable"
+    );
+}
+
+/// Remove the `.agend-managed` marker — the ONLY way a diversion can find an
+/// unclaimed directory. An `Unusable` journal can only be written while the
+/// marker was present (`remove_worktree` checks the marker before it can reach
+/// `classify_surviving_remnant`), so the marker being gone at diversion time
+/// means it was removed in between.
+fn unclaim(lease: &WorktreeLease) {
+    std::fs::remove_file(lease.path.join(MANAGED_MARKER)).expect("remove the managed marker");
+}
+
+/// Assert the fail-closed outcome every F6 arm must produce.
+fn assert_unclaimed_failed_closed(home: &Path, agent: &str, out: &super::ReleaseOutcome) {
+    assert!(
+        !out.released,
+        "#39 F6: an unclaimed worktree must never be released: {out:?}"
+    );
+    assert_eq!(
+        out.stage,
+        Some("worktree_remove"),
+        "#39 F6: this is the refusal an unmanaged release already makes, so it \
+         reports that stage rather than a diversion stage: {out:?}"
+    );
+    assert!(
+        crate::agent::deletion_recovery::read(home, agent)
+            .expect("readable")
+            .is_some(),
+        "#39 F6: a failed release must leave the damage journal in place — \
+         clearing it would discard the only record of what was lost"
+    );
+    assert!(
+        crate::binding::read(home, agent).is_some(),
+        "#39 F6: the binding must survive so the worktree stays attributable"
+    );
+}
+
+/// #39 F6, site 1: a diversion that finds the daemon no longer claims the
+/// directory must fail closed, exactly as an unmanaged release does.
+///
+/// F6 was this arm asserting `managed_verified: true` with the comment "because
+/// the marker was verified", on a path where `is_daemon_managed` had not been
+/// reached. The flag is branch-deletion authority — `branch_cleanup.rs:240`
+/// gates on `!managed_verified && !worktree_absent` — so an unverified `true`
+/// authorises deleting a branch over a directory the daemon does not own.
+#[test]
+fn site1_diversion_of_an_unclaimed_worktree_fails_closed_39() {
+    let home = tmp_home("39-f6-site1");
+    let repo = tmp_repo("39-f6-site1-repo");
+    let lease = lease_bound(&home, &repo, "agent-39f6a", "feat/f6a");
+    damage_worktree(&home, "agent-39f6a", &lease);
+    unclaim(&lease);
+
+    let out = release_full(&home, "agent-39f6a", false);
+    assert_unclaimed_failed_closed(&home, "agent-39f6a", &out);
+
+    drop(lease);
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// #39 F6, site 2: the route that holds the branch lease must fail closed too.
+///
+/// This is the route where an unverified release would do the most damage: it
+/// runs while holding a branch lease, and `diverted_release_outcome` reports
+/// success, which is what gets the binding cleared. The test exists because
+/// until F6 the suite could not tell this arm from an open one — the adversarial
+/// control that broke only this arm left all 94 targeted tests green, so nothing
+/// pinned it. `assert_unclaimed_failed_closed` is what turns it into something
+/// that would notice.
+#[test]
+fn site2_diversion_of_an_unclaimed_worktree_fails_closed_39() {
+    let home = tmp_home("39-f6-site2");
+    let repo = tmp_repo("39-f6-site2-repo");
+    let lease = lease_bound(&home, &repo, "agent-39f6b", "feat/f6b");
+    damage_worktree(&home, "agent-39f6b", &lease);
+    unclaim(&lease);
+    // The fingerprint is snapshotted AFTER `damage_worktree`, whose interrupted
+    // release rewrites the binding, and BEFORE the route re-acquires it — a
+    // stale snapshot is refused by the route before any diversion arm is
+    // reached, which is a different failure from the one under test.
+    let expected = match crate::binding::snapshot_guarded_binding(&home, "agent-39f6b")
+        .expect("snapshot exact binding")
+    {
+        crate::binding::GuardedBinding::Known { fingerprint, .. } => fingerprint,
+        other => panic!("expected known binding, got {other:?}"),
+    };
+
+    let out = super::release_bound_target_exact_under_branch_lock(
+        &home,
+        "agent-39f6b",
+        &expected,
+        &lease.path,
+        &repo,
+    );
+    assert_unclaimed_failed_closed(&home, "agent-39f6b", &out);
+
+    drop(lease);
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}

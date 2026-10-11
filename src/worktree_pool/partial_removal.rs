@@ -381,19 +381,6 @@ pub(super) fn remove_worktree(
     }
 }
 
-/// The outcome a release route returns after a successful diversion.
-///
-/// Three routes reach a diversion point and they do NOT share a lock shape:
-/// `release_known_locked` returns a `LockedRelease`, while the two exact-target
-/// routes return `ReleaseOutcome` and release a different set of guards on the
-/// way out — one of them holds a branch lease the other does not. Hand-written,
-/// those release sequences drift apart, and lock-order is the one thing on this
-/// path that must not drift.
-///
-/// So the shared part lives here and the caller supplies only what genuinely
-/// differs: `release_extra` drops whatever guards this particular route holds
-/// beyond the binding and agent locks, which are common to all three.
-///
 /// The outcome for a release whose required diversion could not complete.
 ///
 /// Fails closed on both counts that matter: `released` stays false so no caller
@@ -406,6 +393,38 @@ pub(super) fn diversion_failed_outcome(error: &str, worktree: &Path) -> super::R
     out
 }
 
+/// #39: the outcome for a release that reached a diversion point on a worktree
+/// the daemon no longer claims.
+///
+/// Nothing was moved and nothing was cleared: the gate is asked AFTER this
+/// check precisely so the directory stays where the operator last saw it. The
+/// stage is `worktree_remove` because this is the same refusal the base release
+/// makes for an unmanaged worktree, verbatim — the caller is told the directory
+/// is unmanaged, and the only reason the caller got here is that the journal
+/// says it is damaged.
+pub(super) fn unmanaged_diversion_outcome(worktree: &Path) -> super::ReleaseOutcome {
+    let mut out = super::ReleaseOutcome::default();
+    mark_release_incomplete(
+        &mut out,
+        "worktree_remove",
+        worktree,
+        unmanaged_refusal(worktree),
+    );
+    out
+}
+
+/// The outcome a release route returns after a successful diversion.
+///
+/// Three routes reach a diversion point and they do NOT share a lock shape:
+/// `release_known_locked` returns a `LockedRelease`, while the two exact-target
+/// routes return `ReleaseOutcome` and release a different set of guards on the
+/// way out — one of them holds a branch lease the other does not. Hand-written,
+/// those release sequences drift apart, and lock-order is the one thing on this
+/// path that must not drift.
+///
+/// So the shared part lives here and the caller supplies only what genuinely
+/// differs: `release_extra` drops whatever guards this particular route holds
+/// beyond the binding and agent locks, which are common to all three.
 pub(super) fn diverted_release_outcome(
     archive: &Path,
     release_extra: impl FnOnce(),
@@ -419,12 +438,104 @@ pub(super) fn diverted_release_outcome(
     }
 }
 
+/// The `LockedRelease` a site-1 route returns once a diversion has happened.
+///
+/// Both shapes differ only in `out` and in the authority flags, and writing
+/// them out twice is how they came to drift: one copy claimed the marker had
+/// been verified when no such check had run (F6). The flags are passed in
+/// rather than retyped at each site, so a route cannot assert an authority it
+/// did not check — and `finish_full_release` is derived from
+/// `managed_verified` instead of being set independently, so the two cannot
+/// disagree the way they did.
+pub(super) fn diverted_locked_release(
+    out: super::ReleaseOutcome,
+    managed_verified: bool,
+) -> super::LockedRelease {
+    super::LockedRelease {
+        out,
+        notices: Vec::new(),
+        clear_refusal_marker: None,
+        finish_full_release: managed_verified,
+        managed_verified,
+        worktree_absent: managed_verified,
+        was_dirty: false,
+    }
+}
+
 pub(super) enum BaselineDecision {
     /// No Unusable journal applies. The route proceeds exactly as before.
     Proceed(Option<BTreeSet<String>>),
     /// The remnant was archived instead of released. `archive` is where the
     /// payload — including everything still on disk — now lives.
-    Diverted { archive: PathBuf },
+    ///
+    /// `managed_verified` is the marker FACT, sampled before the rename. It is
+    /// a field rather than something each route re-derives because the rename
+    /// destroys the only place the question can be asked: `.agend-managed`
+    /// lives inside the worktree, so afterwards the original path is empty and
+    /// the archive carries the marker. A route that read the flag afterwards,
+    /// or that inferred it, would be asserting an authority nobody checked.
+    ///
+    /// Asking at the route instead is not an option: by the time a route holds
+    /// this value the directory is already archived, so a route that re-checked
+    /// would be checking after the fact, and "fail closed" would still leave the
+    /// directory moved. Asking at the route BEFORE the gate ran would be a
+    /// second, independent reading of the same journal, and the two could
+    /// disagree about whether this release needs a diversion at all.
+    ///
+    /// ## When the fact is sampled
+    ///
+    /// Immediately before `divert_to_archive`, which is before the manifest
+    /// write and before the rename. So it is NOT the state at the instant of
+    /// the rename: a marker removed between the sample and the rename is not
+    /// observed. That window is accepted — removing the marker is external
+    /// damage to a directory already mid-teardown, not something this path
+    /// attempts to police. It is recorded here because the sampling point is
+    /// the semantic core of this design, and a reader who assumes "checked just
+    /// before the rename" would be reasoning about a stronger guarantee than
+    /// the code gives.
+    ///
+    /// It being `false` is a real outcome, not a degenerate one — a diversion
+    /// only exists because a damaged journal was written, and that journal was
+    /// only ever written while the marker was present, so `false` means the
+    /// marker was removed in between. Each route decides what to do about it
+    /// (lead ruling: fail closed, because an unclaimed directory is not the
+    /// daemon's to archive or clear). The gate reports the fact; it does not
+    /// act on it, which is what keeps it from taking over the marker's
+    /// authority.
+    ///
+    /// Routes consume this value as-is and MUST NOT ask the marker again — a
+    /// route that obtained its own reading would be authorising itself, which
+    /// is the failure this field exists to remove.
+    ///
+    /// ## Which routes can actually reach this variant
+    ///
+    /// Two of the three. `release_absent_target_impl` (site 3) cannot, and the
+    /// reason is structural rather than incidental — that route screens the
+    /// binding twice before it ever gets here, and both screens read the same
+    /// reader this variant's gate reads:
+    ///
+    /// ```text
+    /// binding state │ site 3 screen          │ gate requirement       │ result
+    /// ──────────────┼────────────────────────┼───────────────────────┼────────────
+    /// Known         │ return stale_release() │ needs Known to compare │ refused first
+    /// Absent        │ passes                │ Absent ⇒ do not divert│ no diversion
+    /// Opaque        │ opaque_release()      │ Opaque ⇒ do not divert │ no diversion
+    /// ```
+    ///
+    /// (`preflight_guarded_binding` IS `guarded_binding_disk_fresh`;
+    /// `binding/release_guard.rs:135`.) All three states are mutually
+    /// exclusive with diverting, so no fixture can drive this arm on that route.
+    ///
+    /// It is reachable **iff** that screen is removed or changed — and its
+    /// reason for existing is "the binding is already gone", which is a premise
+    /// about the route rather than a law. Should that change, the arm is
+    /// already fail-closed on `managed_verified`, which is the whole value of
+    /// keeping it: the premise moving does not silently turn into a fail-open.
+    /// It has no behavioural effect today, and this doc does not claim one.
+    Diverted {
+        archive: PathBuf,
+        managed_verified: bool,
+    },
     /// A diversion was required and could NOT be completed: the archive could
     /// not be written, or the rename failed.
     ///
@@ -471,8 +582,14 @@ pub(super) fn unusable_divert_before_snapshot(
     if !must_divert_unusable(home, agent) {
         return BaselineDecision::Proceed(tracked_path_snapshot(worktree));
     }
+    // Sampled HERE, before `divert_to_archive` moves the directory, because the
+    // rename takes the marker with it and leaves nothing at `worktree` to ask.
+    let managed_verified = crate::worktree_pool::is_daemon_managed(worktree);
     match divert_to_archive(home, agent, worktree) {
-        Ok(archive) => BaselineDecision::Diverted { archive },
+        Ok(archive) => BaselineDecision::Diverted {
+            archive,
+            managed_verified,
+        },
         Err(error) => {
             // The archive is the only safe destination for a damaged remnant.
             // Failing closed here is the whole point: `Proceed(None)` would NOT
@@ -513,13 +630,31 @@ fn must_divert_unusable(home: &Path, agent: &str) -> bool {
     }
 }
 
+/// The reason a worktree may not be diverted, phrased for the release outcome.
+pub(super) fn unmanaged_refusal(worktree: &Path) -> String {
+    format!(
+        "worktree at {} has no .agend-managed marker — refusing to remove \
+         (binding NOT cleared)",
+        worktree.display()
+    )
+}
+
 /// Move the damaged directory into a preservation archive.
 ///
-/// The order is the crash-safety contract and mirrors the admin recovery lane:
-/// publish the destination in the journal, write the self-describing metadata
+/// The order is the crash-safety contract: write the self-describing metadata
 /// inside the source, then rename. A crash before the rename leaves the source
-/// intact and the retry re-runnable; after it, the journal already names the
-/// destination.
+/// intact, carrying a manifest that names an archive directory which does not
+/// exist, and the retry re-runnable.
+///
+/// Note this does NOT publish the destination in the journal, though the admin
+/// recovery lane does (`worktree_recovery.rs`). The admin lane owns the journal
+/// as its recovery record; a diversion reads the journal for the damage and
+/// deliberately writes nothing back, because the journal's `archive` field is
+/// reachable only through `recover_recorded_archive`, whose state gate refuses
+/// a `WorktreeUnusable` journal — recording it there would point an operator at
+/// a place that lane cannot act on. `preservation_directory`'s doc carries that
+/// argument in full. The destination travels with the payload instead: the
+/// manifest is written before the rename, so it moves into the archive.
 fn divert_to_archive(home: &Path, agent: &str, worktree: &Path) -> Result<PathBuf, String> {
     let archive = crate::admin::archive_mechanics::preservation_directory(home, agent, worktree)?;
     let tombstone = crate::agent::deletion_recovery::read(home, agent)?;
