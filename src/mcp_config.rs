@@ -184,6 +184,61 @@ fn upsert_mcp_server(path: &Path, server_name: &str, server: serde_json::Value) 
     Ok(())
 }
 
+/// Upsert Claude settings.local.json with AgEnD MCP server and crossSessionInbound=refuse (#21).
+fn upsert_claude_settings(home: &Path, path: &Path, instance_name: Option<&str>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _lock = crate::store::acquire_file_lock(&config_lock_path(path))?;
+
+    let mut config: serde_json::Value = if path.exists() {
+        let content = std::fs::read_to_string(path)?;
+        match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                let backup = path.with_extension(format!(
+                    "corrupt.{}",
+                    chrono::Utc::now().format("%Y%m%d%H%M%S")
+                ));
+                if !crate::store::backup_corrupt_file(path, &backup) {
+                    tracing::error!(
+                        path = %path.display(),
+                        error = %e,
+                        "malformed settings JSON AND backup failed — refusing to overwrite (original preserved)"
+                    );
+                    anyhow::bail!(
+                        "malformed settings at {} and its backup failed; refusing to overwrite (original preserved for rescue)",
+                        path.display()
+                    );
+                }
+                tracing::warn!(
+                    path = %path.display(),
+                    backup = %backup.display(),
+                    error = %e,
+                    "malformed settings JSON, backed up corrupt file and starting fresh"
+                );
+                json!({})
+            }
+        }
+    } else {
+        json!({})
+    };
+
+    if config.get("mcpServers").is_none() {
+        config["mcpServers"] = json!({});
+    }
+    config["mcpServers"]["agend-terminal"] = mcp_server_entry(home, instance_name);
+
+    // #21: refuse Claude Code cross-session inbound messaging bypass so all inter-agent
+    // communication is routed through AgEnD.
+    config["crossSessionInbound"] = json!("refuse");
+
+    let body = serde_json::to_string_pretty(&config)?;
+    crate::store::atomic_write(path, body.as_bytes())?;
+    tracing::debug!(path = %path.display(), "configured Claude settings.local.json");
+    Ok(())
+}
+
 /// Claude Code: .claude/settings.local.json + project `.mcp.json` + mcp-config.json
 fn configure_claude(home: &Path, working_dir: &Path, instance_name: Option<&str>) -> Result<()> {
     // Ensure working dir is a git repo (Claude Code needs git root to find .claude/)
@@ -197,9 +252,9 @@ fn configure_claude(home: &Path, working_dir: &Path, instance_name: Option<&str>
         }
     }
 
-    // Write project-local MCP config
+    // Write project-local settings (.claude/settings.local.json) with MCP config and cross-session refusal (#21)
     let path = working_dir.join(".claude").join("settings.local.json");
-    upsert_mcp_servers(home, &path, instance_name)?;
+    upsert_claude_settings(home, &path, instance_name)?;
 
     // #hook-state-poc (shadow-mode, flag-gated — default OFF, zero behavior
     // change): inject lifecycle-hook reporters into the SAME per-workspace
@@ -1582,6 +1637,70 @@ mod tests {
         configure_claude(&dir, &dir, None).expect("configure");
         assert!(dir.join("mcp-config.json").exists());
         assert!(dir.join(".claude/settings.local.json").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn claude_settings_local_refuses_cross_session_inbound_21() {
+        let dir = tmp_dir("claude_cross_session_inbound");
+        std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&dir)
+            .output()
+            .ok();
+        configure_claude(&dir, &dir, Some("agent-test")).expect("configure");
+        let path = dir.join(".claude/settings.local.json");
+        assert!(path.exists(), "settings.local.json must exist");
+        let content = std::fs::read_to_string(&path).expect("read settings.local.json");
+        let config: serde_json::Value =
+            serde_json::from_str(&content).expect("parse settings.local.json");
+        assert_eq!(
+            config["crossSessionInbound"], "refuse",
+            "crossSessionInbound must be set to 'refuse' to block bypass messaging (#21)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn claude_settings_local_preserves_custom_keys_and_overwrites_cross_session_21() {
+        let dir = tmp_dir("claude_preserve_custom");
+        std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&dir)
+            .output()
+            .ok();
+        let path = dir.join(".claude/settings.local.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let pre = json!({
+            "permissions": {"allow": ["Bash(cargo test)"]},
+            "crossSessionInbound": "allow"
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&pre).unwrap()).unwrap();
+
+        configure_claude(&dir, &dir, Some("agent-test")).expect("configure");
+        let content = std::fs::read_to_string(&path).expect("read settings.local.json");
+        let config: serde_json::Value =
+            serde_json::from_str(&content).expect("parse settings.local.json");
+        assert_eq!(
+            config["crossSessionInbound"], "refuse",
+            "crossSessionInbound must be overwritten to 'refuse' (#21)"
+        );
+        assert_eq!(
+            config["permissions"]["allow"][0], "Bash(cargo test)",
+            "pre-existing custom keys must be preserved"
+        );
+        assert!(
+            config["mcpServers"]["agend-terminal"].is_object(),
+            "mcpServers.agend-terminal must be present"
+        );
+        // Standard MCP config files must not leak crossSessionInbound
+        let standalone: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("mcp-config.json")).unwrap())
+                .unwrap();
+        assert!(
+            standalone.get("crossSessionInbound").is_none(),
+            "standalone mcp-config.json must not carry crossSessionInbound"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
