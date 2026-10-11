@@ -72,4 +72,55 @@ mod tests {
             vec![true, false, false, false, true, false, false, false, true]
         );
     }
+
+    #[test]
+    fn real_rotation_tick_updates_daemon_symlink_to_real_producer_log_78() {
+        use std::io::Write;
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let home =
+            std::env::temp_dir().join(format!("agend-tick-rot-78-{}-{id}", std::process::id()));
+        let _ = std::fs::create_dir_all(&home);
+
+        let mut appender = tracing_appender::rolling::Builder::new()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("daemon")
+            .filename_suffix(crate::logging::LOG_FILENAME_SUFFIX)
+            .build(&home)
+            .expect("build appender");
+        appender.write_all(b"tick test log\n").unwrap();
+        appender.flush().unwrap();
+
+        let registry =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let externals =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let configs =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+
+        let handler = LogRotationHandler::new(1);
+        handler.run(&ctx);
+
+        #[cfg(unix)]
+        {
+            let link = home.join("daemon.log");
+            assert!(link.exists(), "daemon.log symlink must be created on tick");
+            let target = std::fs::read_link(&link).expect("symlink");
+            let target_str = target.to_string_lossy();
+            assert!(
+                target_str.starts_with("daemon.") && target_str.ends_with(".log"),
+                "symlink must point to real producer log file, got {target_str}"
+            );
+        }
+
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

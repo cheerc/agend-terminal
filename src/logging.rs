@@ -774,4 +774,140 @@ mod tests {
         flush_daemon_log(); // drops + joins the worker thread
         flush_daemon_log(); // idempotent: slot already empty, must not panic
     }
+
+    // ----- #78 regression tests: align with real appender producer -----
+
+    /// Production-parity helper: build the real tracing appender used by setup_rolling_tracing.
+    fn spawn_real_producer(
+        home: &Path,
+        prefix: &str,
+    ) -> tracing_appender::rolling::RollingFileAppender {
+        tracing_appender::rolling::Builder::new()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .max_log_files(retain_days_from_env())
+            .filename_prefix(prefix)
+            .filename_suffix(LOG_FILENAME_SUFFIX)
+            .build(home)
+            .expect("build real rolling appender")
+    }
+
+    #[test]
+    fn real_producer_derived_fixture_verified_by_both_helpers_78() {
+        use std::io::Write;
+        let home = tmp_home("real-producer-78");
+        let mut appender = spawn_real_producer(&home, "daemon");
+        appender.write_all(b"sample daemon log line\n").unwrap();
+        appender.flush().unwrap();
+
+        // 1. Verify producer output shape: daemon.<YYYY-MM-DD>.log
+        let entries: Vec<String> = std::fs::read_dir(&home)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        let producer_file = entries
+            .iter()
+            .find(|name| {
+                name.starts_with("daemon.") && name.ends_with(".log") && *name != "daemon.log"
+            })
+            .cloned()
+            .expect("must find real producer daemon log file");
+
+        // 2. Helper update_daemon_log_symlink_unix must recognize it and symlink to it
+        #[cfg(unix)]
+        {
+            update_daemon_log_symlink_unix(&home);
+            let link = home.join("daemon.log");
+            assert!(
+                link.exists(),
+                "symlink must be created for real producer file"
+            );
+            let target = std::fs::read_link(&link).expect("must be symlink");
+            assert_eq!(
+                target.to_string_lossy(),
+                producer_file,
+                "symlink must point directly to real producer filename"
+            );
+        }
+
+        // 3. Helper cleanup_oversize_logs must recognize it and prune if over budget
+        // Make the file large enough to exceed 100 bytes
+        let path = home.join(&producer_file);
+        std::fs::write(&path, vec![0u8; 1024]).unwrap();
+        let removed = cleanup_oversize_logs(&home, 100);
+        assert_eq!(
+            removed, 1,
+            "cleanup_oversize_logs must count and prune real producer log when over cap"
+        );
+        assert!(!path.exists(), "over-cap real producer log must be deleted");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cleanup_oversize_logs_preserves_app_logs_and_counts_migration_files_78() {
+        use std::io::Write;
+        let home = tmp_home("cleanup-app-preserve-78");
+        // Real daemon producer file (2 KB)
+        let mut daemon_appender = spawn_real_producer(&home, "daemon");
+        daemon_appender.write_all(&vec![b'd'; 2048]).unwrap();
+        daemon_appender.flush().unwrap();
+
+        // Real app producer file (5 KB) - should never be touched by daemon cleanup
+        let mut app_appender = spawn_real_producer(&home, "app");
+        app_appender.write_all(&vec![b'a'; 5120]).unwrap();
+        app_appender.flush().unwrap();
+
+        // Migration file (3 KB) - must be counted toward daemon budget
+        let mig_path = home.join(format!("daemon.log.{MIGRATION_SUFFIX_PREFIX}1700000000"));
+        std::fs::write(&mig_path, vec![b'm'; 3072]).unwrap();
+
+        // Cap = 1 KB. Daemon logs = 2KB + 3KB = 5KB.
+        // Both daemon files should be cleaned up, but app log must remain intact!
+        let removed = cleanup_oversize_logs(&home, 1024);
+        assert!(removed >= 1, "must remove over-cap daemon files");
+
+        // Verify app log is preserved
+        let app_file_exists = std::fs::read_dir(&home).unwrap().flatten().any(|e| {
+            let s = e.file_name().to_string_lossy().to_string();
+            s.starts_with("app.") && s.ends_with(".log")
+        });
+        assert!(
+            app_file_exists,
+            "app log file must NOT be deleted by daemon cleanup backstop"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_excludes_migration_files_and_targets_latest_real_producer_log_78() {
+        use std::io::Write;
+        let home = tmp_home("symlink-no-mig-78");
+        let mut appender = spawn_real_producer(&home, "daemon");
+        appender.write_all(b"daemon active\n").unwrap();
+        appender.flush().unwrap();
+
+        // Write a migration file with a NEWER mtime
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mig_path = home.join(format!("daemon.log.{MIGRATION_SUFFIX_PREFIX}1900000000"));
+        std::fs::write(&mig_path, b"migration backup").unwrap();
+
+        update_daemon_log_symlink_unix(&home);
+        let link = home.join("daemon.log");
+        assert!(link.exists(), "symlink must be created");
+        let target = std::fs::read_link(&link).expect("must be symlink");
+        let target_str = target.to_string_lossy();
+        assert!(
+            !target_str.contains("migration"),
+            "symlink must NEVER point to migration file, got {target_str}"
+        );
+        assert!(
+            target_str.starts_with("daemon.") && target_str.ends_with(".log"),
+            "symlink must point to real daemon log file, got {target_str}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
