@@ -238,11 +238,16 @@ fn bound_project_docs(worktree_root: &str) -> Vec<Value> {
         // error, but a FIFO with no writer blocks forever and a symlink to a
         // device reads unboundedly. `handle_bind_self` is dispatched
         // synchronously with no thread offload, so reaching either hangs the
-        // request handler. Measured on macOS — see
-        // `is_file_is_what_keeps_a_fifo_from_hanging_bind_35`. Removing this
-        // guard is therefore NOT covered by the tests below: the directory
-        // fixture would still be skipped by the read's error, so no test
-        // turns red, while the FIFO case would hang instead.
+        // request handler. Measured on macOS — the directory and socket cases
+        // return an error; the FIFO and device cases never return at all.
+        //
+        // `is_file_is_what_keeps_a_fifo_from_hanging_bind_35` covers this by
+        // calling `bound_project_docs` directly on a directory holding a FIFO;
+        // it passes only because this guard skips the FIFO before the read.
+        // Removing this guard does NOT reliably turn it red, however — a
+        // directory is still skipped by the read's own error, so a regression
+        // here can pass CI while the FIFO case hangs. Treat the guard as
+        // load-bearing on its own terms, not because tests watch it.
         if !metadata.is_file() {
             continue;
         }

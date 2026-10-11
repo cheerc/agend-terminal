@@ -2152,9 +2152,18 @@ fn bind_self_skips_a_non_regular_project_doc_silently_35() {
             .expect("worktree_path")
             .to_string(),
     );
-    // `AGENTS.md` is a DIRECTORY — present at a scanned name, not a regular
-    // file. `CLAUDE.md` is the readable control.
+    // `AGENTS.md` is a DIRECTORY at a SCANNED name — the case under test.
+    // #35 r2 F1: assert the fixture is actually staged. Without this
+    // precondition the two content assertions below hold VACUOUSLY when the
+    // fixture is absent (renaming it to an unscanned name makes the loop take
+    // the "absent" leg and the payload is identical), so the test could not
+    // distinguish "excluded because non-regular" from "excluded because not
+    // there". r1 had exactly that hole.
     std::fs::create_dir_all(worktree.join("AGENTS.md")).unwrap();
+    assert!(
+        worktree.join("AGENTS.md").is_dir(),
+        "precondition: the non-regular fixture must be staged at a scanned name"
+    );
     std::fs::write(worktree.join("CLAUDE.md"), b"good\n").unwrap();
 
     let resp = handle_bind_self(
@@ -2181,25 +2190,67 @@ fn bind_self_skips_a_non_regular_project_doc_silently_35() {
         );
     }
 
+    // #35 r2 scope 2 — the positive direction, at the SAME path. r1's test
+    // could not prove the exclusion was about `is_file()` rather than the file
+    // simply not being there. Replace the directory with a regular file at the
+    // identical path: now that path MUST be disclosed. One path, two shapes,
+    // opposite outcomes — that is what makes the exclusion about the file TYPE
+    // rather than about presence.
+    drop_agents_dir_and_write_regular(&worktree);
+    let resp_file = handle_bind_self(
+        &home,
+        &json!({"repository_path": repo.to_str().unwrap(), "branch": "feat/doc-e"}),
+        &sender_for("agent-35e"),
+    );
+    let file_paths: Vec<&str> = resp_file["project_docs"]
+        .as_array()
+        .expect("project_docs")
+        .iter()
+        .filter_map(|d| d["path"].as_str())
+        .collect();
+    assert!(
+        file_paths.contains(&worktree.join("AGENTS.md").to_str().unwrap()),
+        "the same path as a REGULAR FILE must be disclosed, which is what \
+         proves the skip above was about the file type: {file_paths:?}"
+    );
+
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// Replace `<worktree>/AGENTS.md` with a regular file at the same path.
+/// `remove_dir` rather than `remove_dir_all`: the fixture is an EMPTY
+/// directory, and a non-empty one would be a different bug.
+fn drop_agents_dir_and_write_regular(worktree: &std::path::Path) {
+    let path = worktree.join("AGENTS.md");
+    std::fs::remove_dir(&path).expect("remove the AGENTS.md directory");
+    std::fs::write(&path, b"now a regular file\n").expect("write AGENTS.md as a file");
+    assert!(
+        std::fs::metadata(&path).is_ok_and(|m| m.is_file()),
+        "precondition: AGENTS.md must now be a regular file"
+    );
+}
 #[cfg(unix)]
 #[test]
 fn is_file_is_what_keeps_a_fifo_from_hanging_bind_35() {
-    // #35 r1 F1: this is the load-bearing half of decision 4. `fs::read` on a
-    // FIFO blocks FOREVER — it neither returns nor errors — and
-    // `handle_bind_self` is dispatched synchronously with no thread offload,
-    // so without the `is_file()` guard a repository holding a FIFO named
-    // `CLAUDE.md` hangs the request handler.
+    // #35 r2 scope 3 — rewritten to actually exercise production code.
     //
-    // This asserts the guard's CLASSIFICATION rather than staging the hang:
-    // a real blocking read would hang the test harness instead of failing it,
-    // so the read is never exercised here. What is pinned is that a FIFO is
-    // not a regular file — the exact predicate `bound_project_docs` consults
-    // before it reads. (git cannot track a FIFO, so this fixture is not
-    // checkout-reachable; a symlink to a device is, and `is_file()` rejects
-    // it by this same check.)
+    // WHAT THE r1 VERSION GOT WRONG: it called `mkfifo` and then asserted
+    // `!std::fs::metadata(&fifo).is_file()`. That pins **std**, not this
+    // codebase: it never called `handle_bind_self` or `bound_project_docs`, so
+    // reviewer2's AC-3 (inverting the production guard to
+    // `if metadata.is_file() { continue; }`) left it as the sole survivor —
+    // 6 failed, this passed. Deleting `bound_project_docs` entirely would
+    // have left it green too.
+    //
+    // WHAT IT DOES NOW (r2, decision d-20261011064404916771-1 option C):
+    // calls `bound_project_docs` DIRECTLY on a directory holding a FIFO at a
+    // scanned name, on a bounded thread, and requires it to come back empty
+    // inside 5s. The timeout is what turns a hang into a named failure, so
+    // removing the guard makes this test fail (AC-1) instead of wedging CI.
+    //
+    // Reachable coupling without a production change: `bound_project_docs` is
+    // a private fn of the parent module and `mod tests` opens with
+    // `use super::*`, so no visibility widening is needed.
     let home = tmp_home("35-fifo-guard");
     std::fs::create_dir_all(&home).ok();
     let fifo = home.join("CLAUDE.md");
@@ -2216,12 +2267,48 @@ fn is_file_is_what_keeps_a_fifo_from_hanging_bind_35() {
         return;
     }
 
+    // Precondition: the FIFO is really a FIFO. Without this the assertion
+    // below would also pass if the fixture were merely absent.
     let metadata = std::fs::metadata(&fifo).expect("fifo metadata");
     assert!(
         !metadata.is_file(),
-        "a FIFO must fail the `is_file()` guard, or the blocking read beneath \
-         it becomes reachable: {fifo:?}"
+        "precondition: the fixture must be a FIFO, not a regular file"
     );
+
+    // The real assertion, on a bounded thread: the real function, on a
+    // directory holding a FIFO at a scanned name, must disclose nothing AND
+    // must come back. The timeout is what makes the hang observable rather
+    // than fatal — this is the shape General picked (decision
+    // `d-20261011064404916771-1`, option C), and the same bounded-thread +
+    // `recv_timeout` idiom the repo already uses (`agent_ops_tests.rs`,
+    // `orphan_reconcile.rs`, `bridge_client.rs`). 5s sits inside those
+    // precedents' 2–10s range, and nextest's `slow-timeout` (60s, SIGKILL at
+    // 120s) is the outer fail-closed backstop.
+    //
+    // With the guard intact this returns immediately — the FIFO is skipped
+    // before the read. With the guard REMOVED (AC-1) it blocks forever, and
+    // the timeout turns that into a named failure instead of a wedged CI job.
+    // That is the point: coupling is now observable either way.
+    let root = home.to_str().expect("utf8 home path").to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let docs = bound_project_docs(&root);
+        let _ = tx.send(docs);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(docs) => assert!(
+            docs.is_empty(),
+            "a FIFO at a scanned name must be skipped without reading it: {docs:?}"
+        ),
+        Err(_) => panic!(
+            "bound_project_docs BLOCKED on a FIFO at a scanned name — \
+             the `is_file()` guard in bound_project_docs is not holding, and \
+             a synchronous MCP handler would hang on this repository"
+        ),
+    }
+    // A wedged worker would otherwise outlive the test; the timeout above
+    // already proved it is stuck, so detaching is safe.
+    drop(worker);
 
     std::fs::remove_dir_all(&home).ok();
 }
