@@ -1812,6 +1812,19 @@ mod review_assignment_marker_tests {
         assert!(git_in(&source, &["push", "origin", "main"])
             .status
             .success());
+        // #26: a real clone carries `refs/remotes/origin/HEAD`. A hand-initialized
+        // repo lacks it until `remote set-head` or a fetch runs; setting it here
+        // matches a real clone's remote-tracking ref shape (#1493).
+        assert!(git_in(
+            &source,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        )
+        .status
+        .success());
         (source, origin)
     }
 
