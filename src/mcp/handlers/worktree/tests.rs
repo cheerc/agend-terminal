@@ -1719,7 +1719,10 @@ fn bind_self_response_worktree_path_matches_written_binding_2550_w3() {
     keys.sort();
     assert_eq!(
         keys,
-        vec!["bound", "branch", "worktree_path"],
+        // #35 adds `project_docs`. This assertion is a drift guard on the
+        // response SHAPE — keep it exact, and update it deliberately when the
+        // shape changes rather than loosening it.
+        vec!["bound", "branch", "project_docs", "worktree_path"],
         "success response shape must be unchanged: {resp}"
     );
 
@@ -1864,6 +1867,474 @@ fn bind_self_then_release_worktree_clean_state() {
     assert!(
         !std::path::Path::new(&worktree_path).exists(),
         "worktree dir must be gone after release: {worktree_path}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// ---------------------------------------------------------------------------
+// #35 — bind success discloses the bound worktree's project-doc PATHS.
+//
+// Scope note: these tests pin the RESPONSE SHAPE produced by `bind_self` for a
+// spec file that exists at the worktree ROOT. They do NOT exercise the full
+// daemon bind pipeline end-to-end (no dispatch, no CI watch, no fork) — they
+// drive `handle_bind_self` directly, the same entry point the MCP layer calls.
+// See the "test defends" notes on each test for exactly which layer is pinned.
+// ---------------------------------------------------------------------------
+
+/// Bind `agent` on `branch`, then write `contents` to `<worktree>/CLAUDE.md`
+/// and re-bind. Returns (response, worktree_root).
+///
+/// The two-step shape matters: the doc must be written AFTER the first bind
+/// creates the worktree, and the disclosure is read on the SECOND (idempotent)
+/// bind. That is deliberate — it proves the payload is derived from the
+/// worktree on disk at response time, not cached from bind #1.
+fn bind_twice_with_claude_md(
+    home: &std::path::Path,
+    agent: &str,
+    branch: &str,
+    contents: &[u8],
+) -> (Value, std::path::PathBuf) {
+    let repo = p17_setup_repo(home, agent);
+    let first = handle_bind_self(
+        home,
+        &json!({"repository_path": repo.to_str().unwrap(), "branch": branch}),
+        &sender_for(agent),
+    );
+    assert_eq!(first["bound"].as_bool(), Some(true), "first bind: {first}");
+    let worktree = std::path::PathBuf::from(
+        first["worktree_path"]
+            .as_str()
+            .expect("worktree_path")
+            .to_string(),
+    );
+    std::fs::write(worktree.join("CLAUDE.md"), contents).expect("write CLAUDE.md");
+    let second = handle_bind_self(
+        home,
+        &json!({"repository_path": repo.to_str().unwrap(), "branch": branch}),
+        &sender_for(agent),
+    );
+    assert_eq!(
+        second["bound"].as_bool(),
+        Some(true),
+        "second bind: {second}"
+    );
+    (second, worktree)
+}
+
+#[test]
+fn bind_self_discloses_claude_md_path_and_size_35() {
+    // Defends: the payload carries an entry for a root-level CLAUDE.md whose
+    // `path` is the ABSOLUTE worktree-root path and whose `bytes` is the real
+    // on-disk size. RED on base: `project_docs` does not exist at all.
+    let home = tmp_home("35-claude-md");
+    let body = b"# Project baseline\n\nSome content.\n";
+    let (resp, worktree) = bind_twice_with_claude_md(&home, "agent-35a", "feat/doc-a", body);
+
+    let docs = resp["project_docs"]
+        .as_array()
+        .unwrap_or_else(|| panic!("#35: payload must carry project_docs: {resp}"));
+    assert_eq!(docs.len(), 1, "exactly one project doc expected: {resp}");
+    assert_eq!(
+        docs[0]["path"].as_str(),
+        worktree.join("CLAUDE.md").to_str(),
+        "path must be the absolute worktree-root CLAUDE.md path: {resp}"
+    );
+    assert_eq!(
+        docs[0]["bytes"].as_u64(),
+        Some(body.len() as u64),
+        "bytes must be the real on-disk size: {resp}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn bind_self_discloses_both_spec_files_without_precedence_35() {
+    // Decision 1: BOTH CLAUDE.md and AGENTS.md are listed, and neither is
+    // ranked above the other. Defends the SET of names present, and pins that
+    // `path` is the only discriminator (no `kind`/`priority`/`rank` field that
+    // would smuggle a precedence order in). A test that only asserted
+    // "contains AGENTS.md" would pass even if CLAUDE.md were dropped or
+    // ranked first.
+    let home = tmp_home("35-both-specs");
+    let repo = p17_setup_repo(&home, "agent-35b");
+    let first = handle_bind_self(
+        &home,
+        &json!({"repository_path": repo.to_str().unwrap(), "branch": "feat/doc-b"}),
+        &sender_for("agent-35b"),
+    );
+    assert_eq!(first["bound"].as_bool(), Some(true), "{first}");
+    let worktree = std::path::PathBuf::from(
+        first["worktree_path"]
+            .as_str()
+            .expect("worktree_path")
+            .to_string(),
+    );
+    std::fs::write(worktree.join("CLAUDE.md"), b"claude").unwrap();
+    std::fs::write(worktree.join("AGENTS.md"), b"agents").unwrap();
+
+    let resp = handle_bind_self(
+        &home,
+        &json!({"repository_path": repo.to_str().unwrap(), "branch": "feat/doc-b"}),
+        &sender_for("agent-35b"),
+    );
+
+    let docs = resp["project_docs"]
+        .as_array()
+        .unwrap_or_else(|| panic!("#35: payload must carry project_docs: {resp}"));
+    let names: Vec<String> = docs
+        .iter()
+        .map(|d| {
+            std::path::Path::new(d["path"].as_str().expect("path"))
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert!(
+        names.contains(&"CLAUDE.md".to_string()) && names.contains(&"AGENTS.md".to_string()),
+        "both spec files must be listed, not just one: {names:?}"
+    );
+    assert_eq!(names.len(), 2, "no other files may be listed: {names:?}");
+    for doc in docs {
+        let mut keys: Vec<&str> = doc
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        // #35 r1: the sort is load-bearing. `serde_json::Map` is a `BTreeMap`
+        // without `preserve_order`, so key iteration happens to be sorted
+        // today — but that is a dependency feature, not a guarantee. Sorted
+        // explicitly, the assertion means "exactly these two keys" rather
+        // than "these two keys in whatever order serde_json yields".
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["bytes", "path"],
+            "#35 discloses path+bytes only; a rank/kind field would invent precedence: {doc}"
+        );
+    }
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn bind_self_omits_subdirectory_project_docs_35() {
+    // Decision 2: only the worktree ROOT is listed; a nested CLAUDE.md is a
+    // repo convention, not a rule, and listing it would guess relevance for the
+    // agent. Defends the absence of the nested path specifically.
+    let home = tmp_home("35-nested");
+    let repo = p17_setup_repo(&home, "agent-35c");
+    let first = handle_bind_self(
+        &home,
+        &json!({"repository_path": repo.to_str().unwrap(), "branch": "feat/doc-c"}),
+        &sender_for("agent-35c"),
+    );
+    assert_eq!(first["bound"].as_bool(), Some(true), "{first}");
+    let worktree = std::path::PathBuf::from(
+        first["worktree_path"]
+            .as_str()
+            .expect("worktree_path")
+            .to_string(),
+    );
+    std::fs::write(worktree.join("CLAUDE.md"), b"root").unwrap();
+    std::fs::create_dir_all(worktree.join("sub")).unwrap();
+    std::fs::write(worktree.join("sub").join("CLAUDE.md"), b"nested").unwrap();
+
+    let resp = handle_bind_self(
+        &home,
+        &json!({"repository_path": repo.to_str().unwrap(), "branch": "feat/doc-c"}),
+        &sender_for("agent-35c"),
+    );
+
+    let docs = resp["project_docs"].as_array().expect("project_docs");
+    let paths: Vec<&str> = docs.iter().filter_map(|d| d["path"].as_str()).collect();
+    // Positive control: the ROOT doc must be listed. Without this the test
+    // would also pass if the feature were simply absent — it would only prove
+    // "nested is not listed", never "root is listed and nested is not".
+    assert!(
+        paths.contains(&worktree.join("CLAUDE.md").to_str().unwrap()),
+        "the root spec file must be disclosed: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p.contains("/sub/")),
+        "nested spec files must not be listed: {paths:?}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn bind_self_skips_a_non_utf8_project_doc_silently_35() {
+    // Decision 4, "non-UTF-8" leg: silently skipped — the payload is a path
+    // index, not a health report, so it must not gain an error/warning field
+    // either. Split from its non-regular sibling (#35 r1 F1): only two names
+    // are ever scanned, so the two cases cannot share one fixture set without
+    // one of them becoming unreachable.
+    let home = tmp_home("35-nonutf8");
+    let repo = p17_setup_repo(&home, "agent-35d");
+    let first = handle_bind_self(
+        &home,
+        &json!({"repository_path": repo.to_str().unwrap(), "branch": "feat/doc-d"}),
+        &sender_for("agent-35d"),
+    );
+    assert_eq!(first["bound"].as_bool(), Some(true), "{first}");
+    let worktree = std::path::PathBuf::from(
+        first["worktree_path"]
+            .as_str()
+            .expect("worktree_path")
+            .to_string(),
+    );
+    // Both SCANNED names, in opposite states:
+    //  - `AGENTS.md`  INVALID UTF-8 (0xFF 0xFE are never valid UTF-8)
+    //  - `CLAUDE.md`  GOOD — the half that must be KEPT. Without this the
+    //    test would also pass if the whole feature were broken.
+    std::fs::write(worktree.join("AGENTS.md"), [0xffu8, 0xfe, 0x00]).unwrap();
+    std::fs::write(worktree.join("CLAUDE.md"), b"good\n").unwrap();
+
+    let resp = handle_bind_self(
+        &home,
+        &json!({"repository_path": repo.to_str().unwrap(), "branch": "feat/doc-d"}),
+        &sender_for("agent-35d"),
+    );
+
+    let docs = resp["project_docs"].as_array().expect("project_docs");
+    // The half that must be KEPT: a healthy sibling is still disclosed. This
+    // is the #7 reviewer's lesson — asserting only "the bad ones are absent"
+    // would also pass if the whole feature were broken.
+    assert_eq!(
+        docs.len(),
+        1,
+        "only the readable root doc may be listed: {resp}"
+    );
+    assert_eq!(
+        docs[0]["path"].as_str(),
+        worktree.join("CLAUDE.md").to_str(),
+        "the readable sibling must survive: {resp}"
+    );
+    for forbidden in ["error", "warning", "warnings", "errors", "skipped", "notes"] {
+        assert!(
+            resp.get(forbidden).is_none(),
+            "#35 must stay silent about skipped docs; payload gained '{forbidden}': {resp}"
+        );
+    }
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn bind_self_skips_a_non_regular_project_doc_silently_35() {
+    // Decision 4, "non-regular" leg. #35 r1 F1: the previous fixture was a
+    // directory named `GEMINI.md`, which the two-name scan loop can never
+    // reach — so this leg had NO test at all while the test's name and
+    // comment both promised one. The fixture must sit at a SCANNED name.
+    //
+    // A directory is used because it is the one non-regular type whose
+    // handling can be tested without a timeout. A FIFO at a scanned name is
+    // the case that actually matters (its `read` blocks forever and
+    // `handle_bind_self` dispatches synchronously), but staging one here
+    // would hang the harness rather than fail it — see
+    // `is_file_is_what_keeps_a_fifo_from_hanging_bind_35`.
+    let home = tmp_home("35-nonregular");
+    let repo = p17_setup_repo(&home, "agent-35e");
+    let first = handle_bind_self(
+        &home,
+        &json!({"repository_path": repo.to_str().unwrap(), "branch": "feat/doc-e"}),
+        &sender_for("agent-35e"),
+    );
+    assert_eq!(first["bound"].as_bool(), Some(true), "{first}");
+    let worktree = std::path::PathBuf::from(
+        first["worktree_path"]
+            .as_str()
+            .expect("worktree_path")
+            .to_string(),
+    );
+    // `AGENTS.md` is a DIRECTORY at a SCANNED name — the case under test.
+    // #35 r2 F1: assert the fixture is actually staged. Without this
+    // precondition the two content assertions below hold VACUOUSLY when the
+    // fixture is absent (renaming it to an unscanned name makes the loop take
+    // the "absent" leg and the payload is identical), so the test could not
+    // distinguish "excluded because non-regular" from "excluded because not
+    // there". r1 had exactly that hole.
+    std::fs::create_dir_all(worktree.join("AGENTS.md")).unwrap();
+    assert!(
+        worktree.join("AGENTS.md").is_dir(),
+        "precondition: the non-regular fixture must be staged at a scanned name"
+    );
+    std::fs::write(worktree.join("CLAUDE.md"), b"good\n").unwrap();
+
+    let resp = handle_bind_self(
+        &home,
+        &json!({"repository_path": repo.to_str().unwrap(), "branch": "feat/doc-e"}),
+        &sender_for("agent-35e"),
+    );
+
+    let docs = resp["project_docs"].as_array().expect("project_docs");
+    assert_eq!(
+        docs.len(),
+        1,
+        "a directory at a scanned name must be skipped: {resp}"
+    );
+    assert_eq!(
+        docs[0]["path"].as_str(),
+        worktree.join("CLAUDE.md").to_str(),
+        "the readable sibling must survive: {resp}"
+    );
+    for forbidden in ["error", "warning", "warnings", "errors", "skipped", "notes"] {
+        assert!(
+            resp.get(forbidden).is_none(),
+            "#35 must stay silent about skipped docs; payload gained '{forbidden}': {resp}"
+        );
+    }
+
+    // #35 r2 scope 2 — the positive direction, at the SAME path. r1's test
+    // could not prove the exclusion was about `is_file()` rather than the file
+    // simply not being there. Replace the directory with a regular file at the
+    // identical path: now that path MUST be disclosed. One path, two shapes,
+    // opposite outcomes — that is what makes the exclusion about the file TYPE
+    // rather than about presence.
+    drop_agents_dir_and_write_regular(&worktree);
+    let resp_file = handle_bind_self(
+        &home,
+        &json!({"repository_path": repo.to_str().unwrap(), "branch": "feat/doc-e"}),
+        &sender_for("agent-35e"),
+    );
+    let file_paths: Vec<&str> = resp_file["project_docs"]
+        .as_array()
+        .expect("project_docs")
+        .iter()
+        .filter_map(|d| d["path"].as_str())
+        .collect();
+    assert!(
+        file_paths.contains(&worktree.join("AGENTS.md").to_str().unwrap()),
+        "the same path as a REGULAR FILE must be disclosed, which is what \
+         proves the skip above was about the file type: {file_paths:?}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Replace `<worktree>/AGENTS.md` with a regular file at the same path.
+/// `remove_dir` rather than `remove_dir_all`: the fixture is an EMPTY
+/// directory, and a non-empty one would be a different bug.
+fn drop_agents_dir_and_write_regular(worktree: &std::path::Path) {
+    let path = worktree.join("AGENTS.md");
+    std::fs::remove_dir(&path).expect("remove the AGENTS.md directory");
+    std::fs::write(&path, b"now a regular file\n").expect("write AGENTS.md as a file");
+    assert!(
+        std::fs::metadata(&path).is_ok_and(|m| m.is_file()),
+        "precondition: AGENTS.md must now be a regular file"
+    );
+}
+#[cfg(unix)]
+#[test]
+fn is_file_is_what_keeps_a_fifo_from_hanging_bind_35() {
+    // #35 r2 scope 3 — rewritten to actually exercise production code.
+    //
+    // WHAT THE r1 VERSION GOT WRONG: it called `mkfifo` and then asserted
+    // `!std::fs::metadata(&fifo).is_file()`. That pins **std**, not this
+    // codebase: it never called `handle_bind_self` or `bound_project_docs`, so
+    // reviewer2's AC-3 (inverting the production guard to
+    // `if metadata.is_file() { continue; }`) left it as the sole survivor —
+    // 6 failed, this passed. Deleting `bound_project_docs` entirely would
+    // have left it green too.
+    //
+    // WHAT IT DOES NOW (r2, decision d-20261011064404916771-1 option C):
+    // calls `bound_project_docs` DIRECTLY on a directory holding a FIFO at a
+    // scanned name, on a bounded thread, and requires it to come back empty
+    // inside 5s. The timeout is what turns a hang into a named failure, so
+    // removing the guard makes this test fail (AC-1) instead of wedging CI.
+    //
+    // Reachable coupling without a production change: `bound_project_docs` is
+    // a private fn of the parent module and `mod tests` opens with
+    // `use super::*`, so no visibility widening is needed.
+    let home = tmp_home("35-fifo-guard");
+    std::fs::create_dir_all(&home).ok();
+    let fifo = home.join("CLAUDE.md");
+    // Shell out rather than take a new dependency; `mkfifo` is not guaranteed
+    // on every CI image, so skip there rather than fail.
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !made {
+        eprintln!("skipping: mkfifo unavailable on this host");
+        std::fs::remove_dir_all(&home).ok();
+        return;
+    }
+
+    // Precondition: the FIFO is really a FIFO. Without this the assertion
+    // below would also pass if the fixture were merely absent.
+    let metadata = std::fs::metadata(&fifo).expect("fifo metadata");
+    assert!(
+        !metadata.is_file(),
+        "precondition: the fixture must be a FIFO, not a regular file"
+    );
+
+    // The real assertion, on a bounded thread: the real function, on a
+    // directory holding a FIFO at a scanned name, must disclose nothing AND
+    // must come back. The timeout is what makes the hang observable rather
+    // than fatal — this is the shape General picked (decision
+    // `d-20261011064404916771-1`, option C), and the same bounded-thread +
+    // `recv_timeout` idiom the repo already uses (`agent_ops_tests.rs`,
+    // `orphan_reconcile.rs`, `bridge_client.rs`). 5s sits inside those
+    // precedents' 2–10s range, and nextest's `slow-timeout` (60s, SIGKILL at
+    // 120s) is the outer fail-closed backstop.
+    //
+    // With the guard intact this returns immediately — the FIFO is skipped
+    // before the read. With the guard REMOVED (AC-1) it blocks forever, and
+    // the timeout turns that into a named failure instead of a wedged CI job.
+    // That is the point: coupling is now observable either way.
+    let root = home.to_str().expect("utf8 home path").to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let docs = bound_project_docs(&root);
+        let _ = tx.send(docs);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(docs) => assert!(
+            docs.is_empty(),
+            "a FIFO at a scanned name must be skipped without reading it: {docs:?}"
+        ),
+        Err(_) => panic!(
+            "bound_project_docs BLOCKED on a FIFO at a scanned name — \
+             the `is_file()` guard in bound_project_docs is not holding, and \
+             a synchronous MCP handler would hang on this repository"
+        ),
+    }
+    // A wedged worker would otherwise outlive the test; the timeout above
+    // already proved it is stuck, so detaching is safe.
+    drop(worker);
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn bind_self_never_puts_project_doc_contents_in_payload_35() {
+    // The boundary that matters most: this is PATH DISCLOSURE, not content
+    // preloading. A distinctive sentinel is planted in the file body; the test
+    // fails if that byte sequence appears ANYWHERE in the serialized response.
+    // This defends the property itself, not one field's value — a future edit
+    // that adds a `preview`/`excerpt`/`summary` field would also be caught.
+    let home = tmp_home("35-no-content");
+    let sentinel = "SENTINEL-CLAUDE-MD-BODY-8f3a2c";
+    let (resp, _worktree) =
+        bind_twice_with_claude_md(&home, "agent-35e", "feat/doc-e", sentinel.as_bytes());
+
+    let serialized = serde_json::to_string(&resp).expect("serialize response");
+    assert!(
+        !serialized.contains(sentinel),
+        "project-doc CONTENT leaked into the bind payload: {serialized}"
+    );
+    let docs = resp["project_docs"].as_array().expect("project_docs");
+    assert_eq!(
+        docs[0]["bytes"].as_u64(),
+        Some(sentinel.len() as u64),
+        "size is disclosed even though content is not: {resp}"
     );
 
     std::fs::remove_dir_all(&home).ok();
