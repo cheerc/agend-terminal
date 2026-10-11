@@ -95,14 +95,14 @@ binding_state({instance: "<self>"})
 
 只在 `binding_state` 回傳的 worktree 中工作。工作安全 push 或 handoff 後，以 `release_worktree({instance: "<self>"})` 釋放。Daemon 會拒絕 `main`/`master`、擁有 marker 與 binding transaction，並保留 canonical checkout 供 operator 與 tooling 使用。
 
-## Daemon logging（#914）
+## Daemon logging（#914、#78）
 
-Daemon tracing 透過 `tracing_appender::rolling` 寫入 `$AGEND_HOME/daemon.log.<YYYY-MM-DD>`，每日輪替。預設保留設定：
+Daemon tracing 透過 `tracing_appender::rolling` 寫入 `$AGEND_HOME/daemon.<YYYY-MM-DD>.log`（以 UTC 日期命名），每日輪替。預設保留設定：
 
 - `AGEND_LOG_RETAIN_DAYS=N`（預設 3）——`max_log_files` 上限
 - `AGEND_LOG_MAX_BYTES=2G`（或純 integer / `K`/`M`/`G` 後綴）——目錄大小的硬性後援；總量超過時，每小時 tick 會修剪最舊檔案
 
-Operator 的 tail target 維持 `$AGEND_HOME/daemon.log`——在 Unix 上它是指向最新 rotated file 的 symlink（同一個 hourly tick 會重新指向）；Windows operator 則使用 `glob daemon.log.*`（symlink support 需要 Developer Mode）。
+Operator 的 tail target 維持 `$AGEND_HOME/daemon.log`——在 Unix 上它是指向最新 rotated file 的 relative symlink（同一個 hourly tick 會重新指向）；Windows operator 則使用 `glob daemon.*.log`（或 legacy `daemon.log.*`，symlink support 需要 Developer Mode）。
 
 **相較 pre-#914，已接受的 regression**：
 

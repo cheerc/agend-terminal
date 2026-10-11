@@ -209,10 +209,10 @@ pushed or handed off, release it with `release_worktree({instance: "<self>"})`.
 The daemon rejects `main`/`master`, owns the marker and binding transaction, and
 preserves the canonical checkout for operator and tooling use.
 
-## Daemon logging (#914)
+## Daemon logging (#914, #78)
 
 Daemon tracing writes to a daily-rotating file via `tracing_appender::rolling`
-at `$AGEND_HOME/daemon.log.<YYYY-MM-DD>`. Retention defaults:
+at `$AGEND_HOME/daemon.<YYYY-MM-DD>.log` (dated in UTC). Retention defaults:
 
 - `AGEND_LOG_RETAIN_DAYS=N` (default 3) — `max_log_files` cap
 - `AGEND_LOG_MAX_BYTES=2G` (or plain integer / `K`/`M`/`G` suffix) — hard
@@ -220,7 +220,7 @@ at `$AGEND_HOME/daemon.log.<YYYY-MM-DD>`. Retention defaults:
 
 Operator tail target stays `$AGEND_HOME/daemon.log` — on Unix it's a
 symlink to the newest rotated file (re-pointed by the same hourly tick);
-on Windows operators `glob daemon.log.*` (Developer Mode required for
+on Windows operators `glob daemon.*.log` (or legacy `daemon.log.*`) (Developer Mode required for
 symlink support).
 
 **Accepted regressions vs pre-#914**:

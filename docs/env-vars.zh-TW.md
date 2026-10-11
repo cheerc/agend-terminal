@@ -109,7 +109,7 @@ Stage 1 閘門是**以值判定**（必須等於 `"1"`）；關閉時它會以
 | Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
 |------|---------|-----------------|-----------------------|--------|-------|
 | `AGEND_LOG` | `EnvFilter` 指令，控制 CLI 與滾動式 daemon/app subscriber 的 log 詳盡程度。 | CLI → `agend_terminal=info`；滾動式 → 由呼叫端提供的預設 filter。 | `tracing_subscriber::EnvFilter` 語法，例如 `agend_terminal=debug`、`info,agend_terminal::daemon=trace`。 | `src/logging.rs:76`（CLI）、`:156`（滾動式） | 面向 operator。 |
-| `AGEND_LOG_MAX_BYTES` | 目錄大小的後援上限：每小時的 handler 會修剪最舊的 `daemon.log.*`，直到整體佔用低於上限。 | `2 GiB`（`DEFAULT_MAX_BYTES`）。 | 純位元組數，或加 `K`/`M`/`G` 後綴（不分大小寫），例如 `2G`、`500M`。 | `src/daemon/per_tick/log_rotation.rs:43`；parser 於 `src/logging.rs:198` | 僅 daemon 的調校項。 |
+| `AGEND_LOG_MAX_BYTES` | 目錄大小的後援上限：每小時的 handler 會修剪最舊的 daemon log（`daemon.<YYYY-MM-DD>.log`，UTC 日期；另含 legacy `daemon.log.*` 與 migration 封存），直到整體佔用低於上限。 | `2 GiB`（`DEFAULT_MAX_BYTES`）。 | 純位元組數，或加 `K`/`M`/`G` 後綴（不分大小寫），例如 `2G`、`500M`。 | `src/daemon/per_tick/log_rotation.rs:43`；parser 於 `src/logging.rs:198` | 僅 daemon 的調校項。 |
 | `AGEND_LOG_RETAIN_DAYS` | daily rolling appender 上的 `max_log_files`（保留的每日輪替檔數量）。 | `3`（`DEFAULT_RETAIN_DAYS`；`<=0` 時也是）。 | 正的 `usize`。 | `src/logging.rs:62` | 與 byte cap 互不相干。 |
 | `AGEND_DAEMON_THREAD_DUMP_SECS` | 每個 tick 的 thread-dump 間隔（秒）；`N>=1` 會啟用定期 dump。 | `0` / 停用。 | `u64` 秒；`0` 停用。 | `src/sync_audit.rs`（`thread_dump_interval_secs`） | 透過 `OnceLock` 快取一次——要切換需重啟。同一個 accessor 同時餵給 handler 間隔與 `thread_dump_enabled` 閘門。 |
 | `AGEND_DEBUG_PTY_READ` | 在 PTY 讀取迴圈中，啟用對讀取次數／位元組總量的詳盡 debug logging。僅供 debug 的接縫。 | 關閉。 | `"1"` 啟用；其他任何值（含 `0`）皆關閉。 | `src/agent/mod.rs` | 內部 debug 旗標。 |

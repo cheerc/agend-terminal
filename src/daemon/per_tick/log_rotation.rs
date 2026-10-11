@@ -40,7 +40,7 @@ impl PerTickHandler for LogRotationHandler {
             tracing::info!(
                 removed,
                 max_bytes,
-                "log_rotation: pruned oversize daemon.log.* entries"
+                "log_rotation: pruned oversize daemon log entries"
             );
         }
         // #3669: hourly safety net for JSONL rotated generations. The

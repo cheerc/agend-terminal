@@ -336,11 +336,72 @@ pub fn migrate_existing_log(
     }
 }
 
-/// Hourly cleanup tick. Sums sizes of every `daemon.log.*` file in
-/// `home` (rotated dates AND migration suffixes both count toward the
-/// total); when total > `max_bytes`, deletes oldest by mtime until
-/// total is under the cap. Returns the number of files removed for
-/// telemetry.
+/// Check if a filename corresponds to a daemon log file that counts toward the byte cap.
+///
+/// Matches:
+/// - Real producer output: `daemon.<YYYY-MM-DD>.log` (e.g. `daemon.2026-10-11.log`)
+/// - Legacy rotated format: `daemon.log.<date>`
+/// - Migration archives: `daemon.log.migration.<epoch>` or `daemon.migration.<epoch>`
+///
+///   Excludes:
+/// - Symlink itself: `daemon.log`
+/// - Application logs: `app.*`
+fn is_daemon_log_for_cleanup(name: &str) -> bool {
+    if name == "daemon.log" {
+        return false;
+    }
+    // Real producer format: `daemon.<YYYY-MM-DD>.log` (exclude `daemon.log`)
+    if name.starts_with("daemon.") && name.ends_with(".log") {
+        let middle = &name["daemon.".len()..name.len() - ".log".len()];
+        if !middle.is_empty() && middle.chars().all(|c| c.is_ascii_digit() || c == '-') {
+            return true;
+        }
+    }
+    // Legacy rotated format: `daemon.log.<date>`
+    if name.starts_with("daemon.log.") && !name.contains(MIGRATION_SUFFIX_PREFIX) {
+        return true;
+    }
+    // Migration files: `daemon.log.migration.<epoch>` or `daemon.migration.<epoch>`
+    if name.starts_with("daemon.log.migration.") || name.starts_with("daemon.migration.") {
+        return true;
+    }
+    false
+}
+
+/// Check if a filename is an active rotated daemon log suitable as a symlink target.
+///
+/// Matches:
+/// - Real producer output: `daemon.<YYYY-MM-DD>.log`
+/// - Legacy rotated format: `daemon.log.<date>`
+///
+///   Excludes:
+/// - Migration archives (`daemon.log.migration.*` / `*migration*`)
+/// - Symlink itself: `daemon.log`
+/// - Application logs: `app.*`
+fn is_daemon_active_rotated_log(name: &str) -> bool {
+    if name == "daemon.log" || name.contains(MIGRATION_SUFFIX_PREFIX) {
+        return false;
+    }
+    // Real producer format: `daemon.<YYYY-MM-DD>.log`
+    if name.starts_with("daemon.") && name.ends_with(".log") {
+        let middle = &name["daemon.".len()..name.len() - ".log".len()];
+        if !middle.is_empty() && middle.chars().all(|c| c.is_ascii_digit() || c == '-') {
+            return true;
+        }
+    }
+    // Legacy rotated format: `daemon.log.<date>`
+    if let Some(suffix) = name.strip_prefix("daemon.log.") {
+        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit() || c == '-') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Hourly cleanup tick. Sums sizes of every daemon log file in `home` (real rotated
+/// `daemon.<date>.log`, legacy `daemon.log.<date>`, and migration suffixes all count
+/// toward the total); when total > `max_bytes`, deletes oldest by mtime until
+/// total is under the cap. Returns the number of files removed for telemetry.
 pub fn cleanup_oversize_logs(home: &Path, max_bytes: u64) -> usize {
     let entries_iter = match std::fs::read_dir(home) {
         Ok(d) => d,
@@ -351,11 +412,7 @@ pub fn cleanup_oversize_logs(home: &Path, max_bytes: u64) -> usize {
         .filter_map(|entry| {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            // Match rotated (`daemon.log.<date>`) AND migration
-            // (`daemon.log.migration.<epoch>`) — both count toward budget.
-            // Exclude the symlink itself (we want the underlying files in
-            // the budget, not the link byte-count).
-            if !name_str.starts_with("daemon.log.") {
+            if !is_daemon_log_for_cleanup(&name_str) {
                 return None;
             }
             let meta = entry.metadata().ok()?;
@@ -387,10 +444,10 @@ pub fn cleanup_oversize_logs(home: &Path, max_bytes: u64) -> usize {
     removed
 }
 
-/// Maintain `<home>/daemon.log` symlink → newest `daemon.log.<date>`
-/// rotated file so operator's `tail -F daemon.log` keeps tracking the
-/// active file across rotation boundaries. Unix-only. Windows operator
-/// must `glob daemon.log.*` per the lead-synthed BC note.
+/// Maintain `<home>/daemon.log` symlink → newest rotated daemon log file
+/// (`daemon.<date>.log` or legacy `daemon.log.<date>`) so operator's `tail -F daemon.log`
+/// keeps tracking the active file across rotation boundaries. Unix-only.
+/// Windows operator must glob `daemon.*.log` / `daemon.log.*`.
 #[cfg(unix)]
 pub fn update_daemon_log_symlink_unix(home: &Path) {
     use std::os::unix::fs as unix_fs;
@@ -398,15 +455,15 @@ pub fn update_daemon_log_symlink_unix(home: &Path) {
         Ok(d) => d,
         Err(_) => return,
     };
-    // Newest rotated file (`daemon.log.<date>`), excluding migration
-    // markers (those are static historic snapshots — never the active
-    // write target) and the symlink itself.
+    // Newest rotated file (real `daemon.<date>.log` or legacy `daemon.log.<date>`),
+    // excluding migration markers (static historic snapshots — never active write
+    // targets), app logs, and the symlink itself.
     let newest = entries_iter
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name();
             let name_str = name.to_string_lossy().to_string();
-            if !name_str.starts_with("daemon.log.") || name_str.contains(MIGRATION_SUFFIX_PREFIX) {
+            if !is_daemon_active_rotated_log(&name_str) {
                 return None;
             }
             let ft = entry.file_type().ok()?;
