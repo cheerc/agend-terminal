@@ -772,6 +772,239 @@ mod tests {
         }
     }
 
+    /// Build the fixture the double-absence tests share: a live binding, an
+    /// archive holding the same evidence, a `RecoveryRequired` tombstone that
+    /// records the archive, and the worktree already gone.
+    ///
+    /// `mutate_archive` is handed the archive path so a caller can drop or
+    /// corrupt the archived evidence — that is what separates "archive digest
+    /// is the only evidence" from "archive has none".
+    ///
+    /// Returns `(home, instance, branch, source_repo, worktree, archive)` so
+    /// each test can assert on the same paths it built.
+    #[allow(clippy::type_complexity)]
+    fn double_absence_fixture(
+        tag: &str,
+        mutate_archive: impl FnOnce(&Path),
+    ) -> (PathBuf, String, String, PathBuf, PathBuf, PathBuf) {
+        let home = temp_home(tag);
+        let instance = format!("recovery-{tag}-{}", std::process::id());
+        let branch = format!("review/{tag}");
+        let source_repo = home.join("source-repo");
+        std::fs::create_dir_all(&source_repo).expect("create source repository fixture");
+        let worktree = crate::worktree_pool::daemon_managed_worktree_root(&home)
+            .join(&instance)
+            .join("review-double-absence");
+        std::fs::create_dir_all(&worktree).expect("create worktree fixture");
+        crate::binding::bind_full(
+            &home,
+            &instance,
+            "",
+            &branch,
+            &worktree,
+            &source_repo,
+            false,
+        )
+        .expect("bind recovery fixture");
+        let binding_body = std::fs::read(crate::paths::binding_path(&home, &instance))
+            .expect("read binding fixture");
+        let binding_signature = std::fs::read(
+            crate::paths::runtime_dir(&home)
+                .join(&instance)
+                .join("binding.json.sig"),
+        )
+        .expect("read binding signature fixture");
+        crate::agent::deletion_recovery::begin_from_binding(&home, &instance)
+            .expect("persist deleting tombstone")
+            .expect("signed binding must enter recovery lane");
+
+        let archive = home
+            .join(".trash")
+            .join("worktrees")
+            .join(format!("{instance}-archive"));
+        std::fs::create_dir_all(&archive).expect("create archive fixture");
+        std::fs::write(archive.join(".agend-recovery-binding.json"), &binding_body)
+            .expect("write archived binding evidence");
+        std::fs::write(
+            archive.join(".agend-recovery-binding.json.sig"),
+            &binding_signature,
+        )
+        .expect("write archived signature evidence");
+        mutate_archive(&archive);
+        crate::agent::deletion_recovery::mark_recovery_required(&home, &instance, Some(&archive))
+            .expect("persist archive path before simulated cleanup interruption");
+
+        // The double absence: the WHOLE runtime dir, which is where binding.json
+        // and binding.json.sig both live (`paths.rs` puts them in the same
+        // directory). Removing the directory removes both — this is the case
+        // decision (乙) is about, and the reason neither existing test covers
+        // it: each of them deletes exactly one of the two files and leaves the
+        // other live.
+        std::fs::remove_dir_all(&worktree).expect("simulate archived worktree");
+        std::fs::remove_dir_all(crate::paths::runtime_dir(&home).join(&instance))
+            .expect("simulate binding cleanup before receipt");
+        // Asserted on the FILES, not through `crate::binding::read`: that reader
+        // consults a process-wide in-memory index before it touches the disk, so
+        // it keeps answering from the cache after the files are gone. The lane
+        // under test resolves evidence by reading the paths directly, which is
+        // what makes this a double absence at all.
+        assert!(
+            !crate::paths::binding_path(&home, &instance).exists()
+                && !crate::paths::runtime_dir(&home)
+                    .join(&instance)
+                    .join("binding.json.sig")
+                    .exists(),
+            "precondition: BOTH live binding and signature must be gone from disk"
+        );
+        (home, instance, branch, source_repo, worktree, archive)
+    }
+
+    /// Decision (乙), the core path: with BOTH live binding files absent, the
+    /// archived digest is the evidence, and it authorises recovery.
+    ///
+    /// The test is what proves the archived side of `evidence_binding` is ever
+    /// taken. `partial_live_binding_evidence_reconciles_from_recorded_archive_3696`
+    /// looks similar but deletes only one of the two files, so `live.or(archived)`
+    /// resolves on its left operand and the fallback never runs. Deleting the
+    /// whole runtime directory is what makes the archive the only evidence.
+    #[test]
+    fn double_absence_recovers_from_the_archived_digest_39() {
+        let (home, instance, branch, source_repo, worktree, archive) =
+            double_absence_fixture("double-absent-has-digest", |_| {});
+
+        let report = recover_markerless_bound_worktree(
+            &home,
+            "operator",
+            "recover from archive digest when live binding evidence is absent",
+            &instance,
+            &branch,
+            &worktree,
+            &source_repo,
+        )
+        .expect("decision (乙): an archive digest must reconcile a double absence");
+
+        assert_eq!(report.archive, archive);
+        assert_eq!(
+            crate::agent::deletion_recovery::read(&home, &instance)
+                .expect("read recovery receipt")
+                .expect("recovery receipt must remain durable")
+                .state,
+            crate::agent::deletion_recovery::State::Recovered
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The control for the test above: an archive with no digest at all must be
+    /// refused rather than treated as "no evidence, nothing to check".
+    ///
+    /// Without this, a recovery that ignored the archive entirely and reported
+    /// success would still pass the happy path.
+    #[test]
+    fn double_absence_without_an_archived_digest_is_refused_39() {
+        let (home, instance, branch, source_repo, worktree, _archive) =
+            double_absence_fixture("double-absent-no-digest", |archive| {
+                std::fs::remove_file(archive.join(".agend-recovery-binding.json"))
+                    .expect("remove archived binding evidence");
+                std::fs::remove_file(archive.join(".agend-recovery-binding.json.sig"))
+                    .expect("remove archived signature evidence");
+            });
+
+        let error = recover_markerless_bound_worktree(
+            &home,
+            "operator",
+            "refuse recovery when no digest survives anywhere",
+            &instance,
+            &branch,
+            &worktree,
+            &source_repo,
+        )
+        .expect_err("an archive with no digest must not authorise recovery");
+        assert!(
+            error.contains("no signed binding evidence")
+                || error.contains("no signed signature evidence"),
+            "the refusal must name the missing evidence, got: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A digest that does not match the tombstone must be refused — the archive
+    /// is evidence only when it is the evidence the tombstone recorded.
+    #[test]
+    fn double_absence_with_a_mismatched_archived_digest_is_refused_39() {
+        let (home, instance, branch, source_repo, worktree, _archive) =
+            double_absence_fixture("double-absent-bad-digest", |archive| {
+                std::fs::write(
+                    archive.join(".agend-recovery-binding.json"),
+                    b"{\"tampered\":true}",
+                )
+                .expect("write a binding that no longer matches the tombstone");
+                std::fs::write(
+                    archive.join(".agend-recovery-binding.json.sig"),
+                    b"tampered-signature",
+                )
+                .expect("write a signature that no longer matches the tombstone");
+            });
+
+        let error = recover_markerless_bound_worktree(
+            &home,
+            "operator",
+            "refuse recovery when the archived digest drifted from the tombstone",
+            &instance,
+            &branch,
+            &worktree,
+            &source_repo,
+        )
+        .expect_err("an archive digest must be checked against the tombstone");
+        assert!(
+            error.contains("does not match tombstone"),
+            "the refusal must name the mismatch, got: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A damaged worktree must stay refused even when the archive holds a
+    /// digest that would otherwise authorise recovery.
+    ///
+    /// The guard is PR-1 (#67) and it sits ahead of the evidence resolution, so
+    /// a passing digest must not reach it. Nothing tested this ordering: the
+    /// digest path was only ever exercised from `RecoveryRequired`, where the
+    /// guard does not apply.
+    #[test]
+    fn double_absence_with_an_unusable_tombstone_is_still_refused_39() {
+        let (home, instance, branch, source_repo, worktree, archive) =
+            double_absence_fixture("double-absent-unusable", |_| {});
+
+        // Replace the RecoveryRequired tombstone with the damaged state. The
+        // binding digest it records is left untouched, so the archive still
+        // matches — everything the digest path needs is present.
+        crate::agent::deletion_recovery::mark_worktree_unusable(
+            &home,
+            &instance,
+            "simulated interrupted removal",
+        )
+        .expect("rewrite the tombstone as unusable");
+        assert!(
+            archive.is_dir(),
+            "precondition: the archive must still exist"
+        );
+
+        let error = recover_markerless_bound_worktree(
+            &home,
+            "operator",
+            "refuse recovery of a damaged worktree",
+            &instance,
+            &branch,
+            &worktree,
+            &source_repo,
+        )
+        .expect_err("a damaged worktree must never be recovered from its archive");
+        assert!(
+            error.contains("damaged"),
+            "the refusal must say the worktree is damaged, got: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn marker_present_target_is_left_for_normal_release() {
         let home = temp_home("managed");
