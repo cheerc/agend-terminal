@@ -436,6 +436,9 @@ fn serve_inner(
     // Fixed const (#env-cleanup: was env-overridable via `AGEND_API_MAX_CONNS`;
     // demoted to YAGNI for single-user deploys).
     const API_MAX_CONNS: usize = 32;
+    // #22: in-band NDJSON capacity rejection payload emitted before dropping.
+    const CAPACITY_REJECTED_PAYLOAD: &[u8] =
+        b"{\"ok\":false,\"error\":\"API connection rejected - at capacity\",\"reason\":\"capacity\"}\n";
     let max_conns: usize = API_MAX_CONNS;
     let active_conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -498,6 +501,11 @@ fn serve_inner(
         let (conn_slot, prev) = ConnSlot::reserve(&active_conns);
         if prev >= max_conns {
             tracing::warn!("API connection rejected — at capacity");
+            // #22: emit an in-band NDJSON rejection so the client can distinguish
+            // daemon capacity exhaustion from daemon death or network EOF.
+            let mut stream = stream;
+            let _ = stream.write_all(CAPACITY_REJECTED_PAYLOAD);
+            let _ = stream.flush();
             drop(stream);
             continue; // `conn_slot` drops here → reservation released
         }
@@ -1158,3 +1166,6 @@ mod operator_settlement_tests;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod capacity_tests;
