@@ -280,13 +280,44 @@ fn assignee_binding_check(
         && binding["expected_head"].as_str() == provisioned_head
         && lease_assignment_still_authorizes(home, &binding, caller, task_id)
         && signature_valid;
-    if binding_agent != Some(caller)
-        || binding_task != Some(task_id)
-        || (binding_branch != Some(branch) && !typed_disposable_review)
-        || source_repo.is_empty()
-        || worktree.is_empty()
-    {
-        return Err("assignee completion binding does not exactly match the task".to_string());
+    if binding_agent != Some(caller) {
+        return Err(format!(
+            "assignee completion binding names agent '{}', not caller '{caller}'",
+            binding_agent.unwrap_or_default()
+        ));
+    }
+    if binding_task != Some(task_id) {
+        return Err(format!(
+            "assignee completion binding names task '{}', not task '{task_id}'",
+            binding_task.unwrap_or_default()
+        ));
+    }
+    if binding_branch != Some(branch) && !typed_disposable_review {
+        if let Some(head) = provisioned_head {
+            let review_branch = binding_branch.unwrap_or_default();
+            let lease_kind = binding["lease_kind"].as_str();
+            let expected_head = binding["expected_head"].as_str().unwrap_or_default();
+            let detail = if lease_kind != Some("review") {
+                "it carries no live typed review lease proving this branch may settle the task"
+            } else if expected_head != head {
+                "its expected head does not match the provisioned head"
+            } else {
+                "its typed review lease no longer names a live receipt-capable assignment for this caller and task"
+            };
+            return Err(format!(
+                "assignee completion binding branch '{review_branch}' does not match task branch '{branch}': disposable review checkout at provisioned head '{head}', {detail}; ask the task's orchestrator to close it"
+            ));
+        }
+        return Err(format!(
+            "assignee completion binding branch '{}' does not match task branch '{branch}'",
+            binding_branch.unwrap_or_default()
+        ));
+    }
+    if source_repo.is_empty() {
+        return Err("assignee completion binding has an empty source_repo".to_string());
+    }
+    if worktree.is_empty() {
+        return Err("assignee completion binding has an empty worktree".to_string());
     }
 
     let source_repo = Path::new(source_repo);
