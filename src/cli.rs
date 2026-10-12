@@ -436,6 +436,12 @@ pub(crate) fn check_helper_staleness(home: &Path) -> String {
     let helpers = [
         ("agend-git", "wrapper for daemon-managed git ops"),
         ("agend-mcp-bridge", "bridge for MCP stdio JSON-RPC"),
+        // #20 step 1 (R1): the hook observer helper rides the same
+        // sibling → home/bin mechanism; track it for staleness too.
+        (
+            "agend-hook-observer",
+            "observer for hook branch-mismatch audit",
+        ),
     ];
 
     let mut lines: Vec<String> = Vec::new();
@@ -1432,14 +1438,15 @@ mod helper_staleness_tests {
     fn helpers_list_covers_both_canonical_helper_binaries() {
         // Source-text invariant: the helpers list inside
         // `check_helper_staleness` must include both `agend-git`
-        // and `agend-mcp-bridge` (the two binaries the daemon
-        // installs at $AGEND_HOME/bin). A future refactor that
-        // adds a third helper but forgets to extend this list
+        // and `agend-mcp-bridge` (binaries the daemon installs at
+        // $AGEND_HOME/bin), plus `agend-hook-observer` (#20 step 1
+        // R1 — same sibling → home/bin mechanism). A future refactor
+        // that adds a fourth helper but forgets to extend this list
         // would silently leave operators with no staleness
         // warning for that binary.
         let src = include_str!("cli.rs");
         let helpers_block_start = src.find("let helpers = [").unwrap();
-        let helpers_block_end = helpers_block_start + 200;
+        let helpers_block_end = helpers_block_start + 400;
         let helpers_block = &src[helpers_block_start..helpers_block_end.min(src.len())];
         assert!(
             helpers_block.contains("\"agend-git\""),
@@ -1448,6 +1455,10 @@ mod helper_staleness_tests {
         assert!(
             helpers_block.contains("\"agend-mcp-bridge\""),
             "helpers list must include `agend-mcp-bridge`"
+        );
+        assert!(
+            helpers_block.contains("\"agend-hook-observer\""),
+            "helpers list must include `agend-hook-observer` (#20 R1)"
         );
     }
 }

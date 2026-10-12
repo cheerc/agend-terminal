@@ -2,7 +2,7 @@
 //! log itself. Every one of them goes through the single serialized appender.
 //!
 //! ## Why this exists
-//! All four sinks used `writeln!(f, "{event}")` on an UNBUFFERED `File`.
+//! All five sinks previously used `writeln!(f, "{event}")` on an UNBUFFERED `File`.
 //! `File::write_fmt` issues one `write()` syscall per formatting fragment — for a
 //! real record that is ~64 syscalls — and `O_APPEND` only makes a SINGLE syscall
 //! atomic against other writers, so concurrent appenders interleaved *inside* a
@@ -35,7 +35,7 @@
 //! non-bypassable; the audit-filename literal is banned too, but only as a
 //! belt-and-braces signal.
 //!
-//! All four sinks currently contain zero such primitives in production, so the ban
+//! All five sinks currently contain zero such primitives in production, so the ban
 //! costs them nothing. If one ever needs to write an unrelated file, this test
 //! must be revisited deliberately rather than loosened casually.
 //!
@@ -48,12 +48,16 @@
 use std::path::{Path, PathBuf};
 use syn::visit::Visit;
 
-/// The four sinks named by decision `d-20260828052146598850-31`.
+/// The four sinks named by decision `d-20260828052146598850-31`, plus the
+/// #20 step-1 observer helper (R1).
 const SINKS: &[&str] = &[
     "vendor/agentic-git/crates/agentic-git/src/telemetry.rs",
     "src/bin/agend-git/kill_guard.rs",
     "src/mcp/handlers/ci/merge.rs",
     "src/mcp/handlers/instance_state/mod.rs",
+    // #20 step 1 (R1): the hook observer helper is the fifth sink — it must
+    // route through the same shared appender with no direct file I/O.
+    "src/bin/agend-hook-observer.rs",
 ];
 
 /// Substring proving a sink routes through the shared crate. Matches both the

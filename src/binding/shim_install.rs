@@ -95,6 +95,32 @@ fn symlink_shim_at(home: &Path, exe: &Path, use_agentic_git: bool) {
         links.push((name, agend_git.as_path()));
     }
 
+    // #20 step 1 (R1): the hook observer helper rides the same sibling →
+    // home/bin mechanism. It is NOT a git/kill shim — it takes no part in
+    // routing, flags, guards or fallbacks — so it is installed on a
+    // best-effort basis only: a missing sibling (stale/partial install) leaves
+    // no link, and the hook treats a missing helper as skip (never a commit
+    // refusal). Independent of the agend-git floor above: even when no shim
+    // installs, the observer link is still attempted.
+    if let Some(observer) = sibling("agend-hook-observer") {
+        let observer_name = if cfg!(windows) {
+            "agend-hook-observer.exe"
+        } else {
+            "agend-hook-observer"
+        };
+        let link_path = bin_dir.join(observer_name);
+        // Remove stale symlink/file first.
+        let _ = std::fs::remove_file(&link_path);
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(&observer, &link_path);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::copy(&observer, &link_path);
+        }
+    }
+
     for (name, src) in links {
         let link_path = bin_dir.join(name);
         // Remove stale symlink/file first.

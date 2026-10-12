@@ -173,13 +173,17 @@ jobs:
           # current_exe().with_file_name(), so a release-tarball install must
           # place them beside agend-terminal or the git guard silently falls
           # back / breaks (the cargo-install path already gets all 4, #2691).
-          # All 4 bins listed explicitly on the `tar czf` line + guard loop so
+          # All 5 bins listed explicitly on the `tar czf` line + guard loop so
           # tests/no_local_mcp_mode_invariant.rs (brackets forward from `tar czf`)
           # asserts each is packaged.
+          # #20 step 1 (R1): the hook observer helper ships at the SAME layer —
+          # the daemon's install resolves it via current_exe().with_file_name(),
+          # so a release-tarball install must place it beside agend-terminal or
+          # the mismatch measurement silently never fires.
           tar czf ../../../agend-terminal-${{ matrix.target }}.tar.gz \
-            agend-terminal agend-mcp-bridge agend-git agentic-git
+            agend-terminal agend-mcp-bridge agend-git agentic-git agend-hook-observer
           # Fail-loud: the archive MUST contain every expected sibling binary.
-          for b in agend-terminal agend-mcp-bridge agend-git agentic-git; do
+          for b in agend-terminal agend-mcp-bridge agend-git agentic-git agend-hook-observer; do
             tar tzf ../../../agend-terminal-${{ matrix.target }}.tar.gz "$b" >/dev/null \
               || { echo "::error::release tarball missing $b"; exit 1; }
           done
@@ -194,14 +198,15 @@ jobs:
           # agentic-git) beside agend-terminal — symlink_shim finds siblings via
           # current_exe().with_file_name() (see the Unix arm for the rationale).
           $rel = "target/${{ matrix.target }}/release"
-          # All 4 .exe listed explicitly on the Compress-Archive line + guard loop
+          # All 5 .exe listed explicitly on the Compress-Archive line + guard loop
           # so tests/no_local_mcp_mode_invariant.rs asserts each is packaged.
+          # #20 step 1 (R1): same-layer observer sibling (see the Unix tar arm).
           Compress-Archive `
-            -Path "$rel/agend-terminal.exe","$rel/agend-mcp-bridge.exe","$rel/agend-git.exe","$rel/agentic-git.exe" `
+            -Path "$rel/agend-terminal.exe","$rel/agend-mcp-bridge.exe","$rel/agend-git.exe","$rel/agentic-git.exe","$rel/agend-hook-observer.exe" `
             -DestinationPath agend-terminal-${{ matrix.target }}.zip -Force
           # Fail-loud: the archive MUST contain every expected sibling binary.
           Expand-Archive -Path agend-terminal-${{ matrix.target }}.zip -DestinationPath _verify -Force
-          foreach ($b in @("agend-terminal","agend-mcp-bridge","agend-git","agentic-git")) {
+          foreach ($b in @("agend-terminal","agend-mcp-bridge","agend-git","agentic-git","agend-hook-observer")) {
             if (!(Test-Path "_verify/$b.exe")) { Write-Error "release zip missing $b.exe"; exit 1 }
           }
           Remove-Item -Recurse -Force _verify
@@ -263,6 +268,8 @@ jobs:
           # binary fail-loud; without these the git guard silently degrades.
           cp target/release/agend-git AppDir/usr/bin/agend-git
           cp target/release/agentic-git AppDir/usr/bin/agentic-git
+          # #20 step 1 (R1): same-layer observer sibling (see the Unix tar arm).
+          cp target/release/agend-hook-observer AppDir/usr/bin/agend-hook-observer
           cp assets/appimage/agend-terminal.desktop AppDir/usr/share/applications/agend-terminal.desktop
           # Resize 1024x1024 master → 256x256 for hicolor + AppImage root
           convert assets/appimage/agend-terminal.png -resize 256x256 AppDir/usr/share/icons/hicolor/256x256/apps/agend-terminal.png

@@ -62,6 +62,19 @@ inject_agend_trailers() {
     # worse than none, because it is read as an authoritative answer and squash
     # makes it permanent. `Agend-Agent` stays: it is true either way.
     if [ -z "$ACTUAL_BRANCH" ] || [ "$ACTUAL_BRANCH" != "$BRANCH" ]; then
+        # #20 step 1 (R1): measure a PROVABLE named mismatch only — both sides
+        # non-empty and byte-unequal. Detached / unknown / binding-empty all
+        # arrive here with an empty side and must NOT record. Best-effort:
+        # helper missing or failing never changes the commit outcome.
+        if [ -n "$BRANCH" ] && [ -n "$ACTUAL_BRANCH" ]; then
+            OBSERVER="$HOME_DIR/bin/agend-hook-observer"
+            if [ -x "$OBSERVER" ]; then
+                "$OBSERVER" --home "$HOME_DIR" --agent "$AGENT" \
+                    --task "$TASK" --bound-branch "$BRANCH" \
+                    --actual-branch "$ACTUAL_BRANCH" --head-raw "$HEAD_REF" \
+                    --commit-source "$COMMIT_SOURCE" >/dev/null 2>&1 || true
+            fi
+        fi
         TASK=""
         BRANCH=""
         ISSUED=""

@@ -52,6 +52,22 @@ if ($env:GIT_DIR) {
     }
 }
 if ((-not $Actual) -or ($Actual -cne $Branch)) {
+    # #20 step 1 (R1): measure a PROVABLE named mismatch only — both sides
+    # non-empty and byte-unequal (-cne). Detached / unknown / binding-empty
+    # arrive here with an empty side and must NOT record. Best-effort:
+    # helper missing or failing never changes the commit outcome. The guard
+    # uses the case-sensitive -cne semantics of the outer comparison (branch
+    # names are case-sensitive; a plain -and truthiness probe would treat
+    # `feature/X` vs `feature/x` as needing no observer distinction).
+    if (($Branch -cne "") -and ($Actual -cne "")) {
+        $Observer = Join-Path $HomeDir "bin" "agend-hook-observer.exe"
+        if (Test-Path $Observer) {
+            & $Observer --home $HomeDir --agent $Agent `
+                --task $Task --bound-branch $Branch `
+                --actual-branch $Actual --head-raw $HeadRef `
+                --commit-source $CommitSource 2>$null | Out-Null
+        }
+    }
     $Task = ""
     $Branch = ""
     $Issued = ""
