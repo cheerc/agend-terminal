@@ -12,12 +12,29 @@
 //! * malformed input exits 0 without a record and without leaking input bytes;
 //! * contention (lock held) and I/O failure (missing home) exit 0 with no
 //!   record — a measurement failure never becomes a commit refusal.
+//!
+//! Windows: this file is unix-only (`#![cfg(unix)]`, see below). The .ps1
+//! hook's branch matrix is covered by the `#[cfg(windows)]` ps1 tests in
+//! `src/binding/tests.rs` (`ps1_hook_truth_table_and_idempotency_3545` and
+//! siblings); the actual Windows git→hook→helper path stays UNVERIFIED until
+//! the Lead-coordinated artifact validation. Do NOT "fix" Windows CI by
+//! porting these tests with non-locking substitutes — the contention test's
+//! whole point is the real flock.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+#![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+/// #821-conformant fixture git. These e2e tests init temp repos only — the
+/// canonical `git_isolated::git` entry (cwd pin + shim bypass + pinned
+/// identity + temp fence) — never the enclosing worktree, so no allow-marker
+/// is needed and none is added. Only the git submodule is pulled in (not the
+/// whole `common/` tree — `harness` drags PTY deps this file never uses).
+#[path = "common/git_isolated.rs"]
+mod git_isolated;
 
 fn tmp_home(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -264,23 +281,13 @@ fn installed_hook_records_mismatch_on_real_git_commit() {
 
     // Minimal repo + binding describing the PREVIOUS branch.
     let repo = tmp_home("e2e-repo");
-    let out = Command::new("git")
-        .args(["init", "-b", "fix/new-branch"])
-        .current_dir(&repo)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output()
-        .expect("git init");
+    let out = git_isolated::git(&repo, &["init", "-b", "fix/new-branch"]);
     assert!(out.status.success());
     for kv in [
         ["config", "user.name", "Test User"],
         ["config", "user.email", "test@example.com"],
     ] {
-        let out = Command::new("git")
-            .args(kv)
-            .current_dir(&repo)
-            .env("AGEND_GIT_BYPASS", "1")
-            .output()
-            .expect("git config");
+        let out = git_isolated::git(&repo, &kv);
         assert!(out.status.success());
     }
     let agent = "trailer-agent";
@@ -354,12 +361,7 @@ fn installed_hook_records_nothing_when_branches_match() {
     std::fs::set_permissions(&helper_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let repo = tmp_home("e2e-match-repo");
-    let out = Command::new("git")
-        .args(["init", "-b", "fix/same"])
-        .current_dir(&repo)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output()
-        .expect("git init");
+    let out = git_isolated::git(&repo, &["init", "-b", "fix/same"]);
     assert!(out.status.success());
     let agent = "trailer-agent";
     let runtime = home.join("runtime").join(agent);
