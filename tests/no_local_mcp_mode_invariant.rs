@@ -42,12 +42,19 @@ const RELEASE_YML: &str = include_str!("../.github/workflows/release.yml");
 /// Every binary the daemon expects as a sibling of `agend-terminal`
 /// (`current_exe().with_file_name()`). Each packaging step must ship all of
 /// them at the same layer: the MCP bridge (#531) plus the #2524 P3 git/kill
-/// shims. A missing shim in a release download silently degrades the git guard.
-const REQUIRED_PACKAGED_BINS: [&str; 4] = [
+/// shims (`agend-git`, `agentic-git`) plus the #20 step-1 hook observer
+/// (`agend-hook-observer`, R1 — same sibling → home/bin mechanism as the
+/// shims). A missing shim in a release download silently degrades the git
+/// guard; a missing observer silently disables the mismatch measurement. It
+/// catches release-workflow edits that drop any of them — the regression that
+/// originally produced #531, now generalized to the P3 distribution gap (the
+/// cargo-install path is covered by the `[[bin]]` in #2691).
+const REQUIRED_PACKAGED_BINS: [&str; 5] = [
     "agend-terminal",
     "agend-mcp-bridge",
     "agend-git",
     "agentic-git",
+    "agend-hook-observer",
 ];
 
 #[test]
@@ -71,7 +78,7 @@ fn release_workflow_packages_bridge_in_unix_tar_step() {
         assert!(
             section.contains(bin),
             "Unix tar packaging step must include `{bin}` so release tarballs \
-             ship every daemon sibling (bridge #531 + P3 git/kill shims). \
+             ship every daemon sibling (bridge #531 + P3 git/kill shims + #20 observer). \
              Section was:\n{section}"
         );
     }
@@ -101,7 +108,7 @@ fn release_workflow_packages_bridge_in_windows_zip_step() {
         assert!(
             section.contains(bin),
             "Windows zip packaging step must include `{bin}.exe` so the \
-             release zip ships every daemon sibling (bridge #531 + P3 git/kill \
+             release zip ships every daemon sibling (bridge #531 + P3 git/kill + #20 observer \
              shims). Section was:\n{section}"
         );
     }
@@ -126,7 +133,7 @@ fn release_workflow_includes_bridge_in_appimage_stage() {
         assert!(
             section.contains(bin),
             "AppImage stage must copy `{bin}` into AppDir/usr/bin/ so AppImage \
-             installs ship every daemon sibling (bridge #531 + P3 git/kill \
+             installs ship every daemon sibling (bridge #531 + P3 git/kill + #20 observer \
              shims). Section was:\n{section}"
         );
     }

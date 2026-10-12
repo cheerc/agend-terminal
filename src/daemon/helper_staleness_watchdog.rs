@@ -43,7 +43,7 @@ pub(crate) const RE_ALERT_THRESHOLD_SECS: i64 = 6 * 60 * 60;
 /// Helpers tracked. Mirrors `cli::check_helper_staleness` so a single
 /// classification logic governs both the operator-pull doctor and the
 /// proactive scanner.
-const TRACKED_HELPERS: &[&str] = &["agend-git", "agend-mcp-bridge"];
+const TRACKED_HELPERS: &[&str] = &["agend-git", "agend-mcp-bridge", "agend-hook-observer"];
 
 pub(crate) struct HelperStalenessWatchdogTracker {
     /// Cadence gate — throttles scans to once per [`TICKS_PER_STALENESS_SCAN`]
