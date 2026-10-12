@@ -33,7 +33,7 @@ fn helper() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_agend-hook-observer"))
 }
 
-fn lock_path(home: &Path) -> PathBuf {
+fn observer_lock_path(home: &Path) -> PathBuf {
     home.join("fleet_events.jsonl.lock")
 }
 
@@ -192,7 +192,7 @@ fn lock_contention_skips_without_record_and_stays_zero() {
         .create(true)
         .write(true)
         .truncate(false)
-        .open(lock_path(&home))
+        .open(observer_lock_path(&home))
         .expect("open lock");
     // fs4 is a main-dependency (vendored appender uses it); tests use libc flock
     // via the same syscall shape — hold LOCK_EX for the spawn duration.
