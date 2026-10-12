@@ -4035,6 +4035,12 @@ fn teardown_converges_residual_when_fleet_row_absent_under_delete_fence_19a() {
     let member = "dev-team-impl2";
     let member_dir = custom_root.join(member);
     std::fs::create_dir_all(&member_dir).unwrap();
+    assert!(write_deployment_owner_marker(
+        &member_dir,
+        "dev-team",
+        member,
+        Some("af02dd48-f634-45bd-a72b-0a22de55b04b"),
+    ));
 
     let deployment = Deployment {
         name: "dev-team".into(),
@@ -4088,6 +4094,12 @@ fn teardown_legacy_record_converges_when_fleet_row_absent_19a() {
     let member = "fc-team-impl";
     let member_dir = custom_root.join(member);
     std::fs::create_dir_all(&member_dir).unwrap();
+    assert!(write_deployment_owner_marker(
+        &member_dir,
+        "fc-team",
+        member,
+        None,
+    ));
 
     let deployment = Deployment {
         name: "fc-team".into(),
