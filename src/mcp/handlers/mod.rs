@@ -350,3 +350,9 @@ mod review_repro_issue15_subject_mismatch;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod review_repro_issue33_error_projection;
+
+// #28: create_instance `effort` RED scaffolding (immutable RED→GREEN).
+// Sibling file per the p0b_tests / instance_964_tests precedent.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod create_effort_28red_tests;

@@ -191,6 +191,47 @@ fn spawn_single_instance_impl_inner(
         None => return json!({"error": "missing 'name'"}),
     };
     crate::validate_name_or_err!(raw_name);
+    // #28 F1-F4: validate reasoning-effort intent BEFORE any mutation
+    // (worktree creation, lifecycle permit, fleet.yaml entry).
+    let effort = args
+        .get("effort")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    if let Some(e) = effort {
+        let command = args["backend"].as_str().unwrap_or("claude");
+        let declared = crate::backend::Backend::parse_str(command);
+        let effort_cap = crate::backend_effort::capability_for(&declared);
+        let Some(cap) = effort_cap else {
+            return json!({
+                "error": format!("backend '{command}' does not support reasoning effort"),
+                "code": "effort_unsupported_backend"
+            });
+        };
+        if !cap.allowed_values.contains(&e) {
+            return json!({
+                "error": format!(
+                    "invalid effort value '{e}' for backend '{command}' — must be one of {}",
+                    cap.allowed_values.join("|")
+                ),
+                "code": "invalid_effort_value"
+            });
+        }
+        let scan_args: Vec<String> = args
+            .get("args")
+            .and_then(|v| v.as_str())
+            .map(|s| s.split_whitespace().map(String::from).collect())
+            .unwrap_or_default();
+        if let Some(tok) = crate::backend_effort::scan_effort_conflict(&declared, &scan_args) {
+            return json!({
+                "error": format!(
+                    "args already pin an explicit effort setting ('{tok}') — \
+                     args win over fleet intent, so create_instance effort would be a silent no-op. \
+                     Remove the setting from args, then retry."
+                ),
+                "code": "args_conflict_confirmed"
+            });
+        }
+    }
     let name_owned = {
         // M4: AtomicU64 prevents 65536 wrap-around collision
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -249,6 +290,12 @@ fn spawn_single_instance_impl_inner(
         let declared = crate::backend::Backend::parse_str(command);
         let mut argv: Vec<String> = cmd_args.split_whitespace().map(String::from).collect();
         crate::backend::Backend::push_model_arg(&mut argv, &declared, model);
+        cmd_args = argv.join(" ");
+    }
+    if let Some(effort) = effort {
+        let declared = crate::backend::Backend::parse_str(command);
+        let mut argv: Vec<String> = cmd_args.split_whitespace().map(String::from).collect();
+        crate::backend::Backend::push_effort_arg(&mut argv, &declared, effort);
         cmd_args = argv.join(" ");
     }
     if let Some(dir) = args.get("working_directory").and_then(|v| v.as_str()) {
@@ -387,6 +434,7 @@ fn spawn_single_instance_impl_inner(
         .and_then(|v| v.as_str())
         .filter(|m| !m.is_empty())
         .map(String::from);
+    let entry_effort: Option<String> = effort.map(String::from);
     // #964: ADD fleet.yaml entry BEFORE the SPAWN RPC so the instance
     // exists when SPAWN runs. Pre-fix SPAWN-then-add ordering caused
     // silent failures.
@@ -401,6 +449,7 @@ fn spawn_single_instance_impl_inner(
         args: entry_args,
         model: entry_model,
         model_tier: entry_model_tier,
+        effort: entry_effort,
         env: env_for_entry,
         topic_binding_mode: args
             .get("topic_binding")
