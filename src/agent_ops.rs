@@ -333,6 +333,10 @@ pub(crate) fn delete_instance_with_exit_status(
 /// The provisional delete fence blocks a concurrent spawn while the fleet
 /// generation is checked. A mismatch, including a legacy deployment record
 /// facing a row with generation metadata, refuses before runtime deletion.
+///
+/// Under the DeleteFence admission window, an absent fleet row proves that no
+/// concurrent spawn or live generation exists under `name`, so residual
+/// cleanup is safe and converges cleanly without force (#19a / #76).
 pub(crate) fn delete_instance_with_exit_status_and_post_for_deployment_generation(
     home: &Path,
     name: &str,
@@ -341,13 +345,25 @@ pub(crate) fn delete_instance_with_exit_status_and_post_for_deployment_generatio
     expected_generation: Option<&str>,
     after_delete: impl FnOnce(bool),
 ) -> Option<(DeleteOutcome, bool)> {
-    let expected_generation = expected_generation?;
     let mut fence = crate::daemon::lifecycle::DeleteFence::admit(home, name, true);
-    let generation_matches = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-        .ok()
-        .and_then(|fleet| fleet.instances.get(name)?.deployment_generation.clone())
-        .as_deref()
-        == Some(expected_generation);
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
+    let instance_entry = fleet.as_ref().and_then(|f| f.instances.get(name));
+
+    let generation_matches = match (expected_generation, instance_entry) {
+        // (B) 成員 fleet 列不存在。在 DeleteFence 保護下，無並發 spawn，且無現存實例，
+        // 等同「無需保護的新 generation」，殘留可收斂，允許 teardown。
+        // 同時為 (A) legacy record 提供可達清理路徑：成員列不存在時殘留可收斂。
+        (_, None) => true,
+
+        // (A.1) 兩者皆帶 generation：必須嚴格一致。
+        (Some(expected), Some(entry)) => entry.deployment_generation.as_deref() == Some(expected),
+
+        // (A.2) Legacy record（無 generation）面對 fleet 中存在的列：
+        // 為了防止 stale record 誤殺 live instance（遵守 #3721 既有安全契約），
+        // 只要成員列仍然存在於 fleet.yaml 中，就拒絕（mismatch）。
+        (None, Some(_)) => false,
+    };
+
     if !generation_matches {
         return None;
     }

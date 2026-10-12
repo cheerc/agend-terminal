@@ -4023,3 +4023,124 @@ templates:
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ---------------------------------------------------------------------------
+// #19a / #76 regression tests: generation fence reaches clean completion
+// ---------------------------------------------------------------------------
+
+#[test]
+fn teardown_converges_residual_when_fleet_row_absent_under_delete_fence_19a() {
+    let home = tmp_home("teardown_row_absent_19a");
+    let custom_root = home.join("deployment-root");
+    let member = "dev-team-impl2";
+    let member_dir = custom_root.join(member);
+    std::fs::create_dir_all(&member_dir).unwrap();
+    assert!(write_deployment_owner_marker(
+        &member_dir,
+        "dev-team",
+        member,
+        Some("af02dd48-f634-45bd-a72b-0a22de55b04b"),
+    ));
+
+    let deployment = Deployment {
+        name: "dev-team".into(),
+        template: "dev-team".into(),
+        instances: vec![member.into()],
+        cleanup_instances: Vec::new(),
+        team: Some("dev-team".into()),
+        directory: custom_root.display().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        generation_id: Some("af02dd48-f634-45bd-a72b-0a22de55b04b".into()),
+    };
+    let mut store = DeploymentStore {
+        deployments: vec![deployment.clone()],
+        ..Default::default()
+    };
+    save(&home, &mut store).unwrap();
+
+    // Fleet.yaml does NOT contain `dev-team-impl2` (simulating #76 production sample).
+    // DeleteFence confirms no competing spawn or newer generation under the name.
+    let registry = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let configs = crate::api::ConfigRegistry::default();
+    let externals = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let runtime = DeploymentRuntime {
+        registry: &registry,
+        configs: &configs,
+        externals: &externals,
+        notifier: None,
+    };
+
+    let result = teardown_with_runtime(
+        &home,
+        &serde_json::json!({"name": "dev-team"}),
+        Some(&runtime),
+    );
+
+    assert_eq!(
+        result["status"], "torn_down",
+        "teardown must converge residual and complete when fleet row is absent: {result}"
+    );
+    assert!(
+        !load(&home).deployments.iter().any(|d| d.name == "dev-team"),
+        "deployment store record must be fully pruned on completion"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn teardown_legacy_record_converges_when_fleet_row_absent_19a() {
+    let home = tmp_home("teardown_legacy_row_absent_19a");
+    let custom_root = home.join("deployment-root");
+    let member = "fc-team-impl";
+    let member_dir = custom_root.join(member);
+    std::fs::create_dir_all(&member_dir).unwrap();
+    assert!(write_deployment_owner_marker(
+        &member_dir,
+        "fc-team",
+        member,
+        None,
+    ));
+
+    let deployment = Deployment {
+        name: "fc-team".into(),
+        template: "fc-team".into(),
+        instances: vec![member.into()],
+        cleanup_instances: Vec::new(),
+        team: Some("fc-team".into()),
+        directory: custom_root.display().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        generation_id: None, // Legacy null-generation record (#19)
+    };
+    let mut store = DeploymentStore {
+        deployments: vec![deployment.clone()],
+        ..Default::default()
+    };
+    save(&home, &mut store).unwrap();
+
+    // Member already removed or absent from fleet.yaml.
+    let registry = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let configs = crate::api::ConfigRegistry::default();
+    let externals = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let runtime = DeploymentRuntime {
+        registry: &registry,
+        configs: &configs,
+        externals: &externals,
+        notifier: None,
+    };
+
+    let result = teardown_with_runtime(
+        &home,
+        &serde_json::json!({"name": "fc-team"}),
+        Some(&runtime),
+    );
+
+    assert_eq!(
+        result["status"], "torn_down",
+        "legacy record must converge and complete when fleet row is absent: {result}"
+    );
+    assert!(
+        !load(&home).deployments.iter().any(|d| d.name == "fc-team"),
+        "legacy deployment store record must be pruned on completion"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
