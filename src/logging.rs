@@ -336,11 +336,53 @@ pub fn migrate_existing_log(
     }
 }
 
-/// Hourly cleanup tick. Sums sizes of every `daemon.log.*` file in
-/// `home` (rotated dates AND migration suffixes both count toward the
-/// total); when total > `max_bytes`, deletes oldest by mtime until
-/// total is under the cap. Returns the number of files removed for
-/// telemetry.
+/// Shared producer/legacy naming predicate for daemon rotated logs.
+///
+/// Matches the real rolling-appender output `daemon.<YYYY-MM-DD>.log` (UTC)
+/// and the legacy rotated form `daemon.log.<date>`. Both call sites share
+/// this predicate and then apply their own migration policy:
+/// - `cleanup_oversize_logs` additionally counts the
+///   `daemon.log.migration.<epoch>` archives produced by
+///   `migrate_existing_log` (`{filename}.migration.{epoch}` with filename
+///   `daemon.log`);
+/// - `update_daemon_log_symlink_unix` excludes them (static snapshots, never
+///   the active write target).
+///
+/// A single shared predicate (rather than one helper per call site) keeps the
+/// matcher compiled-and-used on every platform: the symlink consumer is
+/// Unix-only, so a symlink-only helper is dead code on Windows and fails
+/// `-D warnings` there.
+///
+/// Boundary (honest): `daemon.migration.*` (without `.log`) is NOT matched —
+/// no producer or legacy authority emits that namespace; only
+/// `daemon.log.migration.<epoch>` has one (`migrate_existing_log`).
+/// Excludes the `daemon.log` symlink itself and `app.*` logs.
+fn is_daemon_rotated_log_name(name: &str) -> bool {
+    if name == "daemon.log" {
+        return false;
+    }
+    // Real producer format: `daemon.<YYYY-MM-DD>.log` (exclude `daemon.log`).
+    if name.starts_with("daemon.") && name.ends_with(".log") {
+        let middle = &name["daemon.".len()..name.len() - ".log".len()];
+        if !middle.is_empty() && middle.chars().all(|c| c.is_ascii_digit() || c == '-') {
+            return true;
+        }
+    }
+    // Legacy rotated format: `daemon.log.<date>`. The date charset
+    // (digits/dashes only) structurally excludes migration archives
+    // (`daemon.log.migration.<epoch>` carries letters and dots).
+    if let Some(suffix) = name.strip_prefix("daemon.log.") {
+        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit() || c == '-') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Hourly cleanup tick. Sums sizes of every daemon log file in `home` (real rotated
+/// `daemon.<date>.log`, legacy `daemon.log.<date>`, and migration suffixes all count
+/// toward the total); when total > `max_bytes`, deletes oldest by mtime until
+/// total is under the cap. Returns the number of files removed for telemetry.
 pub fn cleanup_oversize_logs(home: &Path, max_bytes: u64) -> usize {
     let entries_iter = match std::fs::read_dir(home) {
         Ok(d) => d,
@@ -351,11 +393,16 @@ pub fn cleanup_oversize_logs(home: &Path, max_bytes: u64) -> usize {
         .filter_map(|entry| {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            // Match rotated (`daemon.log.<date>`) AND migration
-            // (`daemon.log.migration.<epoch>`) — both count toward budget.
-            // Exclude the symlink itself (we want the underlying files in
-            // the budget, not the link byte-count).
-            if !name_str.starts_with("daemon.log.") {
+            // Shared rotated-log naming plus the `daemon.log.migration.*`
+            // archives from `migrate_existing_log`. `is_daemon_rotated_log_name`
+            // structurally excludes migration (letters/dots fail the
+            // digits-dashes charset), so the migration arm carries the
+            // authority here — not a second naming helper.
+            let is_migration = name_str.starts_with("daemon.log.migration.")
+                && name_str["daemon.log.migration.".len()..]
+                    .chars()
+                    .all(|c| c.is_ascii_digit());
+            if !(is_daemon_rotated_log_name(&name_str) || is_migration) {
                 return None;
             }
             let meta = entry.metadata().ok()?;
@@ -387,10 +434,10 @@ pub fn cleanup_oversize_logs(home: &Path, max_bytes: u64) -> usize {
     removed
 }
 
-/// Maintain `<home>/daemon.log` symlink → newest `daemon.log.<date>`
-/// rotated file so operator's `tail -F daemon.log` keeps tracking the
-/// active file across rotation boundaries. Unix-only. Windows operator
-/// must `glob daemon.log.*` per the lead-synthed BC note.
+/// Maintain `<home>/daemon.log` symlink → newest rotated daemon log file
+/// (`daemon.<date>.log` or legacy `daemon.log.<date>`) so operator's `tail -F daemon.log`
+/// keeps tracking the active file across rotation boundaries. Unix-only.
+/// Windows operator must glob `daemon.*.log` / `daemon.log.*`.
 #[cfg(unix)]
 pub fn update_daemon_log_symlink_unix(home: &Path) {
     use std::os::unix::fs as unix_fs;
@@ -398,15 +445,16 @@ pub fn update_daemon_log_symlink_unix(home: &Path) {
         Ok(d) => d,
         Err(_) => return,
     };
-    // Newest rotated file (`daemon.log.<date>`), excluding migration
-    // markers (those are static historic snapshots — never the active
-    // write target) and the symlink itself.
+    // Newest rotated file (shared naming predicate). Migration archives
+    // never match the predicate (digits-dashes charset), so they are
+    // excluded here by construction — static historic snapshots are never
+    // the active write target. App logs and the symlink itself excluded.
     let newest = entries_iter
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name();
             let name_str = name.to_string_lossy().to_string();
-            if !name_str.starts_with("daemon.log.") || name_str.contains(MIGRATION_SUFFIX_PREFIX) {
+            if !is_daemon_rotated_log_name(&name_str) {
                 return None;
             }
             let ft = entry.file_type().ok()?;
@@ -773,5 +821,141 @@ mod tests {
         store_daemon_flush_guard(guard);
         flush_daemon_log(); // drops + joins the worker thread
         flush_daemon_log(); // idempotent: slot already empty, must not panic
+    }
+
+    // ----- #78 regression tests: align with real appender producer -----
+
+    /// Production-parity helper: build the real tracing appender used by setup_rolling_tracing.
+    fn spawn_real_producer(
+        home: &Path,
+        prefix: &str,
+    ) -> tracing_appender::rolling::RollingFileAppender {
+        tracing_appender::rolling::Builder::new()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .max_log_files(retain_days_from_env())
+            .filename_prefix(prefix)
+            .filename_suffix(LOG_FILENAME_SUFFIX)
+            .build(home)
+            .expect("build real rolling appender")
+    }
+
+    #[test]
+    fn real_producer_derived_fixture_verified_by_both_helpers_78() {
+        use std::io::Write;
+        let home = tmp_home("real-producer-78");
+        let mut appender = spawn_real_producer(&home, "daemon");
+        appender.write_all(b"sample daemon log line\n").unwrap();
+        appender.flush().unwrap();
+
+        // 1. Verify producer output shape: daemon.<YYYY-MM-DD>.log
+        let entries: Vec<String> = std::fs::read_dir(&home)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        let producer_file = entries
+            .iter()
+            .find(|name| {
+                name.starts_with("daemon.") && name.ends_with(".log") && *name != "daemon.log"
+            })
+            .cloned()
+            .expect("must find real producer daemon log file");
+
+        // 2. Helper update_daemon_log_symlink_unix must recognize it and symlink to it
+        #[cfg(unix)]
+        {
+            update_daemon_log_symlink_unix(&home);
+            let link = home.join("daemon.log");
+            assert!(
+                link.exists(),
+                "symlink must be created for real producer file"
+            );
+            let target = std::fs::read_link(&link).expect("must be symlink");
+            assert_eq!(
+                target.to_string_lossy(),
+                producer_file,
+                "symlink must point directly to real producer filename"
+            );
+        }
+
+        // 3. Helper cleanup_oversize_logs must recognize it and prune if over budget
+        // Make the file large enough to exceed 100 bytes
+        let path = home.join(&producer_file);
+        std::fs::write(&path, vec![0u8; 1024]).unwrap();
+        let removed = cleanup_oversize_logs(&home, 100);
+        assert_eq!(
+            removed, 1,
+            "cleanup_oversize_logs must count and prune real producer log when over cap"
+        );
+        assert!(!path.exists(), "over-cap real producer log must be deleted");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cleanup_oversize_logs_preserves_app_logs_and_counts_migration_files_78() {
+        use std::io::Write;
+        let home = tmp_home("cleanup-app-preserve-78");
+        // Real daemon producer file (2 KB)
+        let mut daemon_appender = spawn_real_producer(&home, "daemon");
+        daemon_appender.write_all(&vec![b'd'; 2048]).unwrap();
+        daemon_appender.flush().unwrap();
+
+        // Real app producer file (5 KB) - should never be touched by daemon cleanup
+        let mut app_appender = spawn_real_producer(&home, "app");
+        app_appender.write_all(&vec![b'a'; 5120]).unwrap();
+        app_appender.flush().unwrap();
+
+        // Migration file (3 KB) - must be counted toward daemon budget
+        let mig_path = home.join(format!("daemon.log.{MIGRATION_SUFFIX_PREFIX}1700000000"));
+        std::fs::write(&mig_path, vec![b'm'; 3072]).unwrap();
+
+        // Cap = 1 KB. Daemon logs = 2KB + 3KB = 5KB.
+        // Both daemon files should be cleaned up, but app log must remain intact!
+        let removed = cleanup_oversize_logs(&home, 1024);
+        assert!(removed >= 1, "must remove over-cap daemon files");
+
+        // Verify app log is preserved
+        let app_file_exists = std::fs::read_dir(&home).unwrap().flatten().any(|e| {
+            let s = e.file_name().to_string_lossy().to_string();
+            s.starts_with("app.") && s.ends_with(".log")
+        });
+        assert!(
+            app_file_exists,
+            "app log file must NOT be deleted by daemon cleanup backstop"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_excludes_migration_files_and_targets_latest_real_producer_log_78() {
+        use std::io::Write;
+        let home = tmp_home("symlink-no-mig-78");
+        let mut appender = spawn_real_producer(&home, "daemon");
+        appender.write_all(b"daemon active\n").unwrap();
+        appender.flush().unwrap();
+
+        // Write a migration file with a NEWER mtime
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mig_path = home.join(format!("daemon.log.{MIGRATION_SUFFIX_PREFIX}1900000000"));
+        std::fs::write(&mig_path, b"migration backup").unwrap();
+
+        update_daemon_log_symlink_unix(&home);
+        let link = home.join("daemon.log");
+        assert!(link.exists(), "symlink must be created");
+        let target = std::fs::read_link(&link).expect("must be symlink");
+        let target_str = target.to_string_lossy();
+        assert!(
+            !target_str.contains("migration"),
+            "symlink must NEVER point to migration file, got {target_str}"
+        );
+        assert!(
+            target_str.starts_with("daemon.") && target_str.ends_with(".log"),
+            "symlink must point to real daemon log file, got {target_str}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
     }
 }
