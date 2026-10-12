@@ -1439,6 +1439,7 @@ mod tests {
             ("create_instance", "args", "instance_state/spawn.rs extra cmd args"),
             ("create_instance", "model", "instance_state/spawn.rs --model flag"),
             ("create_instance", "model_tier", "instance_state/spawn.rs fleet.yaml model_tier + api/handlers/instance.rs tier resolution"),
+            ("create_instance", "effort", "instance_state/spawn.rs fleet.yaml effort + first-spawn argv (#28)"),
             ("create_instance", "working_directory", "instance_state/spawn.rs validated wd"),
             ("create_instance", "branch", "instance_state/spawn.rs worktree::create"),
             ("create_instance", "task", "instance_state/spawn.rs delayed inject"),
