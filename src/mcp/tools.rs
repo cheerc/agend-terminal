@@ -127,6 +127,7 @@ pub(crate) fn def_create_instance() -> Value {
         "args": {"type": "string", "description": "Extra CLI arguments"},
         "model": {"type": "string", "description": "Concrete model override (e.g. --model flag). Wins over model_tier."},
         "model_tier": {"type": "string", "description": "Symbolic model tier key from fleet.yaml model_tiers (e.g. cheap/strong). Used when model is omitted; lets leads spawn mechanical-task workers on cheaper models (#2477)."},
+        "effort": {"type": "string", "description": "Reasoning-effort level (low|medium|high|xhigh|max; per-backend range applies at spawn)."},
         "working_directory": {"type": "string"},
         "branch": {"type": "string", "description": "Git branch — creates worktree if specified"},
         "task": {"type": "string", "description": "Initial task to inject after spawn"},

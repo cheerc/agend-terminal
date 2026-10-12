@@ -104,6 +104,17 @@ pub(super) fn handle_create_instance(
     }
     // Team mode: spawn count instances and group them
     if let Some(team_name) = args.get("team").and_then(|v| v.as_str()) {
+        // #28 F3: batch mode carrying a non-empty effort refuses single-only.
+        if args
+            .get("effort")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty())
+        {
+            return json!({
+                "error": "effort is currently supported only for single-instance creation (batch/team creation does not support effort)",
+                "code": "unsupported_mode"
+            });
+        }
         // H7 (high/security): validate the team name BEFORE the CREATE_TEAM RPC.
         // `create_team` derives member names `<team>-N` and `workspace_dir(home)
         // .join(name)`; `PathBuf::join` preserves `..`, so an unvalidated name
