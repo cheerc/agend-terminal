@@ -685,3 +685,129 @@ fn post_merge_absent_link_skips_explicit_task_persists_3584() {
         "receipt must carry the bounded settle-after-CI TTL, not the old 1h window: {lifetime}"
     );
 }
+
+// #64 diagnostic-only RED: a real untyped disposable checkout binds the review
+// branch while the task names the subject branch. Completion must stay denied,
+// but the reason must identify the branch-proof gap (not the generic
+// five-way merge), and task.done must project the same sentence the terminal
+// report path returns. No remedy may ask the caller to rewrite task.branch,
+// forge a lease/assignment, force, or treat an ordinary report as authority.
+#[test]
+fn untyped_disposable_branch_mismatch_reason_is_actionable_64() {
+    let home = Home::new();
+    let subject_branch = "fix/subject-64";
+    let created = super::handle(
+        &home.0,
+        "lead",
+        &json!({"action":"create", "title":"subject task", "branch":subject_branch, "assignee":"dev"}),
+    );
+    let id = created["id"].as_str().unwrap().to_string();
+    let claimed = super::handle(&home.0, "dev", &json!({"action":"claim", "id":id}));
+    assert!(claimed.get("error").is_none(), "{claimed}");
+
+    // Real producer: untyped disposable checkout (no typed assignment exists,
+    // so checkout-time lease augmentation is a no-op).
+    let source = home.0.join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    crate::git_helpers::git_cmd(&source, &["init", "-b", "main"]).unwrap();
+    crate::git_helpers::git_cmd(
+        &source,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "fixture",
+        ],
+    )
+    .unwrap();
+    let origin = home.0.join("origin.git");
+    crate::git_helpers::git_cmd(&source, &["clone", "--bare", ".", origin.to_str().unwrap()])
+        .unwrap();
+    crate::git_helpers::git_cmd(
+        &source,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    )
+    .unwrap();
+    crate::git_helpers::git_cmd(&source, &["update-ref", "refs/remotes/origin/main", "HEAD"])
+        .unwrap();
+    crate::git_helpers::git_cmd(
+        &source,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    )
+    .unwrap();
+    let expected = crate::git_helpers::git_cmd(&source, &["rev-parse", "HEAD"]).unwrap();
+    let review_branch = format!(
+        "review/disposable-64-{}",
+        &uuid::Uuid::new_v4().to_string()[..8]
+    );
+    let checkout = crate::mcp::handlers::ci::handle_checkout_repo(
+        &home.0,
+        &json!({
+            "repository_path": source,
+            "branch": review_branch,
+            "bind": true,
+            "task_id": id,
+            "expected_head": expected,
+            "from_ref": "main",
+            "checkout_purpose": "disposable_review",
+        }),
+        "dev",
+    );
+    assert!(checkout.get("error").is_none(), "{checkout}");
+    assert_eq!(checkout["bound"], true, "{checkout}");
+    let binding = crate::binding::read(&home.0, "dev").expect("binding");
+    assert_eq!(
+        binding["checkout_purpose"].as_str(),
+        Some("disposable_review")
+    );
+    assert_eq!(
+        binding["provenance"].as_str(),
+        Some("DaemonProvisionedReview")
+    );
+    assert!(binding.get("lease_kind").is_none(), "{binding}");
+
+    // task.done stays denied.
+    let denied = done(&home, &id);
+    assert_eq!(denied["code"], "assignee_completion_blocked", "{denied}");
+    let reason = denied["reason"].as_str().expect("reason");
+    assert_eq!(reason, denied["error"].as_str().expect("error"), "{denied}");
+    // The reason must identify the branch-proof gap with both branch names.
+    assert!(reason.contains(subject_branch), "{denied}");
+    assert!(reason.contains(review_branch.as_str()), "{denied}");
+    assert!(reason.contains("typed review lease"), "{denied}");
+    // The legitimate non-merge path is the orchestrator, never a caller-side
+    // branch/binding rewrite.
+    let condition = denied["closure_condition"]
+        .as_str()
+        .expect("closure_condition");
+    assert!(condition.contains("orchestrator"), "{denied}");
+    assert!(
+        !reason.contains("change task.branch") && !reason.contains("re-bind"),
+        "{denied}"
+    );
+
+    // send.report terminal projects the same guard sentence; delivery succeeds
+    // as a report but the task is not closed.
+    let report_err = super::auto_close::auto_close_on_report(
+        &home.0,
+        "report",
+        &id,
+        "dev",
+        "review work pushed",
+        true,
+    )
+    .expect_err("untyped disposable completion must fail closed");
+    assert_eq!(report_err.to_string(), reason, "{denied} vs {report_err}");
+    assert_eq!(
+        serde_json::to_value(super::load_routed(&home.0, &id).unwrap().record()).unwrap()["status"],
+        "claimed"
+    );
+}
